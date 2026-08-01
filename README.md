@@ -21,3 +21,34 @@ whole note bodies then leave the machine on every embed.
 
 The index lives at `<vault>/.vault/index.db` and is safe to delete — `doctor
 --rebuild` recreates it from the files.
+
+## Library
+
+```ts
+import { open, gatePrompt, parseDecision, TokenOverlapEmbedder } from "@wilcus/vault";
+
+const vault = open("/path/to/vault", {
+  embedder: new TokenOverlapEmbedder(),
+  gate: {
+    // your LLM call; `gatePrompt` and `parseDecision` are the wiring, not the model
+    decider: async (input) => parseDecision(await askYourModel(gatePrompt(input))),
+    // mandatory: without cutoffs "most similar" degrades into "least unrelated"
+    cutoffs: { distanceCeiling: 0.35, bm25Ceiling: -1 },
+  },
+});
+
+await vault.reindex();
+await vault.search("acme renewal");
+await vault.propose({ title: "Acme renewal 2026", type: "customer", namespace: "customers", body });
+await vault.doctor();
+vault.close();
+```
+
+`propose` is the write gate: it hybrid-searches for similar notes, asks the
+decider to `update`, `supersede`, `create` or `discard`, and applies that with
+two rails — it re-hashes a target immediately before writing (a human edit
+mid-flight aborts the apply, re-runs the gate once, then falls back to `create`)
+and confines every path it writes to the vault root. Writes land through a temp
+file renamed into place. A discarded candidate — or one the gate cannot place —
+is appended whole to `.vault/discarded.log`. Notes it did not author are patched
+textually, never re-serialized, so comments and `01234` survive.

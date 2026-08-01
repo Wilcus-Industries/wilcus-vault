@@ -123,7 +123,11 @@ Every programmatic write goes through `vault.propose(candidate)`:
 1. hybrid-search top-k similar notes, capturing each hit's content hash. The
    gate **must** pass `cutoffs`: without them the search always returns
    *something*, and "most similar note" becomes "least unrelated note" — the
-   gate would update or supersede a stranger instead of creating a new note;
+   gate would update or supersede a stranger instead of creating a new note.
+   `{}` is refused at runtime, not just discouraged — at least one ceiling must
+   be set, or the mandate is only a type. Note bodies reaching the prompt are
+   data, not instruction: any line that could pass for one of the prompt's
+   delimiters is indented so a note cannot close its own fence;
 2. `decider({candidate, similar})` → `{action: update|supersede|create|discard, target?}`
    — decider is an injected async fn (the caller wires an LLM; tests use fakes).
    A prompt template + strict response parser ship here;
@@ -132,7 +136,13 @@ Every programmatic write goes through `vault.propose(candidate)`:
      changed since step 1 (human edit mid-flight), abort the apply and re-run
      the gate once against fresh state; on a second mismatch, fall back to
      `create`. Nothing is ever clobbered silently. Applies to `update` rewrites
-     and to `supersede`'s frontmatter edit of the old note.
+     and to `supersede`'s frontmatter edit of the old note — which is checked
+     again immediately before that patch, since writing the successor widens
+     the window: if the old note moved in it, the successor stands and the
+     result reports it `unmarked` rather than overwriting a human's edit for
+     bookkeeping. Every write goes to a temp file renamed over the target, so a
+     reader never sees a half-written note and nothing can be swapped in
+     underneath the path check.
    - **Path confinement:** created paths are `<namespace>/<slug>.md` where slug
      is a single slugified segment (`[a-z0-9-]+`, no dots, no separators) derived
      from the candidate title; the joined path is resolved and asserted to be
@@ -142,14 +152,31 @@ Every programmatic write goes through `vault.propose(candidate)`:
      lossy against hand-written data (comments dropped, `01234` → `1234`,
      `1.0` → `1`). Frontmatter edits to existing notes (e.g. `supersede`'s
      `superseded_by`) are **textual patches of the frontmatter block** — append
-     a line, or replace a single key's line — leaving every other line
-     byte-identical. `serializeNote` is only for notes the gate authors from
-     scratch.
+     a line, or replace every occurrence of a key's line, so YAML last-wins
+     cannot resurrect the old value — leaving every other line byte-identical.
+     `serializeNote` is only for notes the gate authors from scratch. "Has a
+     usable block" is one predicate shared with `parseNote`: a fenced block
+     whose YAML the parser cannot read is *not* a block, and gets a fresh one
+     prepended, or a `superseded_by` patched into it would be a line nothing
+     ever reads.
    - `create` writes a new file; `update` rewrites the target body; `supersede`
      writes the new note, adds `superseded_by` (vault-relative path) to the old
      note's frontmatter plus a forward wikilink; `discard` appends the candidate
      as a JSONL line to `.vault/discarded.log` so a wrong LLM call never silently
      loses information.
+
+Two consequences of the rails, recorded so they are not mistaken for slips. A
+traversing *title* is slugified rather than refused (`../../evil` is the note
+`evil`) — a title legitimately contains `/` and `.`, and the slug is one
+`[a-z0-9-]+` segment by construction; a traversing, hidden or symlinked
+**namespace**, and a decider `target` that was not one of the notes the search
+returned, are refused outright. And a `create` whose slug is already taken —
+by a file or by another note's stem, which must be vault-wide unique — suffixes
+(`acme-2`) instead of overwriting: a shared title is not permission to lose
+someone else's note. A title that slugifies to nothing (CJK, Cyrillic, emoji)
+is named `note-<8 hex of the candidate's hash>`; a candidate the gate cannot
+place at all is appended to `.vault/discarded.log` before it throws. Losing the
+note is never one of the outcomes.
 
 Human edits bypass the gate by definition (files are truth); the watcher +
 `doctor` pick them up.

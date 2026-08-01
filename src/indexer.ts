@@ -42,8 +42,14 @@ export function scanVault(root: string): string[] {
  * (permissions, I/O) still throws.
  */
 export async function readNote(root: string, rel: string): Promise<Note | null> {
+  const raw = await readRaw(root, rel);
+  return raw === null ? null : parseNote(raw, rel);
+}
+
+/** The file's text, or null if it is no longer there (see `readNote`). */
+export async function readRaw(root: string, rel: string): Promise<string | null> {
   try {
-    return parseNote(await Bun.file(join(root, rel)).text(), rel);
+    return await Bun.file(join(root, rel)).text();
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw e;
