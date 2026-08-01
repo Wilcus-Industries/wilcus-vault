@@ -6,7 +6,7 @@ it is the architecture contract. Spec source: wilcus-agents SPEC § @wilcus/vaul
 ## Done-check
 
 ```
-bun test && bunx tsc --noEmit
+bun run check
 ```
 
 Both green before any PR. TDD: failing test first.
