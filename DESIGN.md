@@ -151,6 +151,16 @@ Every programmatic write goes through `vault.propose(candidate)`:
      as a JSONL line to `.vault/discarded.log` so a wrong LLM call never silently
      loses information.
 
+Two consequences of the rails, recorded so they are not mistaken for slips. A
+traversing *title* is slugified rather than refused (`../../evil` is the note
+`evil`) — a title legitimately contains `/` and `.`, and the slug is one
+`[a-z0-9-]+` segment by construction; a traversing, hidden or symlinked
+**namespace**, and a decider `target` that was not one of the notes the search
+returned, are refused outright. And a `create` whose slug is already taken —
+by a file or by another note's stem, which must be vault-wide unique — suffixes
+(`acme-2`) instead of overwriting: a shared title is not permission to lose
+someone else's note.
+
 Human edits bypass the gate by definition (files are truth); the watcher +
 `doctor` pick them up.
 

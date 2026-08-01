@@ -1,0 +1,360 @@
+// Write-gate evals (DESIGN.md § Write gate, § Testing): every action end to
+// end against a real vault, plus the two safety rails — check-and-write and
+// path confinement. Fake deciders, deterministic embedder, no network.
+import { test, expect, afterAll } from "bun:test";
+import { existsSync, readFileSync, symlinkSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { TokenOverlapEmbedder } from "../src/embed";
+import { parseDecision, slugify, type Decider, type DeciderInput } from "../src/gate";
+import { gatePrompt } from "../src/gate";
+import { open, type Vault } from "../src/vault";
+import { makeVault, cleanupVaults, writeNote } from "./vault-fixture";
+
+afterAll(cleanupVaults);
+
+const embedder = new TokenOverlapEmbedder();
+/** Loose enough that a related note survives; the point is that they are passed. */
+const CUTOFFS = { distanceCeiling: 0.9, bm25Ceiling: 0 };
+
+const read = (root: string, rel: string): string => readFileSync(join(root, rel), "utf8");
+
+async function openVault(
+  files: Record<string, string>,
+  decider: Decider,
+  cutoffs = CUTOFFS,
+): Promise<Vault> {
+  const root = makeVault(files);
+  const v = open(root, { embedder, gate: { decider, cutoffs } });
+  await v.reindex();
+  return v;
+}
+
+const OLD_NOTE = `---
+type: customer
+id: 01234 # legacy account number, must survive a gate write
+rate: 1.0
+updated: 2020-01-01
+---
+# Acme renewal
+
+The Acme renewal closes in March. See [[support-rota]].
+`;
+
+const VAULT = {
+  "notes/acme-renewal.md": OLD_NOTE,
+  "notes/support-rota.md": "# Support rota\n\nWho carries the pager each week.\n",
+};
+
+const CANDIDATE = {
+  title: "Acme renewal 2026",
+  type: "customer",
+  namespace: "notes",
+  body: "The Acme renewal closes in March 2026 at the agreed renewal pricing.\n",
+};
+
+test("create writes a new note we authored, confined and indexed", async () => {
+  const v = await openVault(VAULT, async () => ({ action: "create" }));
+  const r = await v.propose(CANDIDATE);
+
+  expect(r).toMatchObject({ action: "create", path: "notes/acme-renewal-2026.md", fellBack: false });
+  const raw = read(v.root, r.path!);
+  expect(raw).toStartWith("---\n");
+  expect(raw).toContain("title: Acme renewal 2026");
+  expect(raw).toContain("type: customer");
+  expect(raw).toMatch(/created: '?20\d\d-/);
+  expect(raw).toEndWith(CANDIDATE.body);
+
+  // reindexed synchronously by propose: the new note is searchable right away
+  expect((await v.search("acme renewal 2026 pricing")).map((h) => h.path)).toContain(
+    "notes/acme-renewal-2026.md",
+  );
+  v.close();
+});
+
+test("create never overwrites an existing note or reuses a stem", async () => {
+  const v = await openVault(VAULT, async () => ({ action: "create" }));
+  const r = await v.propose({ ...CANDIDATE, title: "Acme renewal" });
+  expect(r.path).toBe("notes/acme-renewal-2.md");
+  expect(read(v.root, "notes/acme-renewal.md")).toBe(OLD_NOTE); // untouched
+  v.close();
+});
+
+test("update rewrites the body and bumps updated, byte-identical frontmatter otherwise", async () => {
+  const v = await openVault(VAULT, async () => ({
+    action: "update",
+    target: "notes/acme-renewal.md",
+    body: "# Acme renewal\n\nRenewal closes 2026-03-01 at the agreed pricing.\n",
+  }));
+  const r = await v.propose(CANDIDATE);
+  expect(r).toMatchObject({ action: "update", path: "notes/acme-renewal.md", fellBack: false });
+
+  const raw = read(v.root, "notes/acme-renewal.md");
+  // A YAML round-trip would drop the comment and turn 01234 into 1234 and 1.0
+  // into 1 — the gate never re-serializes a note it did not author.
+  expect(raw).toContain("id: 01234 # legacy account number, must survive a gate write");
+  expect(raw).toContain("rate: 1.0");
+  expect(raw).toContain("type: customer");
+  expect(raw).not.toContain("updated: 2020-01-01");
+  expect(raw).toMatch(/^updated: "20\d\d-/m);
+  expect(raw).toEndWith("Renewal closes 2026-03-01 at the agreed pricing.\n");
+  expect(raw).not.toContain("closes in March.");
+  v.close();
+});
+
+test("supersede writes the new note, marks the old one, and drops it from search", async () => {
+  const v = await openVault(VAULT, async () => ({
+    action: "supersede",
+    target: "notes/acme-renewal.md",
+  }));
+  const r = await v.propose(CANDIDATE);
+  expect(r).toMatchObject({
+    action: "supersede",
+    path: "notes/acme-renewal-2026.md",
+    superseded: "notes/acme-renewal.md",
+    fellBack: false,
+  });
+
+  const old = read(v.root, "notes/acme-renewal.md");
+  expect(old).toContain(`superseded_by: "notes/acme-renewal-2026.md"`);
+  expect(old).toContain("id: 01234 # legacy account number, must survive a gate write");
+  expect(old).toContain("The Acme renewal closes in March. See [[support-rota]].");
+  expect(old).toContain("[[acme-renewal-2026]]"); // forward link to the successor
+  expect(read(v.root, "notes/acme-renewal-2026.md")).toContain("March 2026");
+
+  // the supersede chain is excluded from the default search
+  const hits = (await v.search("acme renewal march")).map((h) => h.path);
+  expect(hits).toContain("notes/acme-renewal-2026.md");
+  expect(hits).not.toContain("notes/acme-renewal.md");
+  // and the forward wikilink resolves — no broken edge left behind
+  expect((await v.doctor()).brokenLinks).toEqual([]);
+  v.close();
+});
+
+test("supersede patches a note with no usable frontmatter without eating its body", async () => {
+  const broken = "---\ntype: customer\n# no closing fence\n\nAcme renewal notes, unterminated.\n";
+  const v = await openVault({ "notes/acme-renewal.md": broken }, async () => ({
+    action: "supersede",
+    target: "notes/acme-renewal.md",
+  }));
+  await v.propose(CANDIDATE);
+
+  const old = read(v.root, "notes/acme-renewal.md");
+  expect(old).toStartWith(`---\nsuperseded_by: "notes/acme-renewal-2026.md"\n---\n`);
+  expect(old).toContain(broken); // every original byte still there
+  expect((await v.search("acme renewal unterminated")).map((h) => h.path)).not.toContain(
+    "notes/acme-renewal.md",
+  );
+  v.close();
+});
+
+test("discard appends the whole candidate to .vault/discarded.log", async () => {
+  const v = await openVault(VAULT, async () => ({ action: "discard" }));
+  const r = await v.propose(CANDIDATE);
+  expect(r).toMatchObject({ action: "discard", fellBack: false });
+  expect(r.path).toBeUndefined();
+
+  const lines = read(v.root, ".vault/discarded.log").trim().split("\n");
+  expect(lines).toHaveLength(1);
+  const entry = JSON.parse(lines[0]!) as { candidate: unknown; at: string };
+  expect(entry.candidate).toEqual(CANDIDATE); // recoverable in full
+  expect(entry.at).toMatch(/^20\d\d-/);
+
+  await v.propose({ ...CANDIDATE, title: "Second thought" });
+  expect(read(v.root, ".vault/discarded.log").trim().split("\n")).toHaveLength(2); // appended
+  v.close();
+});
+
+test("a human edit between search and apply aborts and re-gates against fresh state", async () => {
+  let calls = 0;
+  let root = "";
+  const decider: Decider = async () => {
+    // the mid-flight edit: a human saves the target while the decider thinks
+    if (++calls === 1) writeNote(root, "notes/acme-renewal.md", "# Acme renewal\n\nhand edit\n");
+    return {
+      action: "update",
+      target: "notes/acme-renewal.md",
+      body: "# Acme renewal\n\ngate body\n",
+    };
+  };
+  const v = await openVault(VAULT, decider);
+  root = v.root;
+
+  const r = await v.propose(CANDIDATE);
+  expect(calls).toBe(2); // aborted, re-ran the whole gate once
+  expect(r).toMatchObject({ action: "update", path: "notes/acme-renewal.md", fellBack: false });
+  expect(read(root, "notes/acme-renewal.md")).toEndWith("gate body\n");
+  v.close();
+});
+
+test("a second mid-flight edit falls back to create and clobbers nothing", async () => {
+  let calls = 0;
+  let root = "";
+  const decider: Decider = async () => {
+    writeNote(root, "notes/acme-renewal.md", `# Acme renewal\n\nhand edit ${++calls}\n`);
+    return { action: "update", target: "notes/acme-renewal.md", body: "gate body\n" };
+  };
+  const v = await openVault(VAULT, decider);
+  root = v.root;
+
+  const r = await v.propose(CANDIDATE);
+  expect(calls).toBe(2);
+  expect(r).toMatchObject({
+    action: "create",
+    path: "notes/acme-renewal-2026.md",
+    fellBack: true,
+  });
+  // the human's edit survived intact — nothing was clobbered silently
+  expect(read(root, "notes/acme-renewal.md")).toBe("# Acme renewal\n\nhand edit 2\n");
+  expect(read(root, "notes/acme-renewal-2026.md")).toContain("March 2026");
+  v.close();
+});
+
+test("supersede aborts before writing anything when the old note moved under it", async () => {
+  let calls = 0;
+  let root = "";
+  const decider: Decider = async () => {
+    writeNote(root, "notes/acme-renewal.md", `# Acme renewal\n\nhand edit ${++calls}\n`);
+    return { action: "supersede", target: "notes/acme-renewal.md" };
+  };
+  const v = await openVault(VAULT, decider);
+  root = v.root;
+
+  const r = await v.propose(CANDIDATE);
+  expect(r.fellBack).toBe(true);
+  expect(read(root, "notes/acme-renewal.md")).not.toContain("superseded_by");
+  v.close();
+});
+
+test("no similar notes is a valid outcome, not an error — cutoffs are passed", async () => {
+  const seen: DeciderInput[] = [];
+  const v = await openVault(
+    VAULT,
+    async (input) => {
+      seen.push(input);
+      return { action: "create" };
+    },
+    { distanceCeiling: 0.5, bm25Ceiling: -1 },
+  );
+  const r = await v.propose({
+    title: "Zeppelin fuselage torque",
+    namespace: "notes",
+    body: "Torque values for the zeppelin fuselage struts.\n",
+  });
+  expect(seen[0]!.similar).toEqual([]); // the vault has notes; none of them are similar
+  expect(r).toMatchObject({ action: "create", path: "notes/zeppelin-fuselage-torque.md" });
+  v.close();
+});
+
+test("the decider sees each similar note with the hash it was read at", async () => {
+  const seen: DeciderInput[] = [];
+  const v = await openVault(VAULT, async (input) => {
+    seen.push(input);
+    return { action: "discard" };
+  });
+  await v.propose(CANDIDATE);
+
+  const input = seen[0]!;
+  expect(input.candidate).toEqual(CANDIDATE);
+  expect(input.similar.length).toBeGreaterThan(0);
+  const hit = input.similar.find((s) => s.note.path === "notes/acme-renewal.md")!;
+  expect(hit.hash).toBe(new Bun.CryptoHasher("sha256").update(OLD_NOTE).digest("hex"));
+  expect(hit.note.body).toContain("closes in March");
+  expect(hit.score).toBeGreaterThan(0);
+  v.close();
+});
+
+test("path confinement: a traversing title is slugified, not obeyed", async () => {
+  const v = await openVault(VAULT, async () => ({ action: "create" }));
+  const r = await v.propose({ ...CANDIDATE, title: "../../evil" });
+  expect(r.path).toBe("notes/evil.md");
+  expect(existsSync(resolve(v.root, "../evil.md"))).toBe(false);
+  expect(existsSync(resolve(v.root, "../../evil.md"))).toBe(false);
+  expect(slugify("../../evil")).toBe("evil");
+  expect(slugify("TLS/SSL — notes..md")).toBe("tls-ssl-notes-md");
+  expect(() => slugify("../..")).toThrow(/slug/);
+  v.close();
+});
+
+test("path confinement: a traversing namespace or symlinked dir is refused", async () => {
+  const v = await openVault(VAULT, async () => ({ action: "create" }));
+  await expect(v.propose({ ...CANDIDATE, namespace: "../x" })).rejects.toThrow(/outside the vault/);
+  await expect(v.propose({ ...CANDIDATE, namespace: "/etc" })).rejects.toThrow(/outside the vault/);
+  expect(existsSync(resolve(v.root, "../x"))).toBe(false);
+  // the scan skips dot-directories, so a note written there could never index
+  await expect(v.propose({ ...CANDIDATE, namespace: ".vault" })).rejects.toThrow(/hidden/);
+
+  symlinkSync(join(v.root, "notes"), join(v.root, "linked"));
+  await expect(v.propose({ ...CANDIDATE, namespace: "linked" })).rejects.toThrow(/symlink/);
+  v.close();
+});
+
+test("path confinement: the decider cannot name a path the search did not return", async () => {
+  const v = await openVault(VAULT, async () => ({
+    action: "update",
+    target: "../../../etc/passwd",
+    body: "pwned",
+  }));
+  await expect(v.propose(CANDIDATE)).rejects.toThrow(/not among the similar notes/);
+  v.close();
+});
+
+test("malformed decider output throws instead of being guessed at", async () => {
+  const bad: unknown[] = [
+    null,
+    "create",
+    { action: "delete" },
+    { action: "update" }, // no target
+    { action: "update", target: 7 },
+    { action: "create", target: "notes/acme-renewal.md" }, // confused about the action
+    { action: "create", body: 3 },
+  ];
+  for (const value of bad) {
+    const v = await openVault(VAULT, async () => value as never);
+    await expect(v.propose(CANDIDATE)).rejects.toThrow(/write gate/);
+    v.close();
+  }
+
+  expect(parseDecision(`{"action":"create"}`)).toEqual({ action: "create" });
+  expect(parseDecision(`  {"action":"update","target":"a.md","body":"x"}  `)).toEqual({
+    action: "update",
+    target: "a.md",
+    body: "x",
+  });
+  // a fenced or chatty answer is malformed, not something to salvage
+  expect(() => parseDecision("```json\n{\"action\":\"create\"}\n```")).toThrow(/write gate/);
+  expect(() => parseDecision("Sure! {\"action\":\"create\"}")).toThrow(/write gate/);
+  expect(() => parseDecision(`{"action":"supersede"}`)).toThrow(/target/);
+});
+
+test("the prompt template carries the candidate, the similar notes and the contract", async () => {
+  let prompt = "";
+  const v = await openVault(VAULT, async (input) => {
+    prompt = gatePrompt(input);
+    return { action: "discard" };
+  });
+  await v.propose(CANDIDATE);
+
+  expect(prompt).toContain("Acme renewal 2026");
+  expect(prompt).toContain(CANDIDATE.body.trim());
+  expect(prompt).toContain("notes/acme-renewal.md");
+  expect(prompt).toContain("closes in March");
+  for (const action of ["update", "supersede", "create", "discard"]) {
+    expect(prompt).toContain(action);
+  }
+  // it asks for exactly what the parser we ship accepts
+  expect(prompt).toContain("one JSON object and nothing else");
+  expect(parseDecision(`{"action": "update", "target": "notes/acme-renewal.md"}`)).toMatchObject({
+    action: "update",
+  });
+  v.close();
+});
+
+test("the facade refuses to propose without a decider and explicit cutoffs", async () => {
+  const root = makeVault(VAULT);
+  const v = open(root, { embedder });
+  await v.reindex();
+  await expect(v.propose(CANDIDATE)).rejects.toThrow(/gate/);
+  expect((await v.search("acme")).length).toBeGreaterThan(0); // the rest of the facade works
+  expect((await v.doctor()).stale).toEqual([]);
+  v.close();
+});

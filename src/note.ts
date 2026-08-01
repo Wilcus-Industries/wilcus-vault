@@ -147,3 +147,59 @@ export function serializeNote(note: Pick<Note, "frontmatter" | "body">): string 
   const yaml = Bun.YAML.stringify(note.frontmatter, null, 2).replace(/\n*$/, "\n");
   return `---\n${yaml}---\n${note.body}`;
 }
+
+/**
+ * The frontmatter block as *text*: where its YAML starts and ends inside `raw`,
+ * and where the body begins after the closing fence. Null when there is no
+ * usable block — which is exactly when `parseNote` treats the whole file as
+ * body, so the two agree on what "has frontmatter" means.
+ */
+function frontmatterBlock(
+  raw: string,
+): { start: number; end: number; bodyStart: number } | null {
+  const open = /^---\r?\n/.exec(raw);
+  if (open === null) return null;
+  const start = open[0].length;
+  const close = /^---[ \t]*\r?(\n|$)/m.exec(raw.slice(start));
+  if (close === null) return null;
+  return {
+    start,
+    end: start + close.index,
+    bodyStart: start + close.index + close[0].length,
+  };
+}
+
+/**
+ * Set one frontmatter key by editing the text, never by re-serializing: append
+ * the key's line, or replace the single line that already defines it, leaving
+ * every other byte of the file identical. Per DESIGN.md § Write gate this is
+ * how the gate touches notes it did not author — a YAML round-trip drops
+ * comments and rewrites `01234` and `1.0`. A file with no usable frontmatter
+ * block (absent, or malformed enough that `parseNote` ignores it) gets a fresh
+ * block prepended; its content is left untouched below.
+ */
+export function patchFrontmatter(raw: string, key: string, value: string): string {
+  // Keys are ours (`superseded_by`, `updated`); anything else could be YAML or
+  // regex syntax rather than a key, and this function does not sanitize.
+  if (!/^[A-Za-z0-9_-]+$/.test(key)) throw new Error(`patchFrontmatter: unusable key ${key}`);
+  const line = `${key}: ${JSON.stringify(value)}`; // JSON strings are valid YAML scalars
+  const at = frontmatterBlock(raw);
+  if (at === null) return `---\n${line}\n---\n${raw}`;
+
+  const eol = raw.slice(0, at.start).endsWith("\r\n") ? "\r\n" : "\n";
+  const block = raw.slice(at.start, at.end);
+  // Top-level only: an indented `key:` belongs to a nested mapping. `[^\r\n]*`
+  // rather than `.*` so a CRLF file keeps its carriage return.
+  const existing = new RegExp(`^${key}[ \t]*:[^\r\n]*`, "m");
+  const patched = existing.test(block)
+    ? block.replace(existing, line)
+    : block + (block === "" || block.endsWith("\n") ? "" : eol) + line + eol;
+  return raw.slice(0, at.start) + patched + raw.slice(at.end);
+}
+
+/** Replace the body, keeping the frontmatter block byte-identical. */
+export function replaceBody(raw: string, body: string): string {
+  const at = frontmatterBlock(raw);
+  // No usable block ⇒ the whole file is the body, as `parseNote` reads it.
+  return at === null ? body : raw.slice(0, at.bodyStart) + body;
+}

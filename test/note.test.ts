@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { parseNote, serializeNote } from "../src/note";
+import { parseNote, patchFrontmatter, replaceBody, serializeNote } from "../src/note";
 
 const sha256 = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
 
@@ -205,4 +205,52 @@ test("non-string title/type are ignored and flagged for doctor", () => {
   expect(n.type).toBeUndefined();
   expect(n.malformedFrontmatter).toBe(true);
   expect(n.frontmatter).toEqual({ title: 42, type: ["a", "b"] }); // kept as written
+});
+
+// The write gate patches frontmatter textually because a YAML round-trip is
+// lossy against hand-written data (DESIGN.md § Write gate).
+test("patchFrontmatter appends a key, leaving every other byte alone", () => {
+  const raw = "---\ntype: customer\nid: 01234 # legacy\nrate: 1.0\n---\n# Acme\n\nbody\n";
+  const out = patchFrontmatter(raw, "superseded_by", "notes/new.md");
+  expect(out).toBe(
+    `---\ntype: customer\nid: 01234 # legacy\nrate: 1.0\nsuperseded_by: "notes/new.md"\n---\n# Acme\n\nbody\n`,
+  );
+  expect(parseNote(out, "x/a.md").frontmatter["superseded_by"]).toBe("notes/new.md");
+});
+
+test("patchFrontmatter replaces exactly one existing top-level key line", () => {
+  const raw = "---\nupdated: 2020-01-01\nmeta:\n  updated: nested\n---\nbody\n";
+  const out = patchFrontmatter(raw, "updated", "2026-08-01");
+  expect(out).toBe(`---\nupdated: "2026-08-01"\nmeta:\n  updated: nested\n---\nbody\n`);
+});
+
+test("patchFrontmatter prepends a block when there is no usable one", () => {
+  for (const raw of [
+    "# Acme\n\nbody\n", // no frontmatter at all
+    "---\ntype: customer\n\nunterminated\n", // no closing fence
+    "", // empty file
+  ]) {
+    const out = patchFrontmatter(raw, "superseded_by", "notes/new.md");
+    expect(out).toBe(`---\nsuperseded_by: "notes/new.md"\n---\n${raw}`);
+    expect(out.endsWith(raw)).toBe(true); // the body is never touched
+    expect(parseNote(out, "x/a.md").frontmatter["superseded_by"]).toBe("notes/new.md");
+  }
+});
+
+test("patchFrontmatter keeps CRLF line endings and rejects an unusable key", () => {
+  const out = patchFrontmatter("---\r\ntype: customer\r\n---\r\nbody\r\n", "updated", "2026-08-01");
+  expect(out).toBe(`---\r\ntype: customer\r\nupdated: "2026-08-01"\r\n---\r\nbody\r\n`);
+  expect(patchFrontmatter("---\r\nupdated: old\r\n---\r\nb\r\n", "updated", "x")).toBe(
+    `---\r\nupdated: "x"\r\n---\r\nb\r\n`,
+  );
+  expect(() => patchFrontmatter("body", "a: b\nevil", "x")).toThrow(/key/);
+});
+
+test("replaceBody swaps the body and keeps the frontmatter block verbatim", () => {
+  const raw = "---\ntype: customer\nid: 01234 # legacy\n---\nold body\n";
+  expect(replaceBody(raw, "new body\n")).toBe(
+    "---\ntype: customer\nid: 01234 # legacy\n---\nnew body\n",
+  );
+  // no usable block: the whole file is the body, exactly as parseNote sees it
+  expect(replaceBody("# Acme\n\nold\n", "new\n")).toBe("new\n");
 });
