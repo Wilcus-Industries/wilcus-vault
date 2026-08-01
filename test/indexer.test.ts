@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { openDb, dbPath } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
 import { reindex, scanVault, readNote } from "../src/indexer";
-import { makeVault, writeNote, cleanupVaults, stubEmbedder } from "./vault-fixture";
+import { makeVault, writeNote, cleanupVaults, stubEmbedder, vecOf } from "./vault-fixture";
 
 afterAll(cleanupVaults);
 
@@ -25,13 +25,6 @@ function open(root: string): Database {
 
 const changes = (db: Database) =>
   (db.query("select total_changes() as c").get() as { c: number }).c;
-
-const vecOf = (db: Database, id: number): Float32Array => {
-  const { emb } = db.query("select emb from vectors where note_id = ?").get(id) as {
-    emb: Uint8Array;
-  };
-  return new Float32Array(emb.buffer.slice(emb.byteOffset, emb.byteOffset + emb.byteLength));
-};
 
 test("scanVault: .md only, dot-directories skipped, symlinks never followed", () => {
   const root = makeVault(FIXTURE);

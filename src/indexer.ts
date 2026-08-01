@@ -36,6 +36,17 @@ export function scanVault(root: string): string[] {
 }
 
 /**
+ * Is this vault-relative path one `scanVault` would index — a `.md` file with
+ * no dot-directory (or dot-file) in it? The same rule, applied to a path we
+ * were handed rather than one we walked to: `fs.watch` reports paths, not
+ * directory entries, so the watcher cannot check for symlinks the way the scan
+ * does (one that slips in is purged by the next `doctor`).
+ */
+export function isNotePath(rel: string): boolean {
+  return rel.endsWith(".md") && !rel.split(/[/\\]/).some((segment) => segment.startsWith("."));
+}
+
+/**
  * Read and parse one note, or null if it is no longer there. A human can
  * delete a file between the scan and the read; that is an ordinary event in a
  * files-are-truth vault, not a reason to abort the run. Any other read error
@@ -56,11 +67,33 @@ export async function readRaw(root: string, rel: string): Promise<string | null>
   }
 }
 
-/** Hash-diff the vault against the index and write only what changed. */
+/** Hash-diff the whole vault against the index and write only what changed. */
 export async function reindex(
   db: Database,
   root: string,
   embedder: Embedder,
+): Promise<IndexStats> {
+  // Every path the files know about plus every path the index knows about: the
+  // ones only the index has are deletions, and `indexPaths` purges them.
+  const indexed = (db.query(`select path from notes`).all() as { path: string }[]).map(
+    (r) => r.path,
+  );
+  return indexPaths(db, root, embedder, [...scanVault(root), ...indexed]);
+}
+
+/**
+ * Hash-diff exactly these vault-relative paths and write only what changed; a
+ * path whose file is gone is purged. `reindex` passes the whole vault, the
+ * watcher passes the handful of paths that just changed — one code path, so a
+ * watched vault and a rebuilt one cannot end up with different rows.
+ * ponytail: reads the whole `notes` table even for one path (three columns of a
+ * hand-written vault). Restrict it to the paths asked for if that ever shows up.
+ */
+export async function indexPaths(
+  db: Database,
+  root: string,
+  embedder: Embedder,
+  rels: Iterable<string>,
 ): Promise<IndexStats> {
   const reembedded = ensureVectors(db, embedder);
   const rows = db.query(`select id, path, hash from notes`).all() as {
@@ -68,8 +101,7 @@ export async function reindex(
     path: string;
     hash: string;
   }[];
-  // Rows we have not matched to a file yet; whatever is left is deleted.
-  const unseen = new Map(rows.map((r) => [r.path, r]));
+  const indexed = new Map(rows.map((r) => [r.path, r]));
   const embedded = new Set(
     (db.query(`select note_id from vector_meta`).all() as { note_id: number }[]).map(
       (r) => r.note_id,
@@ -77,12 +109,17 @@ export async function reindex(
   );
 
   const dirty: { note: Note; mtime: number; id: number | undefined }[] = [];
+  // Rows whose file is no longer on disk — a deletion, or a file removed
+  // between the scan and the read, which is the same thing by the time we look.
+  const gone: number[] = [];
   let unchanged = 0;
-  for (const rel of scanVault(root)) {
+  for (const rel of new Set(rels)) {
+    const row = indexed.get(rel);
     const note = await readNote(root, rel);
-    if (note === null) continue; // deleted mid-run: leave the row for the purge below
-    const row = unseen.get(rel);
-    unseen.delete(rel);
+    if (note === null) {
+      if (row) gone.push(row.id);
+      continue;
+    }
     // A row with no vector is half-indexed (interrupted run) — redo it.
     if (row && row.hash === note.hash && !reembedded && embedded.has(row.id)) {
       unchanged++;
@@ -160,16 +197,16 @@ export async function reindex(
         embedder.dims,
       ]);
     }
-    for (const row of unseen.values()) purgeNote(db, row.id);
+    for (const id of gone) purgeNote(db, id);
     // Resolution depends only on the note set, so an unchanged pass is a no-op
     // — and must stay one, or "nothing changed" would still dirty the file.
-    if (dirty.length || unseen.size) resolveEdges(db);
+    if (dirty.length || gone.length) resolveEdges(db);
   })();
 
   return {
     added: dirty.filter((d) => d.id === undefined).length,
     updated: dirty.filter((d) => d.id !== undefined).length,
-    removed: unseen.size,
+    removed: gone.length,
     unchanged,
     reembedded,
   };

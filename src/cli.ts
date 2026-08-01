@@ -1,17 +1,25 @@
 #!/usr/bin/env bun
+import { resolve } from "node:path";
 import { openDb, dbPath } from "./db";
-import { reindex } from "./indexer";
+import { reindex, type IndexStats } from "./indexer";
 import { doctor, type DoctorReport } from "./doctor";
 import { TokenOverlapEmbedder } from "./embed";
 import { hybridSearch } from "./search";
+import { watch } from "./watch";
 
 const USAGE = `vault <command> [options]
 
   reindex             index new and changed notes
   doctor [--rebuild]  check and repair the index (--rebuild: from scratch)
-  search <query>      hybrid search over the indexed notes
+  search <query>      hybrid search: one line per hit — score, path, title
+  watch               index every change as it is saved, until interrupted
 
-  --vault <dir>       vault root (default: cwd)`;
+  --vault <dir>       vault root (default: the current directory)
+  --help, -h          this text
+  --                  end of flags, so a search query may start with a dash
+
+Exit code 0 on success, 1 on error — and 1 from doctor when it found links
+only a human can fix (broken, ambiguous, or a duplicate filename stem).`;
 
 export async function main(argv: string[]): Promise<number> {
   try {
@@ -26,20 +34,29 @@ export async function main(argv: string[]): Promise<number> {
 }
 
 /**
- * Flags are consumed with their values wherever they appear; everything else is
- * a positional word. `--` ends flag parsing, so a query may start with dashes.
+ * Flags are consumed with their values wherever they appear — before or after
+ * the command — and everything else is a positional word, the first of which is
+ * the command. `--` ends flag parsing, so a query may start with dashes.
  */
-function parseArgs(argv: string[]): { root: string; words: string[]; rebuild: boolean } {
+function parseArgs(argv: string[]): {
+  root: string;
+  words: string[];
+  rebuild: boolean;
+  help: boolean;
+} {
   const words: string[] = [];
   let root = process.cwd();
   let rebuild = false;
+  let help = false;
   let literal = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
-    if (literal || !arg.startsWith("--")) {
+    if (literal || (!arg.startsWith("--") && arg !== "-h")) {
       words.push(arg);
     } else if (arg === "--") {
       literal = true;
+    } else if (arg === "--help" || arg === "-h") {
+      help = true;
     } else if (arg === "--rebuild") {
       rebuild = true;
     } else if (arg !== "--vault") {
@@ -54,22 +71,30 @@ function parseArgs(argv: string[]): { root: string; words: string[]; rebuild: bo
       root = dir;
     }
   }
-  return { root, words, rebuild };
+  return { root, words, rebuild, help };
 }
 
+const COMMANDS = ["reindex", "doctor", "search", "watch"] as const;
+
 async function run(argv: string[]): Promise<number> {
-  const command = argv[0];
-  if (command !== "reindex" && command !== "doctor" && command !== "search") {
-    console.error(USAGE);
+  const { root, words, rebuild, help } = parseArgs(argv);
+  // Help was asked for, so answering it is a success — `vault --help | less`
+  // reads it, and a script checking the exit code is not told it failed.
+  if (help) {
+    console.log(USAGE);
+    return 0;
+  }
+  const [command, ...rest] = words;
+  if (!COMMANDS.includes(command as (typeof COMMANDS)[number])) {
+    console.error(command === undefined ? USAGE : `unknown command ${command}\n\n${USAGE}`);
     return 1;
   }
-  const { root, words, rebuild } = parseArgs(argv.slice(1));
   // The CLI embeds locally: no note text leaves the machine unless a library
   // caller wires up FetchEmbedder.
   const embedder = new TokenOverlapEmbedder();
 
   if (command === "search") {
-    const query = words.join(" ");
+    const query = rest.join(" ");
     if (query === "") throw new Error(`search needs a query\n\n${USAGE}`);
     const db = openDb(dbPath(root));
     try {
@@ -87,12 +112,9 @@ async function run(argv: string[]): Promise<number> {
       console.log(
         hits.length === 0
           ? "no matches"
-          : hits
-              .map(
-                (h) =>
-                  `${h.score.toFixed(4)}  ${h.path}${h.expansion ? " (link)" : ""} — ${h.title}`,
-              )
-              .join("\n"),
+          // score first so the ranking reads down the page, then the note's
+          // identity, then what it is called
+          : hits.map((h) => `${h.score.toFixed(4)}  ${h.path} — ${h.title}`).join("\n"),
       );
     } finally {
       db.close();
@@ -103,11 +125,31 @@ async function run(argv: string[]): Promise<number> {
   if (command === "reindex") {
     const db = openDb(dbPath(root));
     try {
-      const s = await reindex(db, root, embedder);
-      console.log(
-        `indexed ${s.added} new, ${s.updated} changed, ${s.removed} removed, ${s.unchanged} unchanged` +
-          (s.reembedded ? " (re-embedded: model or dims changed)" : ""),
-      );
+      console.log(`indexed ${summary(await reindex(db, root, embedder))}`);
+    } finally {
+      db.close();
+    }
+    return 0;
+  }
+
+  if (command === "watch") {
+    const db = openDb(dbPath(root));
+    try {
+      // Start from a current index: edits made while nothing was watching are
+      // picked up here rather than silently missed.
+      console.log(`indexed ${summary(await reindex(db, root, embedder))}`);
+      const watcher = watch(db, root, embedder, {
+        onChange: (paths, stats) => {
+          // An editor rewriting identical bytes is not news; a change is.
+          if (stats.added || stats.updated || stats.removed) {
+            console.log(`${paths.join(" ")} — ${summary(stats)}`);
+          }
+        },
+      });
+      console.log(`watching ${resolve(root)} — press ctrl-c to stop`);
+      await interrupted();
+      watcher.close();
+      await watcher.idle(); // let a pass in flight finish before the handle goes
     } finally {
       db.close();
     }
@@ -121,6 +163,18 @@ async function run(argv: string[]): Promise<number> {
   const unrepaired =
     report.brokenLinks.length + report.ambiguousLinks.length + report.duplicateStems.length;
   return unrepaired === 0 ? 0 : 1;
+}
+
+const summary = (s: IndexStats): string =>
+  `${s.added} new, ${s.updated} changed, ${s.removed} removed, ${s.unchanged} unchanged` +
+  (s.reembedded ? " (re-embedded: model or dims changed)" : "");
+
+/** `vault watch` runs until it is stopped; this is what "until" means. */
+function interrupted(): Promise<void> {
+  return new Promise((done) => {
+    process.once("SIGINT", () => done());
+    process.once("SIGTERM", () => done());
+  });
 }
 
 function print(r: DoctorReport): void {

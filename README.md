@@ -5,22 +5,77 @@ hybrid semantic + keyword search (sqlite-vec + FTS5 + reciprocal rank fusion), a
 write gate so nothing is silently overwritten. Open the vault in Obsidian or any
 editor — the SQLite index is derived and disposable (`vault doctor --rebuild`).
 
-Status: MVP under construction. See DESIGN.md.
+Status: MVP. Standalone (zero wilcus dependencies), MIT. See DESIGN.md for the
+architecture contract.
+
+## Files are truth
+
+The `.md` files on disk are the only source of truth. Everything in
+`<vault>/.vault/index.db` — note rows, wikilink edges, FTS5 text, embeddings — is
+derived and rebuildable, and no code path may treat it as authoritative. So:
+
+- edit, move, rename or delete notes with any editor, or `git checkout` the whole
+  vault, and nothing is lost — `vault doctor` reconciles the index to the files;
+- delete `index.db` whenever you like; `vault doctor --rebuild` recreates it;
+- the vault is a plain directory of markdown. Nothing here owns it.
+
+## Install
+
+Bun 1.3+ (this uses `bun:sqlite`, `Bun.YAML` and `Bun.CryptoHasher` — there is no
+Node build). Not published to npm yet:
 
 ```
-bun run src/cli.ts reindex [--vault <dir>]            # index new and changed notes
-bun run src/cli.ts doctor [--rebuild] [--vault <dir>] # check and repair the index
-bun run src/cli.ts search <query> [--vault <dir>]     # hybrid search over the index
+git clone https://github.com/CrazyWillBear/wilcus-vault && cd wilcus-vault
+bun install
+bun run src/cli.ts --help
 ```
 
-The CLI embeds locally with the deterministic bag-of-tokens embedder, so nothing
-leaves the machine. A library caller can inject `FetchEmbedder` instead
-(OpenAI-compatible `/v1/embeddings`, configured from `VAULT_EMBED_API_KEY`,
-`VAULT_EMBED_ENDPOINT`, `VAULT_EMBED_MODEL` and `VAULT_EMBED_DIMS`) — note that
-whole note bodies then leave the machine on every embed.
+For a `vault` on your PATH, `bun link` in the clone. As a library, depend on the
+directory (`bun add file:../wilcus-vault`) and import from `@wilcus/vault`.
 
-The index lives at `<vault>/.vault/index.db` and is safe to delete — `doctor
---rebuild` recreates it from the files.
+## CLI
+
+```
+vault reindex [--vault <dir>]            # index new and changed notes
+vault doctor [--rebuild] [--vault <dir>] # check and repair the index
+vault search <query> [--vault <dir>]     # hybrid search, best first
+vault watch [--vault <dir>]              # index changes as they are saved
+vault --help                             # every command and flag
+```
+
+`--vault` defaults to the current directory; `--` ends flag parsing, so a query
+may start with a dash. Exit code 0 on success, 1 on error — and 1 from `doctor`
+when it found problems only a human can fix (broken or ambiguous wikilinks, a
+duplicate filename stem).
+
+```
+$ vault search renewal terms
+0.0328  customers/acme.md — Acme Corp
+0.0161  customers/globex.md — Globex
+```
+
+One line per hit: fused RRF score, vault-relative path, title. The CLI sets no
+relevance cutoffs — no fixed cosine ceiling is meaningful for the bag-of-tokens
+embedder — so it shows the ranking and lets you judge it. Library callers with a
+real embedder pass their own (`cutoffs`), and the write gate must.
+
+`vault watch` reindexes once, then follows `fs.watch` (recursive) with a ~250ms
+per-path debounce, re-embedding only notes whose content hash actually changed.
+It logs each pass and stops on ctrl-c. It is a convenience, never a source of
+truth: anything it misses — a directory rename, a pass that failed, a crash —
+`vault doctor` finds and fixes.
+
+## Obsidian
+
+Point Obsidian (or any editor) at the vault directory and work normally. Notes
+are ordinary markdown with YAML frontmatter and `[[wikilink]]`s, one note per
+file, subdirectories as namespaces. Filename stems must be vault-wide unique —
+that is what a wikilink resolves against, and `vault doctor` reports duplicates.
+
+Obsidian hides dot-directories, so `.vault/` stays out of the way; the scan skips
+it (and `.git/`, `.obsidian/`, …) for the same reason. If the vault is a git repo,
+add `.vault/` to its `.gitignore` — the index is a build artifact, not content.
+Run `vault watch` alongside your editing session to keep search current.
 
 ## Library
 
@@ -38,17 +93,70 @@ const vault = open("/path/to/vault", {
 });
 
 await vault.reindex();
-await vault.search("acme renewal");
+await vault.search("acme renewal", { n: 5, cutoffs: { distanceCeiling: 0.35 } });
 await vault.propose({ title: "Acme renewal 2026", type: "customer", namespace: "customers", body });
 await vault.doctor();
+
+const watcher = vault.watch();     // keep the index warm while a human edits
+watcher.close();
 vault.close();
 ```
 
-`propose` is the write gate: it hybrid-searches for similar notes, asks the
-decider to `update`, `supersede`, `create` or `discard`, and applies that with
-two rails — it re-hashes a target immediately before writing (a human edit
-mid-flight aborts the apply, re-runs the gate once, then falls back to `create`)
-and confines every path it writes to the vault root. Writes land through a temp
-file renamed into place. A discarded candidate — or one the gate cannot place —
-is appended whole to `.vault/discarded.log`. Notes it did not author are patched
-textually, never re-serialized, so comments and `01234` survive.
+### The write gate
+
+`propose` is the only way a program writes to the vault:
+
+1. hybrid-search the candidate against the vault, with mandatory relevance
+   cutoffs, and re-read each hit from disk;
+2. ask your `decider` for one action — `update`, `supersede`, `create` or
+   `discard` — over those notes;
+3. apply it behind two rails. **Check-and-write:** a target is re-hashed
+   immediately before it is touched, so a human edit mid-flight aborts the apply,
+   re-runs the gate once, then falls back to `create`. **Path confinement:** every
+   written path is `<namespace>/<slug>.md` with a single slugified segment,
+   resolved under the vault root, never through a symlink or dot-directory.
+
+Writes land through a temp file renamed into place, so a reader never sees half a
+note. A discarded candidate — or one the gate cannot place at all — is appended
+whole to `.vault/discarded.log`; losing the note is never an outcome. Notes the
+gate did not author are patched textually, never re-serialized, so comments,
+`01234` and `1.0` survive. Human edits bypass the gate by definition:
+`vault watch` and `vault doctor` pick them up.
+
+```ts
+const result = await vault.propose(candidate);
+// { action: "supersede", path: "customers/acme-renewal-2026.md",
+//   superseded: "customers/acme.md", fellBack: false }
+```
+
+### Embedders
+
+An `Embedder` is `{ model, dims, embed(texts) }` and is always injected — the
+vault never hardcodes a provider. Two ship:
+
+- `TokenOverlapEmbedder` — deterministic bag-of-tokens, no network. What the CLI
+  and the test suite use: it exercises the plumbing, not semantics.
+- `FetchEmbedder` — any OpenAI-compatible `POST /v1/embeddings`. Note that whole
+  note bodies leave the machine on every embed; choose the provider accordingly.
+
+```ts
+import { open, FetchEmbedder } from "@wilcus/vault";
+
+// each option falls back to its env var: VAULT_EMBED_API_KEY, VAULT_EMBED_ENDPOINT,
+// VAULT_EMBED_MODEL, VAULT_EMBED_DIMS. The key is never persisted, logged, or
+// echoed back in a provider's error message.
+const vault = open(root, { embedder: new FetchEmbedder({ dims: 1536 }) });
+await vault.doctor(); // first run with a new model: re-embeds everything
+```
+
+`dims` must match what the model returns — it is part of the vec0 table's schema.
+Changing either the model or the dims invalidates every stored vector, so the next
+`doctor` (or `reindex`) drops the vector table and re-embeds every note; search
+refuses to mix vector spaces until it has. Notes are embedded whole; there is no
+chunking.
+
+## Development
+
+```
+bun run check     # bun test && tsc --noEmit — green before any PR
+```

@@ -8,6 +8,7 @@ import { reindex as reindexVault, type IndexStats } from "./indexer";
 import { doctor as runDoctor, type DoctorOptions, type DoctorReport } from "./doctor";
 import { propose as runGate, type Candidate, type GateOptions, type GateResult } from "./gate";
 import { hybridSearch, type SearchHit, type SearchOptions } from "./search";
+import { watch as watchVault, type WatchOptions, type Watcher } from "./watch";
 import type { Embedder } from "./embed";
 
 export type VaultOptions = {
@@ -27,6 +28,8 @@ export type Vault = {
   reindex(): Promise<IndexStats>;
   /** report and repair index drift; `--rebuild` reindexes from scratch */
   doctor(options?: DoctorOptions): Promise<DoctorReport>;
+  /** keep the index up to date as the files change, until `close()` */
+  watch(options?: WatchOptions): Watcher;
   close(): void;
 };
 
@@ -56,6 +59,9 @@ export function open(root: string, { embedder, gate }: VaultOptions): Vault {
       }
       return report;
     },
+    // `db` is re-opened by a rebuild, so the watcher is handed the handle that
+    // is current when it starts, not the one this closure was built with.
+    watch: (options) => watchVault(db, dir, embedder, options),
     close: () => db.close(),
   };
 }
@@ -64,6 +70,7 @@ export type { Candidate, GateResult, GateOptions } from "./gate";
 export type { SearchHit, SearchOptions, Cutoffs } from "./search";
 export type { Embedder } from "./embed";
 export type { DoctorReport, DoctorOptions } from "./doctor";
+export type { WatchOptions, Watcher } from "./watch";
 export type { IndexStats } from "./indexer";
 export type { Note } from "./note";
 export { gatePrompt, parseDecision, slugify } from "./gate";

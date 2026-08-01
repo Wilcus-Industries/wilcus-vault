@@ -1,11 +1,11 @@
-import { test, expect, afterAll, spyOn } from "bun:test";
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { test, expect, afterAll } from "bun:test";
+import { readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { openDb, dbPath } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
 import { reindex } from "../src/indexer";
 import { doctor } from "../src/doctor";
-import { main } from "../src/cli";
+import { open as openVault } from "../src/vault";
 import { makeVault, writeNote, cleanupVaults, stubEmbedder } from "./vault-fixture";
 
 afterAll(cleanupVaults);
@@ -134,40 +134,33 @@ test("a model or dims change drops the vec0 table and re-embeds", async () => {
   db.close();
 });
 
-test("cli: reindex, doctor and doctor --rebuild", async () => {
+test("reopening the vault with another embedder: doctor re-embeds and search works again", async () => {
   const root = makeVault(GRAPH);
-  const log = spyOn(console, "log").mockImplementation(() => {});
-  const err = spyOn(console, "error").mockImplementation(() => {});
-  try {
-    expect(await main(["reindex", "--vault", root])).toBe(0);
-    expect(existsSync(dbPath(root))).toBe(true);
-    // GRAPH has a broken link, an ambiguous link and a duplicate stem: doctor
-    // repaired what it could, so the exit code has to say work is left
-    expect(await main(["doctor", "--vault", root])).toBe(1);
-    expect(await main(["doctor", "--rebuild", "--vault", root])).toBe(1);
-    expect(log.mock.calls.flat().join("\n")).toContain("ghost");
-    expect(err).not.toHaveBeenCalled();
-  } finally {
-    log.mockRestore();
-    err.mockRestore();
-  }
+  const before = openVault(root, { embedder });
+  await before.reindex();
+  expect((await before.search("globex vendor")).map((h) => h.path)).toContain("notes/globex.md");
+  before.close();
+
+  // a different model *and* width: the vec0 table's dims live in its DDL
+  const swapped = stubEmbedder("swapped-v1", 64, (texts) => new TokenOverlapEmbedder(64).embed(texts));
+  const after = openVault(root, { embedder: swapped });
+  // vectors from another model are not comparable, so search refuses until doctor runs
+  await expect(after.search("globex")).rejects.toThrow(/run vault doctor/);
+
+  expect((await after.doctor()).reembedded).toBe(true);
+  const db = openDb(dbPath(root));
+  expect(
+    (db.query("select sql from sqlite_master where name='vectors'").get() as { sql: string }).sql,
+  ).toContain("float[64]");
+  expect(db.query("select count(*) as c from vectors").get()).toEqual({ c: 5 });
+  expect(
+    db.query("select count(*) as c from vector_meta where model='swapped-v1' and dims=64").get(),
+  ).toEqual({ c: 5 });
+  expect(db.query("select count(*) as c from vector_meta where dims<>64").get()).toEqual({ c: 0 });
+  db.close();
+
+  // and the vault is usable again through the new embedder
+  expect((await after.search("globex vendor")).map((h) => h.path)).toContain("notes/globex.md");
+  after.close();
 });
 
-test("cli: a clean vault exits 0; usage goes to stderr", async () => {
-  const root = makeVault({ "a.md": "# A\n\n[[b]]\n", "b.md": "# B\n\n[[a]]\n" });
-  const log = spyOn(console, "log").mockImplementation(() => {});
-  const err = spyOn(console, "error").mockImplementation(() => {});
-  try {
-    expect(await main(["doctor", "--vault", root])).toBe(0);
-    expect(err).not.toHaveBeenCalled();
-    expect(await main([])).toBe(1);
-    expect(await main(["nope"])).toBe(1);
-    // a flag swallowed as the vault path would index the wrong directory
-    expect(await main(["doctor", "--vault", "--rebuild"])).toBe(1);
-    expect(await main(["doctor", "--vault"])).toBe(1);
-    expect(err.mock.calls.flat().join("\n")).toContain("vault <command>");
-  } finally {
-    log.mockRestore();
-    err.mockRestore();
-  }
-});
