@@ -120,9 +120,22 @@ is well-defined regardless of provider). Ships: `TokenOverlapEmbedder`
 semantics) and `FetchEmbedder` (OpenAI-compatible `/v1/embeddings`; endpoint,
 model, dims and key from the constructor falling back to `VAULT_EMBED_*` env
 vars, never persisted to DB/frontmatter and never echoed in error messages —
-a quoted provider error body has the key redacted out; note that whole note
-bodies leave the machine on every embed — callers choose the provider
-accordingly). Requests are batched by text count *and* by characters, since a
+a quoted provider error body has the key redacted out).
+
+Unconfigured, `FetchEmbedder` is **local**: `http://localhost:11434/v1/embeddings`
+with `all-minilm` at 384 dims — Ollama's OpenAI-compatible route, so the default
+costs no dependency and no note ever leaves the machine. A cloud provider is
+supported but never inherited: whole note bodies leave the machine on every
+embed, so that is a choice a caller makes explicitly (and then supplies `model`
+and `dims` for — the defaults describe the local model). An endpoint on
+localhost needs no API key; any other endpoint refuses to construct without one.
+When nothing answers at a local endpoint the first request fails with
+"no embedder configured: start Ollama (`ollama pull all-minilm`) or configure a
+remote provider" — one attempt, no retry, and no fallback to a remote provider,
+which would ship note bodies off the machine to fix a daemon that is merely not
+running. A timeout means something *is* listening and is reported as itself.
+
+Requests are batched by text count *and* by characters, since a
 whole-note payload is what actually blows a provider's per-request limit. Notes
 embedded whole — no chunking.
 

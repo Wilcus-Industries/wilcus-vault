@@ -89,8 +89,8 @@ async function run(argv: string[]): Promise<number> {
     console.error(command === undefined ? USAGE : `unknown command ${command}\n\n${USAGE}`);
     return 1;
   }
-  // The CLI embeds locally: no note text leaves the machine unless a library
-  // caller wires up FetchEmbedder.
+  // The CLI embeds in-process: no daemon to start, and no note text leaves the
+  // machine unless a library caller points FetchEmbedder at a remote provider.
   const embedder = new TokenOverlapEmbedder();
 
   if (command === "search") {

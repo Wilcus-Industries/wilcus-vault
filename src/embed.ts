@@ -1,5 +1,6 @@
-// Embedders are injected — the vault never hardcodes a provider. Two ship:
-// a deterministic one for tests and evals, and an OpenAI-compatible HTTP one.
+// Embedders are injected — the vault never hardcodes a provider. Two ship: a
+// deterministic one for tests and evals, and an OpenAI-compatible HTTP one
+// whose unconfigured default is a small model on a local Ollama, never a cloud.
 
 export interface Embedder {
   /** identity of the vector space; a change forces a full re-embed */
@@ -40,14 +41,25 @@ export class TokenOverlapEmbedder implements Embedder {
   }
 }
 
+/** Zero-config: a small model on a local Ollama. Nothing leaves the machine. */
+const LOCAL_ENDPOINT = "http://localhost:11434/v1/embeddings";
+const LOCAL_MODEL = "all-minilm";
+const LOCAL_DIMS = 384;
+const NO_EMBEDDER =
+  "no embedder configured: start Ollama (`ollama pull all-minilm`) or configure a remote provider";
+
+/** An endpoint on this machine: no API key, and its own diagnosis when it is down. */
+const isLocal = (endpoint: string): boolean =>
+  ["localhost", "127.0.0.1", "[::1]"].includes(new URL(endpoint).hostname);
+
 export type FetchEmbedderOptions = {
-  /** default `$VAULT_EMBED_MODEL` */
+  /** default `$VAULT_EMBED_MODEL`, else `all-minilm` */
   model?: string;
-  /** default `$VAULT_EMBED_DIMS` — must match what the model returns */
+  /** default `$VAULT_EMBED_DIMS`, else 384 — must match what the model returns */
   dims?: number;
-  /** OpenAI-compatible embeddings URL; default `$VAULT_EMBED_ENDPOINT` */
+  /** OpenAI-compatible embeddings URL; default `$VAULT_EMBED_ENDPOINT`, else local Ollama */
   endpoint?: string;
-  /** default `$VAULT_EMBED_API_KEY`; never persisted and never logged */
+  /** default `$VAULT_EMBED_API_KEY`; required for a remote endpoint, never persisted or logged */
   apiKey?: string;
   /** texts per request */
   batchSize?: number;
@@ -59,36 +71,40 @@ export type FetchEmbedderOptions = {
 };
 
 /**
- * OpenAI-compatible `POST /v1/embeddings`. Whole note bodies leave the machine
- * on every embed — that is the caller's provider choice to make, per DESIGN.md
- * § Embedding. The API key lives in a private field: it is never written to the
- * DB or frontmatter, never echoed in an error, and redacted out of any provider
- * response body we quote back.
+ * OpenAI-compatible `POST /v1/embeddings`. Unconfigured it is a local Ollama
+ * (`all-minilm`, 384 dims) and nothing leaves the machine; a remote provider is
+ * an explicit choice — endpoint and key from the constructor or `VAULT_EMBED_*`
+ * — because with one whole note bodies leave the machine on every embed, per
+ * DESIGN.md § Embedding. The API key lives in a private field: it is never
+ * written to the DB or frontmatter, never echoed in an error, and redacted out
+ * of any provider response body we quote back.
  */
 export class FetchEmbedder implements Embedder {
   readonly model: string;
   readonly dims: number;
   readonly #key: string;
   readonly #endpoint: string;
+  readonly #local: boolean;
   readonly #batchSize: number;
   readonly #maxChars: number;
   readonly #timeoutMs: number;
   readonly #fetch: typeof fetch;
 
   constructor(o: FetchEmbedderOptions = {}) {
+    this.#endpoint = o.endpoint ?? process.env["VAULT_EMBED_ENDPOINT"] ?? LOCAL_ENDPOINT;
+    this.#local = isLocal(this.#endpoint);
     const key = o.apiKey ?? process.env["VAULT_EMBED_API_KEY"] ?? "";
-    if (key === "") {
+    // A daemon on this machine has no key to give; a remote provider always does.
+    if (key === "" && !this.#local) {
       throw new Error("FetchEmbedder: no API key — pass apiKey or set VAULT_EMBED_API_KEY");
     }
     this.#key = key;
-    this.model = o.model ?? process.env["VAULT_EMBED_MODEL"] ?? "text-embedding-3-small";
-    this.dims = o.dims ?? Number(process.env["VAULT_EMBED_DIMS"] ?? 1536);
+    this.model = o.model ?? process.env["VAULT_EMBED_MODEL"] ?? LOCAL_MODEL;
+    this.dims = o.dims ?? Number(process.env["VAULT_EMBED_DIMS"] ?? LOCAL_DIMS);
     // Caught here rather than as "every response is the wrong width" later.
     if (!Number.isInteger(this.dims) || this.dims < 1) {
       throw new Error(`FetchEmbedder: dims must be a positive integer, got ${this.dims}`);
     }
-    this.#endpoint =
-      o.endpoint ?? process.env["VAULT_EMBED_ENDPOINT"] ?? "https://api.openai.com/v1/embeddings";
     // ponytail: batch by count and by characters — characters approximate the
     // token budget a provider actually enforces. Count real tokens if a
     // provider starts rejecting batches.
@@ -116,12 +132,26 @@ export class FetchEmbedder implements Embedder {
   }
 
   async #post(input: string[]): Promise<Float32Array[]> {
-    const res = await this.#fetch(this.#endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${this.#key}` },
-      body: JSON.stringify({ model: this.model, input }),
-      signal: AbortSignal.timeout(this.#timeoutMs), // a hung provider must not hang the indexer
-    });
+    let res: Response;
+    try {
+      res = await this.#fetch(this.#endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          // A local daemon wants no key, and `Bearer ` alone is a malformed one.
+          ...(this.#key === "" ? {} : { authorization: `Bearer ${this.#key}` }),
+        },
+        body: JSON.stringify({ model: this.model, input }),
+        signal: AbortSignal.timeout(this.#timeoutMs), // a hung provider must not hang the indexer
+      });
+    } catch (e) {
+      // Nothing is listening on the local default: say what to do about it, on
+      // the first attempt. There is no retry and above all no fall back to
+      // somebody's cloud API — note bodies never leave the machine by accident.
+      // A timeout is a different failure (something *is* there) and stays as it is.
+      if (this.#local && (e as { name?: string }).name !== "TimeoutError") throw new Error(NO_EMBEDDER);
+      throw e;
+    }
     if (!res.ok) {
       throw new Error(
         `embedding request failed: ${res.status} ${this.#redact(await res.text().catch(() => ""))}`,
@@ -180,7 +210,9 @@ export class FetchEmbedder implements Embedder {
    * happens to straddle the cut.
    */
   #redact(body: string): string {
-    return body.replaceAll(this.#key, "[redacted]").slice(0, 200);
+    // Replacing "" would splice [redacted] between every character of a
+    // keyless (local) provider's perfectly quotable error.
+    return (this.#key === "" ? body : body.replaceAll(this.#key, "[redacted]")).slice(0, 200);
   }
 }
 

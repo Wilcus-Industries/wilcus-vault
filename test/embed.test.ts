@@ -10,6 +10,26 @@ const failure = (p: Promise<unknown>): Promise<Error> =>
     (e: Error) => e,
   );
 
+/**
+ * Run `fn` with the `VAULT_EMBED_*` environment set to exactly `env` — every
+ * other one unset, so a developer's own shell cannot decide what the defaults
+ * test sees — then put the real environment back.
+ */
+function withEnv<T>(env: Record<string, string>, fn: () => T): T {
+  const names = ["VAULT_EMBED_API_KEY", "VAULT_EMBED_ENDPOINT", "VAULT_EMBED_MODEL", "VAULT_EMBED_DIMS"];
+  const prev = names.map((n) => [n, process.env[n]] as const);
+  try {
+    for (const n of names) delete process.env[n];
+    for (const [n, v] of Object.entries(env)) process.env[n] = v;
+    return fn();
+  } finally {
+    for (const [n, v] of prev) {
+      if (v === undefined) delete process.env[n];
+      else process.env[n] = v;
+    }
+  }
+}
+
 /** A fetch stub that records its calls and answers with `dims`-wide vectors. */
 function stubFetch(dims: number, reply?: (input: string[]) => Response) {
   const calls: { url: string; init: RequestInit; body: { model: string; input: string[] } }[] = [];
@@ -124,27 +144,94 @@ test("FetchEmbedder reports a non-JSON body instead of throwing a parse error", 
 test("FetchEmbedder refuses nonsense dims at construction", () => {
   expect(() => new FetchEmbedder({ apiKey: KEY, dims: 0 })).toThrow(/dims/);
   expect(() => new FetchEmbedder({ apiKey: KEY, dims: 1.5 })).toThrow(/dims/);
-  const prev = process.env["VAULT_EMBED_DIMS"];
-  try {
-    process.env["VAULT_EMBED_DIMS"] = "wide";
+  withEnv({ VAULT_EMBED_DIMS: "wide" }, () => {
     expect(() => new FetchEmbedder({ apiKey: KEY })).toThrow(/dims/);
-  } finally {
-    if (prev === undefined) delete process.env["VAULT_EMBED_DIMS"];
-    else process.env["VAULT_EMBED_DIMS"] = prev;
-  }
+  });
 });
 
-test("FetchEmbedder reads the key from the environment and refuses to run without one", () => {
-  const prev = process.env["VAULT_EMBED_API_KEY"];
-  try {
-    process.env["VAULT_EMBED_API_KEY"] = "env-key";
+test("FetchEmbedder unconfigured is a small local model, never a cloud provider", async () => {
+  const { calls, fn } = withEnv({}, () => stubFetch(384));
+  const e = withEnv({}, () => new FetchEmbedder({ fetch: fn }));
+  expect(e.model).toBe("all-minilm");
+  expect(e.dims).toBe(384);
+
+  await e.embed(["a"]);
+  expect(calls[0]!.url).toBe("http://localhost:11434/v1/embeddings");
+  // no key exists to send, and a local daemon does not want one
+  expect((calls[0]!.init.headers as Record<string, string>)["authorization"]).toBeUndefined();
+});
+
+test("FetchEmbedder fails fast and actionably when the local endpoint is unreachable", async () => {
+  // what Bun throws on a refused connection — no network needed to reproduce it
+  const refused = () => {
+    throw new Error("Unable to connect. Is the computer able to access the url?");
+  };
+  const calls: string[] = [];
+  const fn = (async (url: string | URL | Request) => {
+    calls.push(String(url));
+    refused();
+  }) as unknown as typeof fetch;
+
+  const e = withEnv({}, () => new FetchEmbedder({ fetch: fn }));
+  const started = Bun.nanoseconds();
+  const err = await failure(e.embed(["a"]));
+  expect(err.message).toBe(
+    "no embedder configured: start Ollama (`ollama pull all-minilm`) or configure a remote provider",
+  );
+  // one attempt, at the local endpoint: no retry storm, and above all no
+  // silent second try against somebody's cloud API
+  expect(calls).toEqual(["http://localhost:11434/v1/embeddings"]);
+  expect((Bun.nanoseconds() - started) / 1e6).toBeLessThan(1_000);
+});
+
+test("FetchEmbedder reports a hung local endpoint as a timeout, not as 'start Ollama'", async () => {
+  const fn = (async () => {
+    throw new DOMException("The operation timed out.", "TimeoutError");
+  }) as unknown as typeof fetch;
+  const e = withEnv({}, () => new FetchEmbedder({ fetch: fn, timeoutMs: 5 }));
+  const err = await failure(e.embed(["a"]));
+  expect(err.message).not.toContain("no embedder configured");
+  expect(err.name).toBe("TimeoutError");
+});
+
+test("FetchEmbedder demands a key for a remote endpoint but not for a local one", () => {
+  withEnv({}, () => {
     expect(new FetchEmbedder({ dims: 4 })).toBeInstanceOf(FetchEmbedder);
-    delete process.env["VAULT_EMBED_API_KEY"];
+    expect(() => new FetchEmbedder({ dims: 4, endpoint: "https://api.openai.com/v1/embeddings" })).toThrow(
+      /VAULT_EMBED_API_KEY/,
+    );
+    for (const local of ["http://127.0.0.1:11434/v1/embeddings", "http://[::1]:11434/v1/embeddings"]) {
+      expect(new FetchEmbedder({ dims: 4, endpoint: local })).toBeInstanceOf(FetchEmbedder);
+    }
+  });
+  withEnv({ VAULT_EMBED_ENDPOINT: "https://api.openai.com/v1/embeddings" }, () => {
     expect(() => new FetchEmbedder({ dims: 4 })).toThrow(/VAULT_EMBED_API_KEY/);
-  } finally {
-    if (prev === undefined) delete process.env["VAULT_EMBED_API_KEY"];
-    else process.env["VAULT_EMBED_API_KEY"] = prev;
-  }
+  });
+});
+
+test("FetchEmbedder env config selects a remote provider over the local default", async () => {
+  const { calls, fn } = stubFetch(1536);
+  const e = withEnv(
+    {
+      VAULT_EMBED_API_KEY: KEY,
+      VAULT_EMBED_ENDPOINT: "https://api.openai.com/v1/embeddings",
+      VAULT_EMBED_MODEL: "text-embedding-3-small",
+      VAULT_EMBED_DIMS: "1536",
+    },
+    () => new FetchEmbedder({ fetch: fn }),
+  );
+  expect([e.model, e.dims]).toEqual(["text-embedding-3-small", 1536]);
+  await e.embed(["a"]);
+  expect(calls[0]!.url).toBe("https://api.openai.com/v1/embeddings");
+  expect((calls[0]!.init.headers as Record<string, string>)["authorization"]).toBe(`Bearer ${KEY}`);
+});
+
+test("FetchEmbedder quotes a keyless provider error body verbatim", async () => {
+  // redacting the empty string would splice [redacted] between every character
+  const { fn } = stubFetch(384, () => new Response("model 'all-minilm' not found", { status: 404 }));
+  const e = withEnv({}, () => new FetchEmbedder({ fetch: fn }));
+  const err = await failure(e.embed(["x"]));
+  expect(err.message).toContain("404 model 'all-minilm' not found");
 });
 
 test("FetchEmbedder rejects a response that does not match the request", async () => {
