@@ -228,6 +228,10 @@ test("patchFrontmatter prepends a block when there is no usable one", () => {
   for (const raw of [
     "# Acme\n\nbody\n", // no frontmatter at all
     "---\ntype: customer\n\nunterminated\n", // no closing fence
+    // Fenced but not parseable: parseNote ignores the block and takes the whole
+    // file as body, so patching *inside* it would write a key nothing reads.
+    "---\ntype: [unclosed\n---\n# Acme\n\nbody\n",
+    "---\n- a\n- b\n---\nbody\n", // a sequence, not a mapping
     "", // empty file
   ]) {
     const out = patchFrontmatter(raw, "superseded_by", "notes/new.md");
@@ -235,6 +239,34 @@ test("patchFrontmatter prepends a block when there is no usable one", () => {
     expect(out.endsWith(raw)).toBe(true); // the body is never touched
     expect(parseNote(out, "x/a.md").frontmatter["superseded_by"]).toBe("notes/new.md");
   }
+});
+
+test("a duplicate key cannot survive the patch and win by YAML last-wins", () => {
+  const out = patchFrontmatter(
+    "---\nupdated: old\ntype: customer\nupdated: older\n---\nbody\n",
+    "updated",
+    "2026-08-01",
+  );
+  expect(parseNote(out, "x/a.md").frontmatter["updated"]).toBe("2026-08-01");
+  expect(out).not.toContain("older");
+  expect(out).toContain("type: customer");
+});
+
+test("patchFrontmatter sees through a BOM instead of prepending past it", () => {
+  const out = patchFrontmatter("﻿---\ntype: customer\n---\nbody\n", "updated", "2026-08-01");
+  expect(out).toBe(`﻿---\ntype: customer\nupdated: "2026-08-01"\n---\nbody\n`);
+  expect(replaceBody("﻿---\ntype: customer\n---\nold\n", "new\n")).toBe(
+    "﻿---\ntype: customer\n---\nnew\n",
+  );
+});
+
+test("an ISO timestamp is written as a YAML-native scalar, other values are quoted", () => {
+  expect(patchFrontmatter("---\na: b\n---\nx", "updated", "2026-08-01T09:41:00.000Z")).toContain(
+    "updated: 2026-08-01T09:41:00.000Z\n",
+  );
+  expect(patchFrontmatter("---\na: b\n---\nx", "superseded_by", "notes/new.md")).toContain(
+    `superseded_by: "notes/new.md"\n`,
+  );
 });
 
 test("patchFrontmatter keeps CRLF line endings and rejects an unusable key", () => {
@@ -253,4 +285,5 @@ test("replaceBody swaps the body and keeps the frontmatter block verbatim", () =
   );
   // no usable block: the whole file is the body, exactly as parseNote sees it
   expect(replaceBody("# Acme\n\nold\n", "new\n")).toBe("new\n");
+  expect(replaceBody("---\ntype: [unclosed\n---\nold\n", "new\n")).toBe("new\n");
 });

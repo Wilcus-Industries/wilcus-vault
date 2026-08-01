@@ -4,7 +4,7 @@
 // touched mid-flight is clobbered) and path confinement (an LLM-derived string
 // never names a raw filesystem path).
 import type { Database } from "bun:sqlite";
-import { appendFileSync, existsSync, lstatSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, renameSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { parseNote, patchFrontmatter, replaceBody, serializeNote, type Note } from "./note";
 import { readRaw, reindex } from "./indexer";
@@ -69,6 +69,14 @@ export type GateResult = {
   path?: string;
   /** the note marked `superseded_by`, for `supersede` */
   superseded?: string;
+  /**
+   * `supersede` wrote the successor but could **not** mark this note: it
+   * changed again in the window between the check and the patch, and a human's
+   * edit does not get overwritten to tidy up our bookkeeping. The successor
+   * stands, this note is untouched and still live in search — the caller (or a
+   * later `propose`) reconciles.
+   */
+  unmarked?: string;
   /** the decision was abandoned: the target changed under two gate runs */
   fellBack: boolean;
 };
@@ -82,19 +90,18 @@ const MAX_SLUG_TRIES = 50;
 /**
  * A single filename segment, `[a-z0-9-]+`. Everything else — separators, dots,
  * accents, punctuation — collapses to a hyphen, so a title can never smuggle a
- * path in (`../../evil` is the note `evil`). Throws when nothing survives:
- * a note with no nameable title is a caller bug, not a file called `-`.
+ * path in (`../../evil` is the note `evil`). Null when nothing survives, which
+ * a Japanese or Russian title does legitimately: the caller names the file
+ * some other way rather than dropping the note.
+ * ponytail: ASCII-only slugs. Transliterate if non-Latin vaults become normal.
  */
-export function slugify(title: string): string {
+export function slugify(title: string): string | null {
   const slug = title
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .slice(0, MAX_SLUG)
     .replace(/^-+|-+$/g, "");
-  if (slug === "") {
-    throw new Error(`write gate: title ${JSON.stringify(title)} has no slug characters`);
-  }
-  return slug;
+  return slug === "" ? null : slug;
 }
 
 /**
@@ -141,6 +148,9 @@ export function checkDecision(value: unknown): Decision {
   const { action, target, body } = d;
   if (target !== undefined && typeof target !== "string") bad("a non-string target");
   if (body !== undefined && typeof body !== "string") bad("a non-string body");
+  // An empty body is not an instruction to blank a note — it is a model that
+  // lost the text. `update` would truncate the target with it.
+  if (body !== undefined && body.trim() === "") bad("an empty body");
 
   const needsTarget = action === "update" || action === "supersede";
   if (needsTarget && !target) bad(`${action} without a target`);
@@ -166,6 +176,13 @@ export function parseDecision(text: string): Decision {
   return checkDecision(value);
 }
 
+/**
+ * Note text is data, not instruction. Anything that could pass for one of the
+ * delimiters below is indented one space, so a note body cannot close its own
+ * fence and address the model directly. The text still reads normally.
+ */
+const fence = (text: string): string => text.trim().replace(/^---[ \t]*(begin|end)/gim, " $&");
+
 /** The prompt an LLM decider gets. `parseDecision` reads what it asks for. */
 export function gatePrompt({ candidate, similar }: DeciderInput): string {
   const notes =
@@ -175,7 +192,7 @@ export function gatePrompt({ candidate, similar }: DeciderInput): string {
           .map(
             (s, i) =>
               `[${i + 1}] path: ${s.note.path}\n    title: ${s.note.title}\n` +
-              `--- begin note ---\n${s.note.body.trim()}\n--- end note ---`,
+              `--- begin note ---\n${fence(s.note.body)}\n--- end note ---`,
           )
           .join("\n\n");
   return `You are the write gate of a markdown memory vault. Decide what should happen to one candidate note.
@@ -184,7 +201,7 @@ CANDIDATE
 title: ${candidate.title}
 type: ${candidate.type ?? "(none)"}
 --- begin candidate ---
-${candidate.body.trim()}
+${fence(candidate.body)}
 --- end candidate ---
 
 EXISTING NOTES THAT LOOK SIMILAR
@@ -222,6 +239,15 @@ export async function propose(
   candidate: Candidate,
   { decider, cutoffs, n = 5 }: GateOptions,
 ): Promise<GateResult> {
+  // `{}` type-checks, which would make the mandate above cosmetic: with no
+  // ceiling at all the search returns the least unrelated note and the gate
+  // acts on it. A caller who wants everything says so with a wide ceiling.
+  if (cutoffs.distanceCeiling === undefined && cutoffs.bm25Ceiling === undefined) {
+    throw new Error(
+      "write gate: cutoffs must set distanceCeiling or bm25Ceiling — without one, " +
+        "'most similar note' is only 'least unrelated note'",
+    );
+  }
   const base = resolve(root);
   let applied: Applied | null = null;
   let fellBack = false;
@@ -269,6 +295,7 @@ async function findSimilar(
   });
   const similar: SimilarNote[] = [];
   for (const hit of hits) {
+    confinedPath(root, hit.path); // the index is derived data, not a trusted path source
     const raw = await readRaw(root, hit.path);
     if (raw === null) continue; // indexed but gone: files are truth, the row is stale
     const note = parseNote(raw, hit.path);
@@ -286,7 +313,7 @@ async function apply(
   similar: SimilarNote[],
 ): Promise<Applied | null> {
   if (decision.action === "discard") {
-    discard(root, candidate, decision);
+    logCandidate(root, candidate, { decision });
     return { action: "discard" };
   }
   if (decision.action === "create") return await create(db, root, candidate, decision.body);
@@ -301,17 +328,37 @@ async function apply(
   if (decision.action === "update") {
     // Frontmatter is the note's identity — keep it verbatim, bump `updated`.
     const bumped = patchFrontmatter(raw, "updated", now());
-    await Bun.write(abs, replaceBody(bumped, decision.body ?? candidate.body));
+    await writeAtomic(abs, replaceBody(bumped, decision.body ?? candidate.body));
     return { action: "update", path: rel };
   }
 
   // supersede: the successor is written first, then the old note is marked and
-  // linked forward to it — both only after the hash check above.
+  // linked forward to it.
   const created = await create(db, root, candidate, decision.body);
-  const marked = patchFrontmatter(raw, "superseded_by", created.path!);
+  // Writing the successor took time, and the old note belongs to a human. If it
+  // moved in that window the successor stands and the caller is told the old
+  // note is unmarked — the alternative is overwriting an edit for bookkeeping.
+  const current = await readRaw(root, rel);
+  if (current === null || parseNote(current, rel).hash !== hit.hash) {
+    return { action: "supersede", path: created.path, unmarked: rel };
+  }
+  const marked = patchFrontmatter(current, "superseded_by", created.path!);
   const link = `Superseded by [[${slugOf(created.path!)}]].\n`;
-  await Bun.write(abs, marked.endsWith("\n") ? `${marked}\n${link}` : `${marked}\n\n${link}`);
+  await writeAtomic(abs, marked.endsWith("\n") ? `${marked}\n${link}` : `${marked}\n\n${link}`);
   return { action: "supersede", path: created.path, superseded: rel };
+}
+
+/**
+ * Write through a temp file and rename it over the target. A reader never sees
+ * a half-written note, a crash never truncates one, and — since rename replaces
+ * a symlink instead of following it — nothing can be swapped in between
+ * `confinedPath` and the write. The temp name is not `.md`, so a crashed write
+ * leaves nothing the scan would index.
+ */
+async function writeAtomic(abs: string, text: string): Promise<void> {
+  const tmp = `${abs}.tmp-${process.pid}-${Bun.randomUUIDv7().slice(-8)}`;
+  await Bun.write(tmp, text);
+  renameSync(tmp, abs);
 }
 
 /** Write a note we authored ourselves — the one place `serializeNote` is used. */
@@ -333,7 +380,7 @@ async function create(
     body: body ?? candidate.body,
   });
   mkdirSync(dirname(abs), { recursive: true });
-  await Bun.write(abs, text);
+  await writeAtomic(abs, text);
   return { action: "create", path: rel };
 }
 
@@ -344,7 +391,14 @@ async function create(
  * does not get to lose someone else's note to a shared title.
  */
 function freePath(db: Database, root: string, candidate: Candidate): { rel: string; abs: string } {
-  const base = slugify(candidate.title);
+  // A title of nothing but CJK, Cyrillic or emoji slugifies to nothing — name
+  // the file after the candidate's own content rather than losing the note.
+  const base =
+    slugify(candidate.title) ??
+    `note-${new Bun.CryptoHasher("sha256")
+      .update(`${candidate.title}\n\n${candidate.body}`)
+      .digest("hex")
+      .slice(0, 8)}`;
   const taken = db.query(`select 1 from notes where slug = ?`);
   for (let i = 1; i <= MAX_SLUG_TRIES; i++) {
     const slug = i === 1 ? base : `${base}-${i}`;
@@ -352,20 +406,21 @@ function freePath(db: Database, root: string, candidate: Candidate): { rel: stri
     const abs = confinedPath(root, rel);
     if (!existsSync(abs) && taken.get(slug) === null) return { rel, abs };
   }
-  throw new Error(`write gate: no free filename for ${JSON.stringify(candidate.title)}`);
+  // Nowhere to put it is still not a reason to drop it on the floor.
+  const reason = `write gate: no free filename for ${JSON.stringify(candidate.title)}`;
+  logCandidate(root, candidate, { reason });
+  throw new Error(reason);
 }
 
 /**
- * A discarded candidate is appended to `.vault/discarded.log` as JSONL, whole:
- * a wrong decider call costs a line in a log, never the information itself.
+ * Append a candidate to `.vault/discarded.log` as JSONL, whole: a wrong decider
+ * call — or a gate that cannot write the file — costs a line in a log, never
+ * the information itself.
  */
-function discard(root: string, candidate: Candidate, decision: Decision): void {
+function logCandidate(root: string, candidate: Candidate, extra: Record<string, unknown>): void {
   const dir = join(root, ".vault");
   mkdirSync(dir, { recursive: true });
-  appendFileSync(
-    join(dir, "discarded.log"),
-    `${JSON.stringify({ at: now(), candidate, decision })}\n`,
-  );
+  appendFileSync(join(dir, "discarded.log"), `${JSON.stringify({ at: now(), candidate, ...extra })}\n`);
 }
 
 /** Wikilink target of a vault-relative path: the filename stem. */

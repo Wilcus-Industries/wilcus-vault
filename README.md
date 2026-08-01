@@ -48,6 +48,7 @@ vault.close();
 decider to `update`, `supersede`, `create` or `discard`, and applies that with
 two rails — it re-hashes a target immediately before writing (a human edit
 mid-flight aborts the apply, re-runs the gate once, then falls back to `create`)
-and confines every path it writes to the vault root. A discarded candidate is
-appended whole to `.vault/discarded.log`. Notes it did not author are patched
+and confines every path it writes to the vault root. Writes land through a temp
+file renamed into place. A discarded candidate — or one the gate cannot place —
+is appended whole to `.vault/discarded.log`. Notes it did not author are patched
 textually, never re-serialized, so comments and `01234` survive.

@@ -66,6 +66,27 @@ function withinNodeBudget(value: unknown, budget = 4096): boolean {
   return visit(value);
 }
 
+/**
+ * A frontmatter block's YAML as a mapping we can index, or null when it is
+ * unusable: invalid YAML, not a mapping, or over the alias budget. Both readers
+ * of a block — `parseNote` and the textual patcher below — decide through this
+ * one function, so they can never disagree about whether a block is real. (They
+ * did once: a fenced-but-invalid block looked patchable while `parseNote`
+ * ignored it, so a `superseded_by` written into it was never read.)
+ */
+function usableFrontmatter(yaml: string): Record<string, unknown> | null {
+  if (yaml.trim() === "") return {};
+  try {
+    const parsed = Bun.YAML.parse(yaml);
+    // Must be a mapping, and small enough to store in an index row.
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) && withinNodeBudget(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export function parseNote(raw: string, relPath: string): Note {
   const hash = new Bun.CryptoHasher("sha256").update(raw).digest("hex");
   const lf = raw.replaceAll("\r\n", "\n");
@@ -77,26 +98,11 @@ export function parseNote(raw: string, relPath: string): Note {
   let body = text;
   let malformedFrontmatter = unterminated;
   if (yaml !== null) {
-    if (yaml.trim() === "") {
+    const parsed = usableFrontmatter(yaml);
+    if (parsed === null) malformedFrontmatter = true;
+    else {
+      frontmatter = parsed;
       body = split;
-    } else {
-      try {
-        const parsed = Bun.YAML.parse(yaml);
-        // Must be a mapping, and small enough to store in an index row.
-        if (
-          parsed &&
-          typeof parsed === "object" &&
-          !Array.isArray(parsed) &&
-          withinNodeBudget(parsed)
-        ) {
-          frontmatter = parsed as Record<string, unknown>;
-          body = split;
-        } else {
-          malformedFrontmatter = true;
-        }
-      } catch {
-        malformedFrontmatter = true;
-      }
     }
   }
 
@@ -150,23 +156,28 @@ export function serializeNote(note: Pick<Note, "frontmatter" | "body">): string 
 
 /**
  * The frontmatter block as *text*: where its YAML starts and ends inside `raw`,
- * and where the body begins after the closing fence. Null when there is no
- * usable block — which is exactly when `parseNote` treats the whole file as
- * body, so the two agree on what "has frontmatter" means.
+ * and where the body begins after the closing fence. Offsets are into `raw`, so
+ * a leading BOM and CRLF endings are stepped over rather than normalized away.
+ * Null when `parseNote` would not use the block — no opening fence, no closing
+ * fence, or YAML it cannot read — so text-level edits and the parsed view never
+ * disagree about what counts as frontmatter.
  */
 function frontmatterBlock(
   raw: string,
 ): { start: number; end: number; bodyStart: number } | null {
-  const open = /^---\r?\n/.exec(raw);
+  const bom = raw.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const open = /^---\r?\n/.exec(raw.slice(bom));
   if (open === null) return null;
-  const start = open[0].length;
+  const start = bom + open[0].length;
   const close = /^---[ \t]*\r?(\n|$)/m.exec(raw.slice(start));
   if (close === null) return null;
-  return {
+  const at = {
     start,
     end: start + close.index,
     bodyStart: start + close.index + close[0].length,
   };
+  const yaml = raw.slice(at.start, at.end).replaceAll("\r\n", "\n");
+  return usableFrontmatter(yaml) === null ? null : at;
 }
 
 /**
@@ -182,20 +193,28 @@ export function patchFrontmatter(raw: string, key: string, value: string): strin
   // Keys are ours (`superseded_by`, `updated`); anything else could be YAML or
   // regex syntax rather than a key, and this function does not sanitize.
   if (!/^[A-Za-z0-9_-]+$/.test(key)) throw new Error(`patchFrontmatter: unusable key ${key}`);
-  const line = `${key}: ${JSON.stringify(value)}`; // JSON strings are valid YAML scalars
+  // A timestamp is a YAML-native scalar and reads as one; anything else is
+  // quoted, so a path or a colon can never become syntax.
+  const line = `${key}: ${ISO_TIMESTAMP.test(value) ? value : JSON.stringify(value)}`;
   const at = frontmatterBlock(raw);
   if (at === null) return `---\n${line}\n---\n${raw}`;
 
   const eol = raw.slice(0, at.start).endsWith("\r\n") ? "\r\n" : "\n";
   const block = raw.slice(at.start, at.end);
   // Top-level only: an indented `key:` belongs to a nested mapping. `[^\r\n]*`
-  // rather than `.*` so a CRLF file keeps its carriage return.
-  const existing = new RegExp(`^${key}[ \t]*:[^\r\n]*`, "m");
-  const patched = existing.test(block)
-    ? block.replace(existing, line)
-    : block + (block === "" || block.endsWith("\n") ? "" : eol) + line + eol;
+  // rather than `.*` so a CRLF file keeps its carriage return. Every occurrence
+  // is taken: YAML's last-wins would otherwise let a duplicate key downstream
+  // resurrect the value we just replaced.
+  const existing = new RegExp(`^${key}[ \t]*:[^\r\n]*`, "gm");
+  let seen = 0;
+  const swapped = block.replace(existing, () => (++seen === 1 ? line : ""));
+  const patched =
+    seen > 0 ? swapped : block + (block === "" || block.endsWith("\n") ? "" : eol) + line + eol;
   return raw.slice(0, at.start) + patched + raw.slice(at.end);
 }
+
+/** `2026-08-01T09:41:00.000Z` — what `new Date().toISOString()` produces. */
+const ISO_TIMESTAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/;
 
 /** Replace the body, keeping the frontmatter block byte-identical. */
 export function replaceBody(raw: string, body: string): string {
