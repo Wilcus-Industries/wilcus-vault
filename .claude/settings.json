@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash(git:*)", "Bash(gh:*)", "Bash(bun:*)", "Bash(bunx:*)",
+      "Bash(mkdir:*)", "Bash(ls:*)", "Bash(mv:*)", "Bash(cp:*)"
+    ]
+  }
+}
