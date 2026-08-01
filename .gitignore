@@ -1,0 +1,6 @@
+node_modules/
+.tools/
+.tools-ext/
+.claude/worktrees/
+*.db
+.vault/
