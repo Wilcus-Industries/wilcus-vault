@@ -16,16 +16,33 @@ no YAML dependency.
 
 ```
 src/
-  note.ts    # parse/serialize a note: frontmatter (Bun.YAML), wikilinks, sha256 hash
+  note.ts    # parse/serialize a note: frontmatter (Bun.YAML), wikilinks, sha256 hash,
+             # textual frontmatter patch for files we did not author
   db.ts      # open DB (WAL, busy_timeout), load sqlite-vec, schema/migrations
   embed.ts   # Embedder interface + deterministic test embedder + fetch-based API embedder
   indexer.ts # scan vault dir, hash-diff, upsert notes/fts/vectors, rewrite edges
+  doctor.ts  # drift report + repair + --rebuild into a temp DB, renamed into place
   search.ts  # hybrid: vec KNN + FTS5 BM25 → pre-fusion cutoffs → RRF ordering
   gate.ts    # write gate: top-k similar → decider → update|supersede|create|discard
   watch.ts   # fs.watch + debounce + hash dirty-check → reindex changed files
   vault.ts   # Vault facade (public API)
   cli.ts     # vault doctor|reindex|search|watch
 ```
+
+`indexer.ts` has one write path, `indexPaths(paths)`: hash-diff those paths,
+write what changed, purge the rows whose file is gone. `reindex` passes every
+path the files *or* the index know about (so a row with no file is a deletion);
+the watcher passes the handful that just changed. A watched vault and a rebuilt
+one cannot drift apart, because only one function ever writes an index row.
+
+What is at a path is decided by an `lstat`, before it is read: **only a regular
+file is a note**, and a path that is gone, is a directory, or has become a
+symlink counts as a deletion. The scan applies the same rule (it skips both), so
+a path that survives only the read would be a row the scan never lists again —
+`doctor` would report it missing forever while a repair happily re-read it,
+indexing a symlink's target from *outside* the vault. A directory would be worse
+than wrong: `EISDIR` out of `reindex` and `doctor` alike, with no way left to
+repair the vault.
 
 ## Data model
 
@@ -120,7 +137,8 @@ half-indexed note and re-embedded on every pass.
 
 Every programmatic write goes through `vault.propose(candidate)`:
 
-1. hybrid-search top-k similar notes, capturing each hit's content hash. The
+1. hybrid-search top-k similar notes, each one re-read from disk so the hash
+   captured is the *file's*, not the index's — the index is derived data. The
    gate **must** pass `cutoffs`: without them the search always returns
    *something*, and "most similar note" becomes "least unrelated note" — the
    gate would update or supersede a stranger instead of creating a new note.
@@ -159,7 +177,8 @@ Every programmatic write goes through `vault.propose(candidate)`:
      whose YAML the parser cannot read is *not* a block, and gets a fresh one
      prepended, or a `superseded_by` patched into it would be a line nothing
      ever reads.
-   - `create` writes a new file; `update` rewrites the target body; `supersede`
+   - `create` writes a new file; `update` rewrites the target body and bumps
+     `updated` in its frontmatter (a textual patch, per the rule above); `supersede`
      writes the new note, adds `superseded_by` (vault-relative path) to the old
      note's frontmatter plus a forward wikilink; `discard` appends the candidate
      as a JSONL line to `.vault/discarded.log` so a wrong LLM call never silently
@@ -185,11 +204,34 @@ Human edits bypass the gate by definition (files are truth); the watcher +
 
 `vault doctor` — report + repair: rebuild stale index rows (hash mismatch), remove
 rows for deleted files, drop-and-re-embed on embedding model/dims change, list
-broken/ambiguous links, orphans, and duplicate stems. `--rebuild` reindexes from
-scratch into a temp DB file, then atomically renames it over `index.db` (safe
-against a concurrently running watcher). `vault watch` — `fs.watch` (recursive) +
-debounce; hash check decides re-embed. Watcher failure is never data loss: doctor
-rebuilds everything from files.
+broken/ambiguous links, orphans, duplicate stems, and malformed frontmatter.
+`--rebuild` reindexes from scratch into a temp DB file, then atomically renames it
+over `index.db` (safe against a concurrently running watcher).
+
+`vault watch` — `fs.watch` (recursive) on the root, acting only on `.md` paths
+outside dot-directories, so the index's own writes under `.vault/` cannot feed
+the watcher its own tail. Debounce is **per path** (~250ms): an editor writing
+one file continuously delays that file, never every other change queued behind
+it; paths that come due together are indexed in one pass, and a pass in flight
+makes later ones queue rather than run concurrently against the same database.
+Each pass is `indexPaths`, so the hash check — not the event — decides whether a
+note is reindexed and re-embedded, and a delete is just a path whose file is
+gone. The CLI reindexes once before watching, so edits made while nothing was
+watching are not missed.
+
+Three failure modes, all of which land in the same place. A transient error (a
+provider blip, a locked database, an `fs.watch` error event) is logged and the
+watcher keeps going — it never throws at the caller mid-run, and never takes the
+process down, including when the caller's own `onError` throws. A directory
+rename reports only the directory, so notes moved inside it are missed. A
+`close()` drops paths still inside their debounce window and anything queued
+behind the pass in flight. None of these is data loss: the files are the truth,
+and `doctor` rebuilds every row from them.
+
+`close()` returns the pass in flight, because that pass still holds the database
+handle: `await watcher.close()` before closing the database is what keeps a
+shutdown from racing a write. Queued paths are dropped rather than drained —
+nobody is waiting for them, and doctor knows where they are.
 
 ## Testing / evals
 
@@ -199,8 +241,15 @@ rebuilds everything from files.
 (exact identifier hits via FTS, overlap paraphrase via vector path, fusion beats
 either alone on a seeded vault), write-gate behaviors per action incl. the
 mid-flight-edit abort, doctor idempotence (delete DB → rebuild → same results),
-watcher re-embed on edit. LLM-judge evals only where a rubric is unavoidable —
-none needed for MVP.
+watcher re-embed on edit, and a model swap end to end (reopen with another
+embedder → search refuses stale vectors → doctor re-embeds → search works).
+LLM-judge evals only where a rubric is unavoidable — none needed for MVP.
+
+Real filesystem events are timed by the OS, so the watcher is tested at two
+levels: its event core driven directly (`watcher.touch(path)` is the same entry
+point `fs.watch` calls, and `idle()` resolves when the queue has drained), plus
+one end-to-end pass that edits, creates and deletes real files under a real
+`fs.watch` and waits for the index rows to catch up.
 
 ## Build slices (issues)
 

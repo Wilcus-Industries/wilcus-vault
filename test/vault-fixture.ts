@@ -1,5 +1,6 @@
 // Fixture vaults live inside the repo (tmp-test/, gitignored) — the test
 // sandbox may block writes outside it.
+import type { Database } from "bun:sqlite";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Embedder } from "../src/embed";
@@ -25,6 +26,14 @@ export function writeNote(root: string, rel: string, body: string): void {
   const abs = join(root, rel);
   mkdirSync(dirname(abs), { recursive: true });
   writeFileSync(abs, body);
+}
+
+/** A note's stored vector, as floats — the blob comes back as bytes. */
+export function vecOf(db: Database, id: number): Float32Array {
+  const { emb } = db.query("select emb from vectors where note_id = ?").get(id) as {
+    emb: Uint8Array;
+  };
+  return new Float32Array(emb.buffer.slice(emb.byteOffset, emb.byteOffset + emb.byteLength));
 }
 
 export function cleanupVaults(): void {

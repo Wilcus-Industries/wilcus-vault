@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { openDb, dbPath } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
 import { reindex, scanVault, readNote } from "../src/indexer";
-import { makeVault, writeNote, cleanupVaults, stubEmbedder } from "./vault-fixture";
+import { doctor } from "../src/doctor";
+import { makeVault, writeNote, cleanupVaults, stubEmbedder, vecOf } from "./vault-fixture";
 
 afterAll(cleanupVaults);
 
@@ -25,13 +26,6 @@ function open(root: string): Database {
 
 const changes = (db: Database) =>
   (db.query("select total_changes() as c").get() as { c: number }).c;
-
-const vecOf = (db: Database, id: number): Float32Array => {
-  const { emb } = db.query("select emb from vectors where note_id = ?").get(id) as {
-    emb: Uint8Array;
-  };
-  return new Float32Array(emb.buffer.slice(emb.byteOffset, emb.byteOffset + emb.byteLength));
-};
 
 test("scanVault: .md only, dot-directories skipped, symlinks never followed", () => {
   const root = makeVault(FIXTURE);
@@ -210,6 +204,43 @@ test("a note with no tokens gets no vector row, and stays indexed and idempotent
   expect(await reindex(db, root, embedder)).toMatchObject({ unchanged: 2, updated: 0 });
   expect(changes(db)).toBe(before);
   db.close();
+});
+
+test("a note replaced by a symlink is purged, never read from outside the vault", async () => {
+  const root = makeVault(FIXTURE);
+  const outside = makeVault({ "secret.md": "# Secret\n\nnot in this vault at all\n" });
+  const db = open(root);
+  await reindex(db, root, embedder);
+
+  // the scan skips symlinks, so without a check the row would keep its content
+  // from *outside* the vault forever: doctor reports it missing and repair,
+  // reading straight through the link, never removes it
+  rmSync(join(root, "notes", "lonely.md"));
+  symlinkSync(join(outside, "secret.md"), join(root, "notes", "lonely.md"));
+
+  expect(await reindex(db, root, embedder)).toMatchObject({ removed: 1, added: 0, updated: 0 });
+  expect(db.query("select count(*) as c from notes where path='notes/lonely.md'").get()).toEqual({
+    c: 0,
+  });
+  expect(db.query("select rowid from notes_fts where notes_fts match 'secret'").get()).toBeNull();
+  db.close();
+});
+
+test("a note replaced by a directory is purged instead of throwing", async () => {
+  const root = makeVault(FIXTURE);
+  const db = open(root);
+  await reindex(db, root, embedder);
+
+  rmSync(join(root, "notes", "lonely.md"));
+  mkdirSync(join(root, "notes", "lonely.md")); // `mv note.md dir/` leaves this behind
+  expect(await reindex(db, root, embedder)).toMatchObject({ removed: 1 });
+  expect(db.query("select count(*) as c from notes where path='notes/lonely.md'").get()).toEqual({
+    c: 0,
+  });
+  db.close();
+
+  // and doctor agrees rather than failing on EISDIR with no way to repair
+  expect(await doctor(root, embedder)).toMatchObject({ missing: [] });
 });
 
 test("readNote returns null when the file vanished between scan and read", async () => {
