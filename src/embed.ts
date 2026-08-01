@@ -83,6 +83,10 @@ export class FetchEmbedder implements Embedder {
     this.#key = key;
     this.model = o.model ?? process.env["VAULT_EMBED_MODEL"] ?? "text-embedding-3-small";
     this.dims = o.dims ?? Number(process.env["VAULT_EMBED_DIMS"] ?? 1536);
+    // Caught here rather than as "every response is the wrong width" later.
+    if (!Number.isInteger(this.dims) || this.dims < 1) {
+      throw new Error(`FetchEmbedder: dims must be a positive integer, got ${this.dims}`);
+    }
     this.#endpoint =
       o.endpoint ?? process.env["VAULT_EMBED_ENDPOINT"] ?? "https://api.openai.com/v1/embeddings";
     // ponytail: batch by count and by characters — characters approximate the
@@ -123,29 +127,60 @@ export class FetchEmbedder implements Embedder {
         `embedding request failed: ${res.status} ${this.#redact(await res.text().catch(() => ""))}`,
       );
     }
-    const { data } = (await res.json()) as { data?: { embedding?: number[]; index?: number }[] };
+    // Parsed by hand so a 200 carrying an HTML error page is a clear message
+    // rather than an unredacted parse error.
+    const text = await res.text();
+    let data: { embedding?: unknown; index?: unknown }[] | undefined;
+    try {
+      ({ data } = JSON.parse(text) as { data?: { embedding?: unknown; index?: unknown }[] });
+    } catch {
+      throw new Error(`embedder ${this.model} returned a non-JSON response: ${this.#redact(text)}`);
+    }
     if (!Array.isArray(data) || data.length !== input.length) {
       throw new Error(
         `embedder ${this.model} returned ${data?.length ?? 0} vectors for ${input.length} texts`,
       );
     }
-    // The response order is not promised; `index` is what maps a vector back
-    // to its text, and a mix-up here would mis-file every note's embedding.
-    return [...data]
-      .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
-      .map((d) => {
-        if (!Array.isArray(d.embedding) || d.embedding.length !== this.dims) {
-          throw new Error(
-            `embedder ${this.model} returned a vector of width ${d.embedding?.length ?? 0}, expected ${this.dims}`,
-          );
-        }
-        return Float32Array.from(d.embedding);
-      });
+    // The response order is not promised; `index` is what maps a vector back to
+    // its text, and a mix-up here would mis-file every note's embedding. Filing
+    // by index rather than sorting also proves the indices are one per text:
+    // each slot is claimed exactly once, or we refuse the whole response.
+    const out = new Array<Float32Array>(input.length);
+    for (const d of data) {
+      const i = d.index;
+      if (typeof i !== "number" || !Number.isInteger(i) || i < 0 || i >= out.length || out[i] !== undefined) {
+        throw new Error(
+          `embedder ${this.model} returned an unusable vector index ${String(i)} for ${input.length} texts`,
+        );
+      }
+      out[i] = this.#vector(d.embedding);
+    }
+    return out;
   }
 
-  /** Providers echo request details into error bodies; the key never survives. */
+  /** A vector is only usable if every element is a finite number. */
+  #vector(embedding: unknown): Float32Array {
+    if (!Array.isArray(embedding) || embedding.length !== this.dims) {
+      throw new Error(
+        `embedder ${this.model} returned a vector of width ${Array.isArray(embedding) ? embedding.length : 0}, expected ${this.dims}`,
+      );
+    }
+    // A string or a null (a provider's NaN, once JSON has been through it)
+    // survives l2normalize as NaN and poisons the vec0 index until the next
+    // full re-embed, so it never gets that far.
+    if (!embedding.every((x) => typeof x === "number" && Number.isFinite(x))) {
+      throw new Error(`embedder ${this.model} returned a vector that is not all finite numbers`);
+    }
+    return Float32Array.from(embedding as number[]);
+  }
+
+  /**
+   * Providers echo request details into error bodies; the key never survives.
+   * Redact *then* truncate — the other order leaks the head of a key that
+   * happens to straddle the cut.
+   */
   #redact(body: string): string {
-    return body.slice(0, 200).replaceAll(this.#key, "[redacted]");
+    return body.replaceAll(this.#key, "[redacted]").slice(0, 200);
   }
 }
 

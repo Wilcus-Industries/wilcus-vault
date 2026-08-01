@@ -3,6 +3,13 @@ import { FetchEmbedder, TokenOverlapEmbedder, l2normalize } from "../src/embed";
 
 const KEY = "sk-test-do-not-log-me";
 
+/** The error a call rejected with — the message itself is what we assert on. */
+const failure = (p: Promise<unknown>): Promise<Error> =>
+  p.then(
+    () => new Error("did not throw"),
+    (e: Error) => e,
+  );
+
 /** A fetch stub that records its calls and answers with `dims`-wide vectors. */
 function stubFetch(dims: number, reply?: (input: string[]) => Response) {
   const calls: { url: string; init: RequestInit; body: { model: string; input: string[] } }[] = [];
@@ -56,15 +63,75 @@ test("FetchEmbedder batches by count and by request size", async () => {
 test("FetchEmbedder never leaks the API key in errors or when inspected", async () => {
   const { fn } = stubFetch(4, () => new Response(`bad key ${KEY}`, { status: 401 }));
   const e = new FetchEmbedder({ apiKey: KEY, dims: 4, fetch: fn });
-  const err = await e.embed(["x"]).then(
-    () => null,
-    (x: Error) => x,
-  );
-  expect(err?.message).toContain("401");
-  expect(err?.message).not.toContain(KEY);
-  expect(err?.message).toContain("[redacted]");
+  const err = await failure(e.embed(["x"]));
+  expect(err.message).toContain("401");
+  expect(err.message).not.toContain(KEY);
+  expect(err.message).toContain("[redacted]");
   expect(JSON.stringify(e)).not.toContain(KEY);
   expect(Bun.inspect(e)).not.toContain(KEY);
+});
+
+test("FetchEmbedder redacts the key before truncating a long error body", async () => {
+  // the key straddles the 200-character cut: truncating first would leak its head
+  const { fn } = stubFetch(4, () => new Response("x".repeat(190) + KEY + "y".repeat(50), { status: 500 }));
+  const e = new FetchEmbedder({ apiKey: KEY, dims: 4, fetch: fn });
+  const err = await failure(e.embed(["x"]));
+  expect(err.message).toContain("500");
+  expect(err.message).not.toContain(KEY.slice(0, 8));
+});
+
+test("FetchEmbedder rejects vectors that are not all finite numbers", async () => {
+  // JSON has no NaN literal, so a provider's NaN arrives as null
+  for (const bad of [`[1, "2", 3, 4]`, `[1, null, 3, 4]`, `[1, 2, 3, 1e999]`]) {
+    const e = new FetchEmbedder({
+      apiKey: KEY,
+      dims: 4,
+      model: "m-1",
+      fetch: stubFetch(4, () => new Response(`{"data":[{"index":0,"embedding":${bad}}]}`)).fn,
+    });
+    // a non-finite element survives l2normalize and would poison the vec0 index
+    await expect(e.embed(["x"])).rejects.toThrow(/m-1.*finite numbers/s);
+  }
+});
+
+test("FetchEmbedder rejects a response whose indices are not one per text", async () => {
+  const e = (body: string) =>
+    new FetchEmbedder({
+      apiKey: KEY,
+      dims: 2,
+      model: "m-1",
+      fetch: stubFetch(2, () => new Response(body)).fn,
+    });
+  const vec = `"embedding":[1,2]`;
+  // duplicated index: one text would silently get another text's vector
+  await expect(e(`{"data":[{"index":0,${vec}},{"index":0,${vec}}]}`).embed(["a", "b"])).rejects.toThrow(
+    /m-1.*index/s,
+  );
+  await expect(e(`{"data":[{"index":0,${vec}},{"index":7,${vec}}]}`).embed(["a", "b"])).rejects.toThrow(
+    /m-1.*index/s,
+  );
+  await expect(e(`{"data":[{${vec}},{${vec}}]}`).embed(["a", "b"])).rejects.toThrow(/m-1.*index/s);
+});
+
+test("FetchEmbedder reports a non-JSON body instead of throwing a parse error", async () => {
+  const { fn } = stubFetch(4, () => new Response(`<html>gateway timeout ${KEY}</html>`));
+  const e = new FetchEmbedder({ apiKey: KEY, dims: 4, model: "m-1", fetch: fn });
+  const err = await failure(e.embed(["x"]));
+  expect(err.message).toMatch(/m-1.*non-JSON/s);
+  expect(err.message).not.toContain(KEY);
+});
+
+test("FetchEmbedder refuses nonsense dims at construction", () => {
+  expect(() => new FetchEmbedder({ apiKey: KEY, dims: 0 })).toThrow(/dims/);
+  expect(() => new FetchEmbedder({ apiKey: KEY, dims: 1.5 })).toThrow(/dims/);
+  const prev = process.env["VAULT_EMBED_DIMS"];
+  try {
+    process.env["VAULT_EMBED_DIMS"] = "wide";
+    expect(() => new FetchEmbedder({ apiKey: KEY })).toThrow(/dims/);
+  } finally {
+    if (prev === undefined) delete process.env["VAULT_EMBED_DIMS"];
+    else process.env["VAULT_EMBED_DIMS"] = prev;
+  }
 });
 
 test("FetchEmbedder reads the key from the environment and refuses to run without one", () => {

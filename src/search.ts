@@ -10,6 +10,13 @@ import { l2normalize, type Embedder } from "./embed";
 const RRF_K = 60;
 /** k = 3×N per signal, so the supersede filter and the cutoffs cannot starve N. */
 const OVERFETCH = 3;
+/**
+ * A whole note body is a legitimate query — the write gate passes one — and an
+ * FTS5 MATCH with a term per word of it is a slow way to ask a vague question.
+ * ponytail: first N distinct terms, no scoring; weight by IDF if the truncation
+ * ever costs a real hit.
+ */
+const MAX_FTS_TERMS = 32;
 
 export type SearchHit = {
   id: number;
@@ -26,9 +33,13 @@ export type SearchHit = {
   expansion: boolean;
 };
 
-export type SearchOptions = {
-  /** hits to return (default 10); expansion may append up to N more */
-  n?: number;
+/**
+ * Per-signal relevance cutoffs, applied before fusion. Named as one field so a
+ * caller has to decide about them: the write gate MUST pass cutoffs — without
+ * them "most similar note" always returns *something*, and the gate would
+ * update the least-unrelated note instead of creating a new one.
+ */
+export type Cutoffs = {
   /**
    * Drop vector hits whose cosine distance is above this (0 = identical,
    * 1 = orthogonal). Off by default: the right ceiling is a property of the
@@ -41,6 +52,12 @@ export type SearchOptions = {
    * −1 is stricter than 0. Off by default.
    */
   bm25Ceiling?: number;
+};
+
+export type SearchOptions = {
+  /** hits to return (default 10); expansion may append up to N more */
+  n?: number;
+  cutoffs?: Cutoffs;
   /** append one-hop wikilink neighbours of the survivors, below every hit */
   expandLinks?: boolean;
 };
@@ -50,12 +67,12 @@ export type SearchOptions = {
  * every whitespace-separated run becomes one quoted phrase (embedded quotes
  * doubled), so `NEAR(`, `OR`, `*`, `^` and friends are matched as words.
  * Terms carrying no letter or digit produce no phrase; a query with none at
- * all yields null — there is nothing to ask FTS5 for.
+ * all yields null — there is nothing to ask FTS5 for. Capped at the first
+ * `MAX_FTS_TERMS` distinct terms.
  */
 export function ftsQuery(text: string): string | null {
-  const terms = text
-    .split(/\s+/)
-    .filter((t) => /[\p{L}\p{N}]/u.test(t))
+  const terms = [...new Set(text.split(/\s+/).filter((t) => /[\p{L}\p{N}]/u.test(t)))]
+    .slice(0, MAX_FTS_TERMS)
     .map((t) => `"${t.replaceAll('"', '""')}"`);
   return terms.length > 0 ? terms.join(" OR ") : null;
 }
@@ -64,7 +81,7 @@ export async function hybridSearch(
   db: Database,
   embedder: Embedder,
   query: string,
-  { n = 10, distanceCeiling, bm25Ceiling, expandLinks = false }: SearchOptions = {},
+  { n = 10, cutoffs = {}, expandLinks = false }: SearchOptions = {},
 ): Promise<SearchHit[]> {
   if (!Number.isInteger(n) || n < 1) {
     throw new Error(`search: n must be a positive integer, got ${n}`);
@@ -75,6 +92,29 @@ export async function hybridSearch(
   const vector = await queryVector(db, embedder, query);
   if (match === null && vector === null) return []; // nothing to search with
 
+  let rows: Omit<SearchHit, "expansion">[];
+  try {
+    rows = fuse(db, vector, match, n, cutoffs);
+  } catch (e) {
+    // The quoting above should make an FTS5 parse error unreachable; if a
+    // tokenizer or Unicode-table skew still produces one, the keyword signal
+    // drops out rather than taking the whole search down with it.
+    if (match === null || !/fts5/i.test(String(e))) throw e;
+    rows = fuse(db, vector, null, n, cutoffs);
+  }
+
+  const direct = rows.map((r) => ({ ...r, expansion: false }));
+  return expandLinks ? [...direct, ...expand(db, direct, n)] : direct;
+}
+
+/** One statement: both signals, their cutoffs, and the RRF fusion over them. */
+function fuse(
+  db: Database,
+  vector: Float32Array | null,
+  match: string | null,
+  n: number,
+  { distanceCeiling, bm25Ceiling }: Cutoffs,
+): Omit<SearchHit, "expansion">[] {
   // Both sides are optional, so the SQL is assembled around the ones we have
   // and the parameters are pushed in the order they appear in it.
   const params: SQLQueryBindings[] = [];
@@ -103,7 +143,7 @@ export async function hybridSearch(
 
   // Cutoffs and the supersede filter sit in the WHERE, so the rank each side
   // contributes is a rank *among survivors* — fusion never sees the rest.
-  const rows = db
+  return db
     .query(
       `with knn as materialized (${knn}),
          vecq as (
@@ -126,9 +166,6 @@ export async function hybridSearch(
        limit ?`,
     )
     .all(...params) as Omit<SearchHit, "expansion">[];
-
-  const direct = rows.map((r) => ({ ...r, expansion: false }));
-  return expandLinks ? [...direct, ...expand(db, direct, n)] : direct;
 }
 
 /**

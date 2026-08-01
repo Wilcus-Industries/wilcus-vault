@@ -83,11 +83,16 @@ hit, capped at N of their own, so `expandLinks` returns at most 2N.
 
 The user's query never reaches FTS5 as syntax: each whitespace-separated run
 becomes one quoted phrase (embedded quotes doubled), so `NEAR(`, `OR`, `*` and
-`^` are matched as words. The cutoffs themselves are the caller's policy —
-there is no default, because the ceiling that means "irrelevant" is a property
-of the embedder, and the `vault search` CLI (bag-of-tokens embedder) has no
-meaningful fixed one. Both are upper bounds on a lower-is-better quantity:
-cosine distance, and FTS5's negative `rank`.
+`^` are matched as words, and the keyword side is capped at the first 32
+distinct terms — a whole note body is a legitimate query (the write gate passes
+one) but not a legitimate 400-term MATCH. If FTS5 rejects a query anyway, that
+signal drops out and the search continues on vectors alone. The cutoffs are the
+caller's policy — there is no default, because the ceiling that means
+"irrelevant" is a property of the embedder, and the `vault search` CLI
+(bag-of-tokens embedder) has no meaningful fixed one. Both are upper bounds on a
+lower-is-better quantity: cosine distance, and FTS5's negative `rank`. They live
+in one `cutoffs` option so a caller has to decide about them rather than inherit
+silence.
 
 ## Embedding
 
@@ -115,7 +120,10 @@ half-indexed note and re-embedded on every pass.
 
 Every programmatic write goes through `vault.propose(candidate)`:
 
-1. hybrid-search top-k similar notes, capturing each hit's content hash;
+1. hybrid-search top-k similar notes, capturing each hit's content hash. The
+   gate **must** pass `cutoffs`: without them the search always returns
+   *something*, and "most similar note" becomes "least unrelated note" — the
+   gate would update or supersede a stranger instead of creating a new note;
 2. `decider({candidate, similar})` → `{action: update|supersede|create|discard, target?}`
    — decider is an injected async fn (the caller wires an LLM; tests use fakes).
    A prompt template + strict response parser ship here;

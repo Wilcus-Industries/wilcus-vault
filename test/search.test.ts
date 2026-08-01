@@ -118,7 +118,34 @@ test("eval: cutoffs make a garbage query return nothing", async () => {
   // without cutoffs the vector side still returns its k nearest, however far
   expect((await hybridSearch(db, embedder, garbage)).length).toBeGreaterThan(0);
   // with them, nothing survives — and an empty result is a valid outcome
-  expect(await hybridSearch(db, embedder, garbage, { distanceCeiling: 0.5, bm25Ceiling: -1 })).toEqual([]);
+  expect(
+    await hybridSearch(db, embedder, garbage, {
+      cutoffs: { distanceCeiling: 0.5, bm25Ceiling: -1 },
+    }),
+  ).toEqual([]);
+  db.close();
+});
+
+test("each cutoff narrows its own signal, in the direction it says", async () => {
+  const { db } = await indexed(EVAL_VAULT);
+  const q = "acme renewal pricing";
+
+  // BM25 alone: FTS5's rank is negative and lower is better, so -1 keeps only
+  // the strongest keyword hit. A reversed comparison would keep the rest.
+  const keyword = await hybridSearch(db, embedder, q, { n: 10, cutoffs: { bm25Ceiling: -1 } });
+  expect(keyword.filter((h) => h.ftsRank !== null).map((h) => h.path)).toEqual([
+    "notes/pricing-model.md",
+  ]);
+  expect(keyword.filter((h) => h.vecRank !== null).length).toBeGreaterThan(1); // vector side untouched
+
+  // Cosine distance alone: 0.3 keeps the two nearest (0.184, 0.265) and drops
+  // the rest, while FTS keeps returning rows.
+  const vector = await hybridSearch(db, embedder, q, { n: 10, cutoffs: { distanceCeiling: 0.3 } });
+  expect(vector.filter((h) => h.vecRank !== null).map((h) => h.path).sort()).toEqual([
+    "notes/acme-renewal.md",
+    "notes/renewal-stub.md",
+  ]);
+  expect(vector.filter((h) => h.ftsRank !== null).length).toBeGreaterThan(2); // FTS side untouched
   db.close();
 });
 
@@ -144,6 +171,30 @@ test("eval: FTS5 syntax in the query is text, not syntax", async () => {
   expect(ftsQuery(`acme OR renewal`)).toBe(`"acme" OR "OR" OR "renewal"`);
   expect(ftsQuery(`a"b`)).toBe(`"a""b"`);
   expect(ftsQuery(`  ***  `)).toBeNull();
+  // a whole note body is a legitimate query (the write gate passes one), so the
+  // keyword side is capped at the first 32 distinct terms
+  const long = ftsQuery(Array.from({ length: 200 }, (_, i) => `w${i} w${i}`).join(" "))!;
+  expect(long.split(" OR ")).toHaveLength(32);
+  expect(long.startsWith(`"w0" OR "w1" OR "w2"`)).toBe(true);
+});
+
+test("an FTS5 error drops the keyword signal instead of failing the search", async () => {
+  const { db } = await indexed(EVAL_VAULT);
+  // The quoting should make this unreachable; the fallback is what keeps a
+  // tokenizer/Unicode skew from taking the whole search down.
+  const wedged = new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop !== "query") return Reflect.get(target, prop, receiver);
+      return (sql: string) => {
+        if (sql.includes("notes_fts match ?")) throw new Error(`fts5: syntax error near "x"`);
+        return target.query(sql);
+      };
+    },
+  });
+  const hits = await hybridSearch(wedged, embedder, "acme renewal pricing");
+  expect(hits.length).toBeGreaterThan(0);
+  expect(hits.every((h) => h.ftsRank === null)).toBe(true);
+  db.close();
 });
 
 test("a token-less note has no vector row and stays findable through FTS", async () => {
@@ -201,16 +252,32 @@ test("vault search prints ranked hits", async () => {
   db.close();
   const log = spyOn(console, "log").mockImplementation(() => {});
   const err = spyOn(console, "error").mockImplementation(() => {});
+  const said = () => log.mock.calls.flat().join("\n");
   try {
     expect(await main(["search", "INV-2031", "--vault", root])).toBe(0);
-    expect(log.mock.calls.flat().join("\n")).toContain("ledger/invoice-2031.md");
+    expect(said()).toContain("ledger/invoice-2031.md");
+
+    // the flag and its value are consumed wherever they sit, and never become
+    // query words — this must find the same note as the line above
+    log.mockClear();
+    expect(await main(["search", "--vault", root, "INV-2031"])).toBe(0);
+    expect(said()).toContain("ledger/invoice-2031.md");
 
     log.mockClear();
+    expect(await main(["search", "🙂", "--vault", root])).toBe(0); // no signal either side
+    expect(said()).toBe("no matches");
+
+    // an unindexed vault is not the same answer as "nothing matched"
+    log.mockClear();
     const { root: emptyRoot } = await indexed({});
-    expect(await main(["search", "acme", "renewal", "--vault", emptyRoot])).toBe(0);
-    expect(log.mock.calls.flat().join("\n")).toBe("no matches");
+    expect(await main(["search", "acme", "--vault", emptyRoot])).toBe(0);
+    expect(said()).toMatch(/not indexed.*reindex/);
 
     expect(await main(["search", "--vault", root])).toBe(1); // no query at all
+    // an error is a message, not a stack trace
+    err.mockClear();
+    expect(await main(["search", "acme", "--sideways", "--vault", root])).toBe(1);
+    expect(err.mock.calls.flat().join("\n")).toContain("--sideways");
   } finally {
     log.mockRestore();
     err.mockRestore();
