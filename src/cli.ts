@@ -148,8 +148,8 @@ async function run(argv: string[]): Promise<number> {
       });
       console.log(`watching ${resolve(root)} — press ctrl-c to stop`);
       await interrupted();
-      watcher.close();
-      await watcher.idle(); // let a pass in flight finish before the handle goes
+      // The pass in flight still owns the database handle `finally` closes.
+      await watcher.close();
     } finally {
       db.close();
     }

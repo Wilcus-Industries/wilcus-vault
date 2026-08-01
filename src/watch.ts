@@ -26,8 +26,13 @@ export type Watcher = {
   touch(rel: string): void;
   /** resolves once every debounced path has been indexed and nothing is in flight */
   idle(): Promise<void>;
-  /** stop watching; pending debounced paths are dropped (doctor finds them) */
-  close(): void;
+  /**
+   * Stop watching. Pending debounced paths are dropped (doctor finds them);
+   * the returned promise resolves when the pass in flight — which still holds
+   * the database — is done, so `await watcher.close()` is what makes closing
+   * the database next safe.
+   */
+  close(): Promise<void>;
 };
 
 /**
@@ -51,39 +56,67 @@ export function watch(
   let running: Promise<void> | null = null;
   let closed = false;
 
-  const flush = async (): Promise<void> => {
-    // Yield one timer tick first: paths whose debounce expired in the same tick
-    // (a save-all, a `git checkout`) then join this pass instead of queueing a
-    // pass each.
-    await Bun.sleep(0);
-    while (ready.size > 0) {
-      const paths = [...ready].sort();
-      ready.clear();
-      try {
-        const stats = await indexPaths(db, root, embedder, paths);
-        // A model/dims swap wipes every vector; the paths above were re-embedded
-        // with it, so re-embed the rest rather than leave the vault half-indexed.
-        if (stats.reembedded) await reindex(db, root, embedder);
-        onChange?.(paths, stats);
-      } catch (e) {
-        // A malformed note, a provider blip, a locked database: report it and
-        // keep watching. The files are still the truth, and doctor still fixes
-        // whatever this pass could not.
-        onError(e);
-      }
+  /**
+   * Report a failure and carry on. A reporter that throws is the one error with
+   * nowhere left to go: swallowed here rather than allowed to take the process
+   * down from an `fs.watch` listener, or to abandon a pass mid-flight.
+   */
+  const report = (error: unknown): void => {
+    try {
+      onError(error);
+    } catch {
+      // nothing left to tell about it
     }
-    running = null;
+  };
+
+  const flush = async (): Promise<void> => {
+    try {
+      // Yield one timer tick first: paths whose debounce expired in the same
+      // tick (a save-all, a `git checkout`) then join this pass instead of
+      // queueing a pass each.
+      await Bun.sleep(0);
+      while (ready.size > 0 && !closed) {
+        const paths = [...ready].sort();
+        ready.clear();
+        try {
+          let stats = await indexPaths(db, root, embedder, paths);
+          // A model/dims swap wipes every vector: the paths above were
+          // re-embedded with the new one, the rest of the vault is re-embedded
+          // here rather than left half-indexed. Report *that* pass — it is the
+          // one that says what happened — but keep the flag, which the second
+          // `ensureVectors` no longer has a reason to raise.
+          if (stats.reembedded) stats = { ...(await reindex(db, root, embedder)), reembedded: true };
+          onChange?.(paths, stats);
+        } catch (e) {
+          // A malformed note, a provider blip, a locked database: report it and
+          // keep watching. The files are still the truth, and doctor still fixes
+          // whatever this pass could not.
+          report(e);
+        }
+      }
+    } finally {
+      // Whatever escaped — a caller's onError or onChange throwing is all that
+      // can — the watcher must not be left believing a pass is still in flight:
+      // that wedges every later change and hangs `idle()` and `close()`.
+      running = null;
+    }
   };
 
   const touch = (rel: string): void => {
-    if (closed) return;
+    // One filter for both entry points: `fs.watch` below and a caller feeding
+    // paths in directly. The index's own writes land under `.vault/`, so this
+    // is also what stops the watcher feeding itself its own tail.
+    if (closed || !isNotePath(rel)) return;
     clearTimeout(timers.get(rel));
     timers.set(
       rel,
       setTimeout(() => {
         timers.delete(rel);
         ready.add(rel);
-        running ??= flush();
+        // Nothing awaits this promise, so an unhandled rejection here would be
+        // a crash. The pass reports its failures rather than throwing them, so
+        // this is the last resort behind `report` and the `finally` above.
+        running ??= flush().catch(report);
       }, debounceMs),
     );
   };
@@ -92,11 +125,11 @@ export function watch(
     // A directory rename reports only the directory, so the notes moved inside
     // it are missed until the next doctor run — the documented ceiling of a
     // watcher that is not the source of truth.
-    if (typeof filename === "string" && isNotePath(filename)) touch(filename);
+    if (typeof filename === "string") touch(filename);
   });
   // Without a listener an 'error' event throws out of the event loop and takes
   // the process with it. Watching stops mattering long before losing the vault.
-  watcher.on("error", onError);
+  watcher.on("error", report);
 
   return {
     touch,
@@ -109,7 +142,14 @@ export function watch(
       closed = true;
       for (const timer of timers.values()) clearTimeout(timer);
       timers.clear();
+      ready.clear(); // what a close drops, doctor picks up
       watcher.close();
+      // The pass in flight still owns the database handle, so hand it back: a
+      // caller that awaits this can close the database without racing a write.
+      // Anything queued behind that pass is already gone — `closed` stops the
+      // loop at its next turn rather than draining a backlog nobody is waiting
+      // for.
+      return running ?? Promise.resolve();
     },
   };
 }

@@ -57,14 +57,18 @@ test("isNotePath: .md files only, never through a dot-directory", () => {
   expect(isNotePath("notes")).toBe(false);
 });
 
+// The edits below land *before* `watch` starts, so the only events in these
+// two tests are the `touch` calls themselves — a live fs.watch on the same root
+// would otherwise race its own inotify events into the flush sequence and make
+// an exact assertion about passes flaky.
 test("a burst on one path is debounced into a single index pass", async () => {
   const root = makeVault(FIXTURE);
   const db = open(root);
   await reindex(db, root, embedder);
+  writeNote(root, "notes/acme.md", "# Acme Corp\n\nedited five times\n");
 
   const flushes: string[][] = [];
   const w = watch(db, root, embedder, { debounceMs: 20, onChange: (paths) => flushes.push(paths) });
-  writeNote(root, "notes/acme.md", "# Acme Corp\n\nedited five times\n");
   for (let i = 0; i < 5; i++) w.touch("notes/acme.md");
   await w.idle();
 
@@ -72,7 +76,7 @@ test("a burst on one path is debounced into a single index pass", async () => {
   expect(noteRow(db, "notes/acme.md")!.hash).toBe(
     new Bun.CryptoHasher("sha256").update("# Acme Corp\n\nedited five times\n").digest("hex"),
   );
-  w.close();
+  await w.close();
   db.close();
 });
 
@@ -80,17 +84,37 @@ test("paths ready together are indexed in one pass", async () => {
   const root = makeVault(FIXTURE);
   const db = open(root);
   await reindex(db, root, embedder);
+  writeNote(root, "notes/acme.md", "# Acme Corp\n\none\n");
+  writeNote(root, "notes/globex.md", "# Globex\n\ntwo\n");
 
   const flushes: string[][] = [];
   const w = watch(db, root, embedder, { debounceMs: 10, onChange: (paths) => flushes.push(paths) });
-  writeNote(root, "notes/acme.md", "# Acme Corp\n\none\n");
-  writeNote(root, "notes/globex.md", "# Globex\n\ntwo\n");
   w.touch("notes/acme.md");
   w.touch("notes/globex.md");
   await w.idle();
 
   expect(flushes).toEqual([["notes/acme.md", "notes/globex.md"]]);
-  w.close();
+  await w.close();
+  db.close();
+});
+
+test("touch ignores anything the scan would not index", async () => {
+  const root = makeVault(FIXTURE);
+  const db = open(root);
+  await reindex(db, root, embedder);
+
+  const flushes: string[][] = [];
+  const w = watch(db, root, embedder, { debounceMs: 1, onChange: (paths) => flushes.push(paths) });
+  // the index's own files live under .vault/: acting on them would feed the
+  // watcher its own tail
+  w.touch(".vault/index.db");
+  w.touch(".vault/index.db-wal");
+  w.touch(".obsidian/workspace.md");
+  w.touch("notes/photo.png");
+  await w.idle();
+
+  expect(flushes).toEqual([]);
+  await w.close();
   db.close();
 });
 
@@ -130,7 +154,7 @@ test("the watcher indexes a create, an edit and a delete", async () => {
   expect(db.query("select count(*) as c from notes_fts where rowid = ?").get(created.id)).toEqual({
     c: 0,
   });
-  w.close();
+  await w.close();
   db.close();
 });
 
@@ -147,7 +171,7 @@ test("an unchanged file is reported but rewrites nothing", async () => {
   await w.idle();
   expect(seen).toMatchObject([{ added: 0, unchanged: 1 }]);
   expect(changes()).toBe(before);
-  w.close();
+  await w.close();
   db.close();
 });
 
@@ -180,7 +204,103 @@ test("an embedder failure is reported and the watcher keeps working", async () =
       .update("# Acme Corp\n\nedited while the provider is down\n")
       .digest("hex"),
   );
-  w.close();
+  await w.close();
+  db.close();
+});
+
+test("a reporter that throws does not wedge the watcher", async () => {
+  const root = makeVault(FIXTURE);
+  const db = open(root);
+  let down = false;
+  const flaky = stubEmbedder("flaky-v1", 32, async (texts) => {
+    if (down) throw new Error("provider down");
+    return embedder.embed(texts);
+  });
+  await reindex(db, root, flaky);
+  writeNote(root, "notes/acme.md", "# Acme Corp\n\nfails to embed\n");
+
+  let reports = 0;
+  const w = watch(db, root, flaky, {
+    debounceMs: 1,
+    onError: () => {
+      reports++;
+      throw new Error("the error reporter is broken too");
+    },
+  });
+  down = true;
+  w.touch("notes/acme.md");
+  await w.idle(); // must resolve: a throwing reporter used to leave the pass in flight forever
+  expect(reports).toBe(1);
+
+  // and the next change still gets indexed
+  down = false;
+  writeNote(root, "notes/globex.md", "# Globex\n\nindexes fine\n");
+  w.touch("notes/globex.md");
+  await w.idle();
+  expect(noteRow(db, "notes/globex.md")!.hash).toBe(
+    new Bun.CryptoHasher("sha256").update("# Globex\n\nindexes fine\n").digest("hex"),
+  );
+  await w.close();
+  db.close();
+});
+
+test("close waits for the pass in flight and starts no more", async () => {
+  const root = makeVault(FIXTURE);
+  const db = open(root);
+  await reindex(db, root, embedder);
+  const changes = () => (db.query("select total_changes() as c").get() as { c: number }).c;
+
+  let release = (): void => {};
+  const held = new Promise<void>((r) => (release = r));
+  const slow = stubEmbedder("token-overlap-v1", 32, async (texts) => {
+    await held;
+    return embedder.embed(texts);
+  });
+  writeNote(root, "notes/acme.md", "# Acme Corp\n\nindexed by the pass in flight\n");
+  writeNote(root, "notes/globex.md", "# Globex\n\nqueued behind it, never indexed\n");
+
+  const w = watch(db, root, slow, { debounceMs: 1 });
+  w.touch("notes/acme.md");
+  await Bun.sleep(20); // the pass is now inside embed()
+  w.touch("notes/globex.md"); // queues behind it
+  await Bun.sleep(20);
+
+  const closing = w.close();
+  release();
+  await closing;
+  const settled = changes();
+
+  // closing resolves only once the database is nobody's: a caller may now close
+  // it (the README example does exactly that) without racing a write
+  await Bun.sleep(50);
+  expect(changes()).toBe(settled);
+  expect(noteRow(db, "notes/acme.md")!.hash).toBe(
+    new Bun.CryptoHasher("sha256")
+      .update("# Acme Corp\n\nindexed by the pass in flight\n")
+      .digest("hex"),
+  );
+  // the queued path never ran: what a close drops, doctor picks up
+  expect(noteRow(db, "notes/globex.md")!.hash).toBe(
+    new Bun.CryptoHasher("sha256").update(FIXTURE["notes/globex.md"]).digest("hex"),
+  );
+  db.close();
+});
+
+test("a model swap under the watcher re-embeds the whole vault, not just the touched path", async () => {
+  const root = makeVault(FIXTURE);
+  const db = open(root);
+  await reindex(db, root, embedder); // 32 dims
+
+  let reported: { reembedded: boolean } | undefined;
+  const wider = new TokenOverlapEmbedder(64);
+  const w = watch(db, root, wider, { debounceMs: 1, onChange: (_paths, stats) => (reported = stats) });
+  w.touch("notes/acme.md");
+  await w.idle();
+
+  expect(reported?.reembedded).toBe(true);
+  expect(db.query("select count(*) as c from vectors").get()).toEqual({ c: 2 });
+  expect(db.query("select count(*) as c from vector_meta where dims = 64").get()).toEqual({ c: 2 });
+  await w.close();
   db.close();
 });
 

@@ -35,6 +35,15 @@ path the files *or* the index know about (so a row with no file is a deletion);
 the watcher passes the handful that just changed. A watched vault and a rebuilt
 one cannot drift apart, because only one function ever writes an index row.
 
+What is at a path is decided by an `lstat`, before it is read: **only a regular
+file is a note**, and a path that is gone, is a directory, or has become a
+symlink counts as a deletion. The scan applies the same rule (it skips both), so
+a path that survives only the read would be a row the scan never lists again —
+`doctor` would report it missing forever while a repair happily re-read it,
+indexing a symlink's target from *outside* the vault. A directory would be worse
+than wrong: `EISDIR` out of `reindex` and `doctor` alike, with no way left to
+repair the vault.
+
 ## Data model
 
 - A note = one `.md` file under the vault root (subdirs = namespaces). The scan
@@ -213,10 +222,16 @@ watching are not missed.
 Three failure modes, all of which land in the same place. A transient error (a
 provider blip, a locked database, an `fs.watch` error event) is logged and the
 watcher keeps going — it never throws at the caller mid-run, and never takes the
-process down. A directory rename reports only the directory, so notes moved
-inside it are missed. A `close()` drops paths still inside their debounce
-window. None of these is data loss: the files are the truth, and `doctor`
-rebuilds every row from them.
+process down, including when the caller's own `onError` throws. A directory
+rename reports only the directory, so notes moved inside it are missed. A
+`close()` drops paths still inside their debounce window and anything queued
+behind the pass in flight. None of these is data loss: the files are the truth,
+and `doctor` rebuilds every row from them.
+
+`close()` returns the pass in flight, because that pass still holds the database
+handle: `await watcher.close()` before closing the database is what keeps a
+shutdown from racing a write. Queued paths are dropped rather than drained —
+nobody is waiting for them, and doctor knows where they are.
 
 ## Testing / evals
 

@@ -61,7 +61,8 @@ real embedder pass their own (`cutoffs`), and the write gate must.
 
 `vault watch` reindexes once, then follows `fs.watch` (recursive) with a ~250ms
 per-path debounce, re-embedding only notes whose content hash actually changed.
-It logs each pass and stops on ctrl-c. It is a convenience, never a source of
+It logs the passes that changed something and stops on ctrl-c (finishing the
+pass in flight first). It is a convenience, never a source of
 truth: anything it misses — a directory rename, a pass that failed, a crash —
 `vault doctor` finds and fixes.
 
@@ -98,8 +99,8 @@ await vault.propose({ title: "Acme renewal 2026", type: "customer", namespace: "
 await vault.doctor();
 
 const watcher = vault.watch();     // keep the index warm while a human edits
-watcher.close();
-vault.close();
+await watcher.close();             // resolves when the pass in flight is done
+vault.close();                     // ...so this cannot close the DB under a write
 ```
 
 ### The write gate

@@ -1,7 +1,7 @@
 // Files are truth: the scan is the input, the DB is the output. Dirtiness is
 // decided by content hash, never by the DB's own bookkeeping.
 import type { Database } from "bun:sqlite";
-import { readdirSync, statSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 import { parseNote, type Note } from "./note";
 import { ensureVectors } from "./db";
@@ -109,13 +109,23 @@ export async function indexPaths(
   );
 
   const dirty: { note: Note; mtime: number; id: number | undefined }[] = [];
-  // Rows whose file is no longer on disk — a deletion, or a file removed
-  // between the scan and the read, which is the same thing by the time we look.
+  // Rows whose path is no longer a note on disk — see the entry check below.
   const gone: number[] = [];
   let unchanged = 0;
   for (const rel of new Set(rels)) {
     const row = indexed.get(rel);
-    const note = await readNote(root, rel);
+    // What is at the path decides, and it is decided *before* the read: only a
+    // regular file is a note. A path that is gone, has become a directory, or
+    // has become a symlink — which the scan skips, and which can point clean
+    // out of the vault — is a deletion. Reading first would index a symlink's
+    // target from outside the vault into a row nothing can ever purge (the
+    // scan never lists it again, so doctor calls it missing forever), and would
+    // throw EISDIR out of both reindex and doctor on a path turned directory,
+    // leaving no way to repair the vault at all.
+    const entry = lstatSync(join(root, rel), { throwIfNoEntry: false });
+    // Still null-checked after the read: a human may delete the file between
+    // the two syscalls, which is an ordinary event, not a failure.
+    const note = entry?.isFile() ? await readNote(root, rel) : null;
     if (note === null) {
       if (row) gone.push(row.id);
       continue;
@@ -125,8 +135,7 @@ export async function indexPaths(
       unchanged++;
       continue;
     }
-    const mtime = statSync(join(root, rel), { throwIfNoEntry: false })?.mtimeMs ?? 0;
-    dirty.push({ note, mtime: Math.floor(mtime), id: row?.id });
+    dirty.push({ note, mtime: Math.floor(entry?.mtimeMs ?? 0), id: row?.id });
   }
 
   const vectors = dirty.length
