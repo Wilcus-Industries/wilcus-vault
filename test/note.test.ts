@@ -132,3 +132,77 @@ body with [[globex]]
 test("serialize without frontmatter emits body only", () => {
   expect(serializeNote({ frontmatter: {}, body: "# Bare\n" })).toBe("# Bare\n");
 });
+
+test("alias bomb: expanded frontmatter over the node budget is malformed", () => {
+  // Billion-laughs: aliases re-expand on every reference, so a tiny file blows
+  // up into a multi-megabyte object that would detonate on JSON.stringify.
+  const raw = `---
+a: &a ["x","x","x","x","x","x","x","x","x"]
+b: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a]
+c: &c [*b,*b,*b,*b,*b,*b,*b,*b,*b]
+d: &d [*c,*c,*c,*c,*c,*c,*c,*c,*c]
+e: [*d,*d,*d,*d,*d,*d,*d,*d,*d]
+---
+body
+`;
+  const n = parseNote(raw, "x/bomb.md");
+  expect(n.malformedFrontmatter).toBe(true);
+  expect(n.frontmatter).toEqual({});
+  expect(n.body).toBe(raw);
+  expect(JSON.stringify(n).length).toBeLessThan(raw.length * 20); // stays small
+});
+
+test("ordinary nested frontmatter stays under the node budget", () => {
+  const n = parseNote(
+    "---\nmeta:\n  tags: [a, b, c]\n  nested:\n    k: v\n---\nbody\n",
+    "x/nested.md",
+  );
+  expect(n.malformedFrontmatter).toBe(false);
+  expect(n.frontmatter).toEqual({ meta: { tags: ["a", "b", "c"], nested: { k: "v" } } });
+});
+
+test("unterminated frontmatter is flagged", () => {
+  // A mangled closing fence must not silently drop superseded_by from the index.
+  const raw = "---\ntype: customer\nsuperseded_by: new/acme.md\n\nbody\n";
+  const n = parseNote(raw, "x/unterminated.md");
+  expect(n.malformedFrontmatter).toBe(true);
+  expect(n.frontmatter).toEqual({});
+  expect(n.body).toBe(raw);
+});
+
+test("closing fence with trailing junk does not close the block", () => {
+  const raw = "---\ntype: customer\n--- oops\nbody\n";
+  const n = parseNote(raw, "x/junk-fence.md");
+  expect(n.malformedFrontmatter).toBe(true);
+  expect(n.body).toBe(raw);
+});
+
+test("wikilinks never span newlines and are length-capped", () => {
+  const n = parseNote("[[foo\nbar]]\n\n[[ok]]\n", "x/nl.md");
+  expect(n.links).toEqual(["ok"]);
+
+  const distant = parseNote("[[\n\nlots of prose\n\n]]\n", "x/distant.md");
+  expect(distant.links).toEqual([]);
+
+  const long = parseNote(`[[${"a".repeat(300)}]] and [[short]]\n`, "x/long.md");
+  expect(long.links).toEqual(["short"]);
+});
+
+test("strips a leading UTF-8 BOM", () => {
+  const n = parseNote("﻿---\ntype: customer\n---\n# Title\n", "x/bom.md");
+  expect(n.frontmatter).toEqual({ type: "customer" });
+  expect(n.malformedFrontmatter).toBe(false);
+  expect(n.body).toBe("# Title\n");
+
+  const noFm = parseNote("﻿# Heading\n", "x/bom2.md");
+  expect(noFm.title).toBe("Heading");
+  expect(noFm.body).toBe("# Heading\n");
+});
+
+test("non-string title/type are ignored and flagged for doctor", () => {
+  const n = parseNote("---\ntitle: 42\ntype: [a, b]\n---\n# Heading\n", "x/badtypes.md");
+  expect(n.title).toBe("Heading"); // falls through to the heading
+  expect(n.type).toBeUndefined();
+  expect(n.malformedFrontmatter).toBe(true);
+  expect(n.frontmatter).toEqual({ title: 42, type: ["a", "b"] }); // kept as written
+});
