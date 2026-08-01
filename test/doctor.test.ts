@@ -6,7 +6,7 @@ import { TokenOverlapEmbedder } from "../src/embed";
 import { reindex } from "../src/indexer";
 import { doctor } from "../src/doctor";
 import { main } from "../src/cli";
-import { makeVault, writeNote, cleanupVaults } from "./vault-fixture";
+import { makeVault, writeNote, cleanupVaults, stubEmbedder } from "./vault-fixture";
 
 afterAll(cleanupVaults);
 
@@ -93,6 +93,33 @@ test("--rebuild reproduces an identical index after the DB is deleted", async ()
   expect(readdirSync(join(root, ".vault"))).toEqual(["index.db"]);
 });
 
+test("--rebuild re-embeds by definition and reports it", async () => {
+  const root = makeVault(GRAPH);
+  expect((await doctor(root, embedder, { rebuild: true })).reembedded).toBe(true);
+});
+
+test("a failed rebuild leaves no temp database behind", async () => {
+  const root = makeVault(GRAPH);
+  await doctor(root, embedder);
+  const boom = stubEmbedder("boom-v1", 32, async () => {
+    throw new Error("provider down");
+  });
+  await expect(doctor(root, boom, { rebuild: true })).rejects.toThrow("provider down");
+  expect(readdirSync(join(root, ".vault"))).toEqual(["index.db"]);
+  expect(snapshot(root).notes).toHaveLength(5); // the live index is untouched
+});
+
+test("doctor survives a file deleted mid-run", async () => {
+  const root = makeVault(GRAPH);
+  const racy = stubEmbedder("race-v1", 32, async (texts) => {
+    rmSync(join(root, "notes", "lonely.md"), { force: true });
+    return texts.map(() => new Float32Array(32).fill(1));
+  });
+  await doctor(root, racy); // must not throw
+  expect((await doctor(root, racy)).missing).toEqual(["notes/lonely.md"]);
+  expect((await doctor(root, racy, { repair: false })).missing).toEqual([]);
+});
+
 test("a model or dims change drops the vec0 table and re-embeds", async () => {
   const root = makeVault(GRAPH);
   await doctor(root, embedder);
@@ -110,15 +137,37 @@ test("a model or dims change drops the vec0 table and re-embeds", async () => {
 test("cli: reindex, doctor and doctor --rebuild", async () => {
   const root = makeVault(GRAPH);
   const log = spyOn(console, "log").mockImplementation(() => {});
+  const err = spyOn(console, "error").mockImplementation(() => {});
   try {
     expect(await main(["reindex", "--vault", root])).toBe(0);
     expect(existsSync(dbPath(root))).toBe(true);
-    expect(await main(["doctor", "--vault", root])).toBe(0);
-    expect(await main(["doctor", "--rebuild", "--vault", root])).toBe(0);
+    // GRAPH has a broken link, an ambiguous link and a duplicate stem: doctor
+    // repaired what it could, so the exit code has to say work is left
+    expect(await main(["doctor", "--vault", root])).toBe(1);
+    expect(await main(["doctor", "--rebuild", "--vault", root])).toBe(1);
     expect(log.mock.calls.flat().join("\n")).toContain("ghost");
-    expect(await main([])).toBe(1); // usage
-    expect(await main(["nope"])).toBe(1);
+    expect(err).not.toHaveBeenCalled();
   } finally {
     log.mockRestore();
+    err.mockRestore();
+  }
+});
+
+test("cli: a clean vault exits 0; usage goes to stderr", async () => {
+  const root = makeVault({ "a.md": "# A\n\n[[b]]\n", "b.md": "# B\n\n[[a]]\n" });
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  const err = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    expect(await main(["doctor", "--vault", root])).toBe(0);
+    expect(err).not.toHaveBeenCalled();
+    expect(await main([])).toBe(1);
+    expect(await main(["nope"])).toBe(1);
+    // a flag swallowed as the vault path would index the wrong directory
+    expect(await main(["doctor", "--vault", "--rebuild"])).toBe(1);
+    expect(await main(["doctor", "--vault"])).toBe(1);
+    expect(err.mock.calls.flat().join("\n")).toContain("vault <command>");
+  } finally {
+    log.mockRestore();
+    err.mockRestore();
   }
 });

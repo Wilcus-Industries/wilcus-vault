@@ -2,6 +2,14 @@
 // sandbox may block writes outside it.
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import type { Embedder } from "../src/embed";
+
+/** An embedder that returns exactly what a test wants it to. */
+export const stubEmbedder = (
+  model: string,
+  dims: number,
+  embed: Embedder["embed"] = async (texts) => texts.map(() => new Float32Array(dims).fill(1)),
+): Embedder => ({ model, dims, embed });
 
 const roots: string[] = [];
 

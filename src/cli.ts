@@ -14,13 +14,15 @@ const USAGE = `vault <command> [options]
 export async function main(argv: string[]): Promise<number> {
   const command = argv[0];
   if (command !== "reindex" && command !== "doctor") {
-    console.log(USAGE);
+    console.error(USAGE);
     return 1;
   }
   const flag = argv.indexOf("--vault");
   const root = flag === -1 ? process.cwd() : argv[flag + 1];
-  if (root === undefined) {
-    console.log(USAGE);
+  // A missing value would otherwise swallow the next flag and index whatever
+  // directory that names — or the cwd.
+  if (root === undefined || root.startsWith("--")) {
+    console.error(`--vault needs a directory\n\n${USAGE}`);
     return 1;
   }
   // Only the deterministic embedder ships so far; the API one lands with search.
@@ -40,8 +42,13 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
-  print(await doctor(root, embedder, { rebuild: argv.includes("--rebuild") }));
-  return 0;
+  const report = await doctor(root, embedder, { rebuild: argv.includes("--rebuild") });
+  print(report);
+  // Drift is repaired; links a human has to fix are not, so say so in the
+  // exit code. (Orphans and malformed frontmatter are notes, not damage.)
+  const unrepaired =
+    report.brokenLinks.length + report.ambiguousLinks.length + report.duplicateStems.length;
+  return unrepaired === 0 ? 0 : 1;
 }
 
 function print(r: DoctorReport): void {

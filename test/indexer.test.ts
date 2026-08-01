@@ -4,8 +4,8 @@ import { mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { openDb, dbPath } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
-import { reindex, scanVault } from "../src/indexer";
-import { makeVault, writeNote, cleanupVaults } from "./vault-fixture";
+import { reindex, scanVault, readNote } from "../src/indexer";
+import { makeVault, writeNote, cleanupVaults, stubEmbedder } from "./vault-fixture";
 
 afterAll(cleanupVaults);
 
@@ -178,6 +178,65 @@ test("an embedding model change re-embeds every note", async () => {
   expect(stats).toMatchObject({ updated: 3, unchanged: 0, reembedded: true });
   expect(db.query("select count(*) as c from vectors").get()).toEqual({ c: 3 });
   expect(db.query("select count(*) as c from vector_meta where dims = 48").get()).toEqual({ c: 3 });
+  db.close();
+});
+
+test("a new embedding model at the same dims still re-embeds everything", async () => {
+  const root = makeVault(FIXTURE);
+  const db = open(root);
+  await reindex(db, root, embedder);
+  const stats = await reindex(db, root, stubEmbedder("other-model-v1", 32));
+  expect(stats).toMatchObject({ updated: 3, unchanged: 0, reembedded: true });
+  expect(db.query("select count(*) as c from vector_meta where model='other-model-v1'").get()).toEqual(
+    { c: 3 },
+  );
+  expect(db.query("select count(*) as c from vectors").get()).toEqual({ c: 3 });
+  db.close();
+});
+
+test("a note with no tokens gets no vector row, and stays indexed and idempotent", async () => {
+  const root = makeVault({ "cjk.md": "# 圏点\n\n日本語 🙂\n", "notes/acme.md": FIXTURE["notes/acme.md"] });
+  const db = open(root);
+  expect(await reindex(db, root, embedder)).toMatchObject({ added: 2 });
+  const id = (db.query("select id from notes where path='cjk.md'").get() as { id: number }).id;
+  // an all-zero vector has no direction: cosine distance against it is NaN
+  expect(db.query("select count(*) as c from vectors where note_id = ?").get(id)).toEqual({ c: 0 });
+  expect(db.query("select count(*) as c from vector_meta where note_id = ?").get(id)).toEqual({
+    c: 1,
+  });
+  expect(db.query("select count(*) as c from notes_fts where rowid = ?").get(id)).toEqual({ c: 1 });
+  // must not look half-indexed on the next pass
+  const before = changes(db);
+  expect(await reindex(db, root, embedder)).toMatchObject({ unchanged: 2, updated: 0 });
+  expect(changes(db)).toBe(before);
+  db.close();
+});
+
+test("readNote returns null when the file vanished between scan and read", async () => {
+  expect(await readNote(makeVault(FIXTURE), "notes/ghost.md")).toBeNull();
+});
+
+test("a file deleted mid-run does not abort the reindex", async () => {
+  const root = makeVault(FIXTURE);
+  const db = open(root);
+  const racy = stubEmbedder("race-v1", 32, async (texts) => {
+    rmSync(join(root, "notes", "globex.md")); // gone after we read it, before we write
+    return texts.map(() => new Float32Array(32).fill(1));
+  });
+  await reindex(db, root, racy); // must not throw
+  expect(await reindex(db, root, racy)).toMatchObject({ removed: 1, unchanged: 2 });
+  db.close();
+});
+
+test("an embedder returning the wrong shape fails with a clear error", async () => {
+  const root = makeVault(FIXTURE);
+  const db = open(root);
+  const narrow = stubEmbedder("narrow-v1", 32, async (texts) =>
+    texts.map(() => new Float32Array(8)),
+  );
+  await expect(reindex(db, root, narrow)).rejects.toThrow(/narrow-v1.*width 8.*32/s);
+  const short = stubEmbedder("short-v1", 32, async () => []);
+  await expect(reindex(db, root, short)).rejects.toThrow(/short-v1.*0 vectors for 3/s);
   db.close();
 });
 

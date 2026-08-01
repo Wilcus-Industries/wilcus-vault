@@ -90,6 +90,13 @@ from env only, never persisted to DB/frontmatter and never echoed in error
 messages; note that whole note bodies leave the machine on every embed — callers
 choose the provider accordingly). Notes embedded whole — no chunking.
 
+A note whose text yields no tokens the embedder recognizes (CJK, emoji or
+punctuation only) embeds to all zeros. A zero vector has no direction, so
+cosine distance against it is NaN and would poison KNN: the indexer writes no
+`vectors` row for it — the note stays findable through FTS — while its
+`vector_meta` row still records the attempt, so it is not mistaken for a
+half-indexed note and re-embedded on every pass.
+
 ## Write gate
 
 Every programmatic write goes through `vault.propose(candidate)`:

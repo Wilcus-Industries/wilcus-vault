@@ -17,13 +17,13 @@ export type DoctorReport = {
   brokenLinks: LinkProblem[];
   /** `[[slug]]` matching several notes — none of them wins */
   ambiguousLinks: LinkProblem[];
-  /** notes with no link in and none out */
+  /** notes with no *resolved* link in and no link out at all */
   orphans: string[];
   /** filename stems shared by several notes: every link to them is ambiguous */
   duplicateStems: { slug: string; paths: string[] }[];
   /** frontmatter the parser could not use — indexed anyway, whole file as body */
   malformed: string[];
-  /** the embedding model or dims changed, so the vec0 table was rebuilt */
+  /** every note was re-embedded: the model or dims changed, or this was a rebuild */
   reembedded: boolean;
 };
 
@@ -42,11 +42,11 @@ export async function doctor(
   const path = dbPath(root);
   // Drift is measured before any repair, so the report says what was wrong.
   const drift = await withDb(path, (db) => diskDrift(db, root));
-  const reembedded = rebuild
-    ? await rebuildIndex(root, embedder)
-    : repair
-      ? await withDb(path, async (db) => (await reindex(db, root, embedder)).reembedded)
-      : false;
+  let reembedded = rebuild; // a rebuild embeds every note from scratch
+  if (rebuild) await rebuildIndex(root, embedder);
+  else if (repair) {
+    reembedded = (await withDb(path, (db) => reindex(db, root, embedder))).reembedded;
+  }
   return { ...drift, ...(await withDb(path, graphReport)), reembedded };
 }
 
@@ -75,7 +75,9 @@ async function diskDrift(
   );
   const stale: string[] = [];
   for (const rel of scanVault(root)) {
-    if (indexed.get(rel) !== (await readNote(root, rel)).hash) stale.push(rel);
+    const note = await readNote(root, rel);
+    if (note === null) continue; // deleted while we looked: it counts as missing
+    if (indexed.get(rel) !== note.hash) stale.push(rel);
     indexed.delete(rel);
   }
   return { stale, missing: [...indexed.keys()].sort() };
@@ -124,21 +126,34 @@ function graphReport(db: Database): Omit<DoctorReport, "stale" | "missing" | "re
 
 /**
  * Rebuild from the files into a temp DB, then rename it over index.db — a
- * half-finished rebuild can never become the live index.
- * ponytail: a watcher holding the old file keeps writing to the replaced
- * inode; those writes are lost, not corrupting, and the next doctor run picks
- * them back up off disk. Add a lock file if that stops being good enough.
+ * half-finished rebuild can never become the live index, and a failed one
+ * leaves nothing behind.
+ * ponytail: two races remain, both narrowed rather than closed. A watcher
+ * holding the old file keeps writing to the replaced inode: those writes are
+ * lost, not corrupting, and the next doctor run picks them back up off disk.
+ * And a watcher that recreates the old file's -wal between our unlink and the
+ * rename leaves a stale journal beside the fresh index, which SQLite would
+ * then try to apply. A lock file is the upgrade path for both.
  */
-async function rebuildIndex(root: string, embedder: Embedder): Promise<boolean> {
+async function rebuildIndex(root: string, embedder: Embedder): Promise<void> {
   const target = dbPath(root);
   const tmp = `${target}.rebuild-${Bun.randomUUIDv7()}`;
-  const reembedded = await withDb(tmp, async (db) => {
-    const stats = await reindex(db, root, embedder);
-    db.run("pragma wal_checkpoint(truncate)"); // fold the WAL in before the rename
-    return stats.reembedded;
-  });
+  try {
+    await withDb(tmp, async (db) => {
+      await reindex(db, root, embedder);
+      db.run("pragma wal_checkpoint(truncate)"); // fold the WAL in before the rename
+    });
+  } catch (e) {
+    rmDb(tmp); // a dead temp index must not accumulate in .vault/
+    throw e;
+  }
+  // The replaced file's journal describes a database that is about to stop
+  // existing; drop it first so it is never seen next to the new one.
+  rmDb(target, { journalsOnly: true });
   renameSync(tmp, target);
-  // The replaced file's journal describes a database that no longer exists.
-  for (const suffix of ["-wal", "-shm"]) rmSync(`${target}${suffix}`, { force: true });
-  return reembedded;
+}
+
+function rmDb(path: string, { journalsOnly = false } = {}): void {
+  for (const suffix of ["-wal", "-shm"]) rmSync(`${path}${suffix}`, { force: true });
+  if (!journalsOnly) rmSync(path, { force: true });
 }
