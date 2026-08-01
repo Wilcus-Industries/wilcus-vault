@@ -77,7 +77,17 @@ how bad it is); a threshold on the fused score cannot filter irrelevance. RRF
 N. Superseded notes are filtered from the over-fetched set before ranking. When
 nothing survives the cutoffs, the result is empty — callers (the write gate
 especially) must treat that as "no similar notes exist", not an error.
-One-hop wikilink expansion is an opt-in second pass, never an LLM graph walk.
+One-hop wikilink expansion is an opt-in second pass, never an LLM graph walk:
+neighbours (either direction) of the survivors are appended below every direct
+hit, capped at N of their own, so `expandLinks` returns at most 2N.
+
+The user's query never reaches FTS5 as syntax: each whitespace-separated run
+becomes one quoted phrase (embedded quotes doubled), so `NEAR(`, `OR`, `*` and
+`^` are matched as words. The cutoffs themselves are the caller's policy —
+there is no default, because the ceiling that means "irrelevant" is a property
+of the embedder, and the `vault search` CLI (bag-of-tokens embedder) has no
+meaningful fixed one. Both are upper bounds on a lower-is-better quantity:
+cosine distance, and FTS5's negative `rank`.
 
 ## Embedding
 
@@ -85,10 +95,14 @@ One-hop wikilink expansion is an opt-in second pass, never an LLM graph walk.
 — injected. Vectors are L2-normalized on insert and on query (so cosine distance
 is well-defined regardless of provider). Ships: `TokenOverlapEmbedder`
 (deterministic bag-of-tokens, for tests/evals — exercises the plumbing, not
-semantics) and `FetchEmbedder` (OpenAI-compatible `/v1/embeddings`; API key read
-from env only, never persisted to DB/frontmatter and never echoed in error
-messages; note that whole note bodies leave the machine on every embed — callers
-choose the provider accordingly). Notes embedded whole — no chunking.
+semantics) and `FetchEmbedder` (OpenAI-compatible `/v1/embeddings`; endpoint,
+model, dims and key from the constructor falling back to `VAULT_EMBED_*` env
+vars, never persisted to DB/frontmatter and never echoed in error messages —
+a quoted provider error body has the key redacted out; note that whole note
+bodies leave the machine on every embed — callers choose the provider
+accordingly). Requests are batched by text count *and* by characters, since a
+whole-note payload is what actually blows a provider's per-request limit. Notes
+embedded whole — no chunking.
 
 A note whose text yields no tokens the embedder recognizes (CJK, emoji or
 punctuation only) embeds to all zeros. A zero vector has no direction, so

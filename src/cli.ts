@@ -3,17 +3,19 @@ import { openDb, dbPath } from "./db";
 import { reindex } from "./indexer";
 import { doctor, type DoctorReport } from "./doctor";
 import { TokenOverlapEmbedder } from "./embed";
+import { hybridSearch } from "./search";
 
 const USAGE = `vault <command> [options]
 
   reindex             index new and changed notes
   doctor [--rebuild]  check and repair the index (--rebuild: from scratch)
+  search <query>      hybrid search over the indexed notes
 
   --vault <dir>       vault root (default: cwd)`;
 
 export async function main(argv: string[]): Promise<number> {
   const command = argv[0];
-  if (command !== "reindex" && command !== "doctor") {
+  if (command !== "reindex" && command !== "doctor" && command !== "search") {
     console.error(USAGE);
     return 1;
   }
@@ -25,8 +27,40 @@ export async function main(argv: string[]): Promise<number> {
     console.error(`--vault needs a directory\n\n${USAGE}`);
     return 1;
   }
-  // Only the deterministic embedder ships so far; the API one lands with search.
+  // The CLI embeds locally: no note text leaves the machine unless a library
+  // caller wires up FetchEmbedder.
   const embedder = new TokenOverlapEmbedder();
+
+  if (command === "search") {
+    const words = argv.slice(1);
+    if (flag !== -1) words.splice(flag - 1, 2);
+    const query = words.join(" ");
+    if (query === "") {
+      console.error(`search needs a query\n\n${USAGE}`);
+      return 1;
+    }
+    const db = openDb(dbPath(root));
+    try {
+      // No relevance cutoffs here: against a bag-of-tokens embedder no fixed
+      // cosine ceiling is meaningful (a one-word query is far from every long
+      // note by construction), so the CLI shows the ranking and lets the
+      // reader judge. Library callers with a real embedder pass their own.
+      const hits = await hybridSearch(db, embedder, query);
+      console.log(
+        hits.length === 0
+          ? "no matches"
+          : hits
+              .map(
+                (h) =>
+                  `${h.score.toFixed(4)}  ${h.path}${h.expansion ? " (link)" : ""} — ${h.title}`,
+              )
+              .join("\n"),
+      );
+    } finally {
+      db.close();
+    }
+    return 0;
+  }
 
   if (command === "reindex") {
     const db = openDb(dbPath(root));
