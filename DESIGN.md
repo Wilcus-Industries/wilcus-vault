@@ -39,7 +39,14 @@ src/
   path); `doctor` reports the resulting broken edges.
 - Frontmatter: `type`, `created`, `updated`, optional `superseded_by`
   (**vault-relative path** of the superseding note), plus free keys. Written by
-  us, editable by humans.
+  us, editable by humans. `parseNote` never throws: a file whose frontmatter is
+  unterminated, non-mapping, or invalid YAML still indexes with the whole file as
+  its body and a `malformedFrontmatter` flag for `doctor` to report. Title =
+  frontmatter `title` ?? first `# ` heading ?? filename stem.
+- Wikilinks (`[[slug]]`, `[[slug|alias]]` — slug only, deduped) and the fallback
+  heading are found by regex over the body, not a markdown parse: links and
+  headings inside code fences count. Deliberate MVP simplification — a spurious
+  edge is visible in `doctor`, and no note is ever lost to a parse failure.
 - DB at `<vault>/.vault/index.db`, opened in WAL mode with `busy_timeout=5000`
   (watcher, CLI, and library callers share it). Never committed to the vault's
   own git. Tables:
