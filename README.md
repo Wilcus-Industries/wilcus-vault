@@ -6,3 +6,11 @@ write gate so nothing is silently overwritten. Open the vault in Obsidian or any
 editor — the SQLite index is derived and disposable (`vault doctor --rebuild`).
 
 Status: MVP under construction. See DESIGN.md.
+
+```
+bun run src/cli.ts reindex [--vault <dir>]           # index new and changed notes
+bun run src/cli.ts doctor [--rebuild] [--vault <dir>] # check and repair the index
+```
+
+The index lives at `<vault>/.vault/index.db` and is safe to delete — `doctor
+--rebuild` recreates it from the files.
