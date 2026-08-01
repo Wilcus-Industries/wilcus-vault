@@ -39,7 +39,17 @@ src/
   path); `doctor` reports the resulting broken edges.
 - Frontmatter: `type`, `created`, `updated`, optional `superseded_by`
   (**vault-relative path** of the superseding note), plus free keys. Written by
-  us, editable by humans.
+  us, editable by humans. `parseNote` never throws: a file whose frontmatter is
+  unterminated, non-mapping, invalid YAML, or over the alias-expansion node
+  budget (YAML aliases re-expand — a 250-byte billion-laughs note would
+  otherwise become a megabytes-wide index row) still indexes with the whole file
+  as its body and a `malformedFrontmatter` flag for `doctor` to report; so does
+  a non-string `title`/`type`, whose value is ignored. Title = frontmatter
+  `title` ?? first `# ` heading ?? filename stem.
+- Wikilinks (`[[slug]]`, `[[slug|alias]]` — slug only, deduped) and the fallback
+  heading are found by regex over the body, not a markdown parse: links and
+  headings inside code fences count. Deliberate MVP simplification — a spurious
+  edge is visible in `doctor`, and no note is ever lost to a parse failure.
 - DB at `<vault>/.vault/index.db`, opened in WAL mode with `busy_timeout=5000`
   (watcher, CLI, and library callers share it). Never committed to the vault's
   own git. Tables:
@@ -96,6 +106,13 @@ Every programmatic write goes through `vault.propose(candidate)`:
      from the candidate title; the joined path is resolved and asserted to be
      under the vault root; symlinked targets are rejected. LLM-derived strings
      never name a raw filesystem path.
+   - **No re-serialization of notes we didn't author:** a YAML round-trip is
+     lossy against hand-written data (comments dropped, `01234` → `1234`,
+     `1.0` → `1`). Frontmatter edits to existing notes (e.g. `supersede`'s
+     `superseded_by`) are **textual patches of the frontmatter block** — append
+     a line, or replace a single key's line — leaving every other line
+     byte-identical. `serializeNote` is only for notes the gate authors from
+     scratch.
    - `create` writes a new file; `update` rewrites the target body; `supersede`
      writes the new note, adds `superseded_by` (vault-relative path) to the old
      note's frontmatter plus a forward wikilink; `discard` appends the candidate
