@@ -25,7 +25,7 @@ src/
   search.ts  # hybrid: vec KNN + FTS5 BM25 → pre-fusion cutoffs → RRF ordering
   gate.ts    # write gate: top-k similar → decider → update|supersede|create|discard
   watch.ts   # fs.watch + debounce + hash dirty-check → reindex changed files
-  vault.ts   # Vault facade (public API)
+  vault.ts   # Vault facade (public API), incl. the direct reads: get(path), list(prefix?)
   cli.ts     # vault doctor|reindex|search|watch
 ```
 
@@ -35,9 +35,10 @@ path the files *or* the index know about (so a row with no file is a deletion);
 the watcher passes the handful that just changed. A watched vault and a rebuilt
 one cannot drift apart, because only one function ever writes an index row.
 
-What is at a path is decided by an `lstat`, before it is read: **only a regular
-file is a note**, and a path that is gone, is a directory, or has become a
-symlink counts as a deletion. The scan applies the same rule (it skips both), so
+What is at a path is decided by an `lstat`, before it is read (`noteEntry`, one
+function so the indexer and `get` cannot drift): **only a regular file is a
+note**, and a path that is gone, is a directory, or has become a symlink counts
+as a deletion. The scan applies the same rule (it skips both), so
 a path that survives only the read would be a row the scan never lists again —
 `doctor` would report it missing forever while a repair happily re-read it,
 indexing a symlink's target from *outside* the vault. A directory would be worse
@@ -129,6 +130,37 @@ caller's policy — there is no default, because the ceiling that means
 lower-is-better quantity: cosine distance, and FTS5's negative `rank`. They live
 in one `cutoffs` option so a caller has to decide about them rather than inherit
 silence.
+
+Search is not the only read. Two direct paths sit beside it on the facade, for a
+caller that already knows which note it wants (wilcus-core#42: one note parser
+in the ecosystem, this one):
+
+- **`get(path)`** takes a note's identity — the vault-relative path *including*
+  `.md`; `ledger/q3` names nothing — and returns the parsed note or null. It
+  reads the **file**, never the index row, so a stale, missing or half-written
+  row cannot change the answer; that is what makes it safe for another package
+  to delete its own parser. The argument is canonicalized first, into the same
+  form the scan stores (`relative` + forward slashes): `./ledger/q3.md`,
+  `ledger//q3.md`, a Windows-joined `ledger\q3.md` and an absolute path inside
+  the vault are all the one note, and the `path` handed back is the identity a
+  caller may store — it cannot vary with how the caller spelled it. Only a regular file is a note, so a directory or a
+  symlink at the path is null exactly like an absent one. The path's *parent* is
+  put through the same `confinedPath` rail the write gate uses, so an escape, a
+  dot-directory or a symlinked directory on the way down **throws** — a caller
+  that built such a path has a bug, and silence would hide it. The leaf needs no
+  confinement of its own: a symlink there is already null, and a path cannot
+  escape the root through its last segment alone.
+- **`list(prefix?)`** returns vault-relative paths from the index rows, sorted.
+  Derived data is legitimate here — paths are precisely what the scan rebuilds,
+  and a caller that wants content calls `get`. An optional `prefix` names a
+  namespace and matches on **segment boundaries**, the same rule as § Scopes and
+  context: `ledger` and `ledger/` both match `ledger/q3.md`, neither matches
+  `ledger-archive/q3.md`. It is the note set, not the search set — superseded
+  notes are listed and no cutoff applies.
+
+Neither takes a `VaultContext` yet. The type exists (#20), but a read context
+with nothing to enforce is a parameter that means nothing; it arrives on both
+with the scope read check (#23, § Scopes and context).
 
 ## Embedding
 
@@ -282,7 +314,8 @@ type VaultContext = { agent: string; source?: string };
 prompted the call — a conversation id, a task id, freeform. It is the second
 parameter of `propose(candidate, ctx)` — optional until a `ScopePolicy` exists
 to require it (#23); the read paths carry it as `SearchOptions.ctx` and an
-optional trailing parameter on `get`/`list` (#21).
+optional trailing parameter on `get`/`list` (both with #23, which is what makes
+a read context mean anything — #21 shipped them unscoped).
 The gate stamps provenance into the frontmatter of every note it writes:
 **`vault_agent`** and **`vault_source`** — namespaced, because `agent:` and
 `source:` are exactly the keys a human's own frontmatter plausibly holds, and

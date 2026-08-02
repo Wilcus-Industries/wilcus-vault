@@ -1,7 +1,7 @@
 // Files are truth: the scan is the input, the DB is the output. Dirtiness is
 // decided by content hash, never by the DB's own bookkeeping.
 import type { Database } from "bun:sqlite";
-import { lstatSync, readdirSync } from "node:fs";
+import { lstatSync, readdirSync, type Stats } from "node:fs";
 import { join, relative } from "node:path";
 import { parseNote, type Note } from "./note";
 import { ensureVectors } from "./db";
@@ -48,6 +48,18 @@ export function scanVault(root: string): string[] {
  */
 export function isNotePath(rel: string): boolean {
   return rel.endsWith(".md") && !rel.split(/[/\\]/).some((segment) => segment.startsWith("."));
+}
+
+/**
+ * The `lstat` of a path that really holds a note, or null. **Only a regular
+ * file is a note** (DESIGN.md § Layout): a path that is gone, has become a
+ * directory, or has become a symlink — which the scan skips, and which can
+ * point clean out of the vault — holds no note. Decided *before* the read and
+ * shared, so the indexer's deletion rule and `get`'s null cannot drift apart.
+ */
+export function noteEntry(root: string, rel: string): Stats | null {
+  const entry = lstatSync(join(root, rel), { throwIfNoEntry: false });
+  return entry?.isFile() ? entry : null;
 }
 
 /**
@@ -134,10 +146,10 @@ export async function indexPaths(
     // scan never lists it again, so doctor calls it missing forever), and would
     // throw EISDIR out of both reindex and doctor on a path turned directory,
     // leaving no way to repair the vault at all.
-    const entry = lstatSync(join(root, rel), { throwIfNoEntry: false });
+    const entry = noteEntry(root, rel);
     // Still null-checked after the read: a human may delete the file between
     // the two syscalls, which is an ordinary event, not a failure.
-    const note = entry?.isFile() ? await readNote(root, rel) : null;
+    const note = entry === null ? null : await readNote(root, rel);
     if (note === null) {
       if (row) gone.push(row.id);
       continue;
