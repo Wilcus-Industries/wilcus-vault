@@ -18,7 +18,9 @@ no YAML dependency.
 src/
   note.ts    # parse/serialize a note: frontmatter (Bun.YAML), wikilinks, sha256 hash,
              # textual frontmatter patch for files we did not author
-  db.ts      # open DB (WAL, busy_timeout), load sqlite-vec, schema/migrations
+  db.ts      # open DB (WAL, busy_timeout), load sqlite-vec, schema/migrations,
+             # vectorsStale (read-only) / resetVectors (destructive)
+  term.ts    # scrub control characters out of anything echoed to a terminal
   embed.ts   # Embedder interface + deterministic test embedder + fetch-based API embedder
   indexer.ts # scan vault dir, hash-diff, upsert notes/fts/vectors, rewrite edges
   doctor.ts  # drift report + repair + --rebuild into a temp DB, renamed into place
@@ -209,7 +211,22 @@ The CLI is a caller like any other: every command builds that same defaulted
 `FetchEmbedder`, and `--lexical` substitutes `TokenOverlapEmbedder` for a machine
 with no daemon (and for the suite, so CI needs no Ollama). Either way a bad
 configuration or an unreachable endpoint reaches the user as the one sentence it
-was written as, and exit 1 — `main` prints `e.message`, never a stack.
+was written as, and exit 1 — never a stack, and never raw: an error now quotes a
+provider's response body, so it goes through `term.ts` like every other
+untrusted string the vault prints (`safe`/`printable` — control characters
+become `?`, so nothing can redraw the terminal's last line).
+
+**A model swap does not destroy anything until its replacements exist.**
+Staleness is *detected* read-only (`vectorsStale`) before `embed` is called, and
+the drop-and-recreate (`resetVectors`) runs inside the write transaction that
+files the new vectors. Embedding is a network call that fails for ordinary
+reasons — the daemon is not running, `--lexical` and the default were swapped —
+and the old order left the vault with an empty `vectors` table, an empty
+`vector_meta` and nothing recording that a re-embed was owed: `search` would
+then quietly answer on FTS alone, at exit 0. Now a failed swap rolls back whole,
+and `search` keeps refusing stale vectors until a pass has actually replaced
+them. (`doctor --rebuild` was always safe — it builds a temp DB and renames it
+into place.)
 
 Requests are batched by text count *and* by characters, since a
 whole-note payload is what actually blows a provider's per-request limit. Notes

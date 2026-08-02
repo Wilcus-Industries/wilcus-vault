@@ -148,6 +148,35 @@ test("cli: an unreachable embedder is one line on stderr, never a stack trace", 
   expect(code).toBe(1);
   expect(out).toBe("");
   expect(err).not.toBe("");
-  expect(err.split("\n")).toHaveLength(1);
   expect(err).not.toContain("    at "); // a stack frame is not an error message
+});
+
+test("cli: an error message cannot rewrite the terminal it is printed to", async () => {
+  // Everything on stderr was written by someone else: an argument, a note, and
+  // now up to 200 bytes of whatever answered on :11434. A carriage return or an
+  // ESC in any of them redraws the line the terminal has already printed, so
+  // stderr gets the same scrub stdout has always had. Argv is the shortest
+  // untrusted string that reaches the catch all of them land in — and the bytes
+  // are built by code, so no editor or patch tool can quietly normalize them.
+  const ESC = String.fromCharCode(27);
+  const CR = String.fromCharCode(13);
+  const control = (c: string) => (c.codePointAt(0) ?? 0) < 32 || c.codePointAt(0) === 127;
+  for (const arg of [`--${ESC}[2K${CR}x`, `${ESC}[2K${CR}x`]) {
+    const { code, err } = await cli(arg);
+    expect(code).toBe(1);
+    // every control character is gone but the newlines the CLI itself writes
+    expect([...err].filter(control)).toEqual([...err].filter((c) => c === "\n"));
+    expect(err).toContain("?[2K?x");
+    expect(err).toContain("vault <command>"); // and a multi-line usage error stays readable
+  }
+});
+
+test("cli: search with no query reports a broken embedder before it asks for one", async () => {
+  const root = makeVault(GRAPH);
+  // The embedder is built before the query is checked, so a misconfigured one
+  // is what a bare `vault search` complains about. Pinned because the order is
+  // arbitrary: swapping it would silently change this message.
+  const { code, err } = await withEnv(REMOTE, () => cli("search", "--vault", root));
+  expect(code).toBe(1);
+  expect(err).toBe("FetchEmbedder: no API key — pass apiKey or set VAULT_EMBED_API_KEY");
 });

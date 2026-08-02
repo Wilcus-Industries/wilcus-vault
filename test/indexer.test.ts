@@ -259,6 +259,35 @@ test("a new embedding model at the same dims still re-embeds everything", async 
   db.close();
 });
 
+test("a model swap that fails to embed leaves the old vectors intact", async () => {
+  const root = makeVault(FIXTURE);
+  const db = open(root);
+  await reindex(db, root, embedder);
+  const before = db.query("select note_id, emb from vectors order by note_id").all();
+
+  // The swap's replacement vectors never arrive — an Ollama that is not
+  // running, which `--lexical` <-> default switching makes an ordinary event.
+  const broken = stubEmbedder("other-model-v1", 32, () => {
+    throw new Error("no embedder configured: start Ollama");
+  });
+  await expect(reindex(db, root, broken)).rejects.toThrow(/no embedder configured/);
+  // Nothing may have been thrown away for a re-embed that did not happen: an
+  // emptied vectors table with emptied meta is a vault that searches on FTS
+  // alone and says nothing about it.
+  expect(db.query("select note_id, emb from vectors order by note_id").all()).toEqual(before);
+  expect(db.query("select count(*) as c from vector_meta where model = ?").get(embedder.model)).toEqual(
+    { c: 3 },
+  );
+
+  // and the swap still works once the embedder does
+  const stats = await reindex(db, root, stubEmbedder("other-model-v1", 32));
+  expect(stats).toMatchObject({ updated: 3, unchanged: 0, reembedded: true });
+  expect(db.query("select count(*) as c from vector_meta where model='other-model-v1'").get()).toEqual(
+    { c: 3 },
+  );
+  db.close();
+});
+
 test("a note with no tokens gets no vector row, and stays indexed and idempotent", async () => {
   const root = makeVault({ "cjk.md": "# 圏点\n\n日本語 🙂\n", "notes/acme.md": FIXTURE["notes/acme.md"] });
   const db = open(root);

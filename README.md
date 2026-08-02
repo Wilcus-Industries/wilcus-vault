@@ -57,8 +57,10 @@ Ollama ...` — and exits 1, rather than quietly falling back to a cloud API.
 
 `--lexical` swaps in the deterministic `TokenOverlapEmbedder` instead: no
 daemon, no network, and no semantics either — for an offline machine, and what
-the test suite runs on. The two are different vector spaces, so switching
-re-embeds the vault on the next pass.
+the test suite runs on. The two are different vector spaces, so switching costs
+a full re-embed: `reindex`, `doctor` and `watch` do it on their next pass, and
+`search` refuses in the meantime (`... — run vault doctor to re-embed`) rather
+than compare vectors that are not comparable.
 
 ```
 $ vault search renewal terms

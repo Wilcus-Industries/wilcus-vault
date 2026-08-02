@@ -6,6 +6,7 @@ import { doctor, type DoctorReport } from "./doctor";
 import { FetchEmbedder, TokenOverlapEmbedder } from "./embed";
 import { hybridSearch } from "./search";
 import { watch } from "./watch";
+import { printable, safe } from "./term";
 
 const USAGE = `vault <command> [options]
 
@@ -22,8 +23,9 @@ const USAGE = `vault <command> [options]
 Notes embed on a local Ollama unless VAULT_EMBED_* names another
 OpenAI-compatible provider: run \`ollama pull all-minilm\` once, or pass
 --lexical for a deterministic bag-of-tokens embedder that needs nothing
-running — no network, and no semantics either. Switching between them
-re-embeds the vault, since they are different vector spaces.
+running — no network, and no semantics either. They are different vector
+spaces: switching costs a full re-embed, which reindex, doctor and watch do
+on their next pass and search refuses to go without.
 
 Exit code 0 on success, 1 on error — and 1 from doctor when it found links
 only a human can fix: broken (nothing to point at) or ambiguous (a bare
@@ -34,9 +36,10 @@ export async function main(argv: string[]): Promise<number> {
     return await run(argv);
   } catch (e) {
     // A stack trace is not an error message. Anything thrown from here down
-    // (a bad flag, an index built by another embedder) reaches the user as
-    // the sentence it was written as.
-    console.error(e instanceof Error ? e.message : String(e));
+    // (a bad flag, an index built by another embedder, a provider's response
+    // body quoted back) reaches the user as the sentence it was written as —
+    // and only as that, never as escape codes the terminal would act on.
+    console.error(printable(e));
     return 1;
   }
 }
@@ -98,7 +101,7 @@ async function run(argv: string[]): Promise<number> {
   }
   const [command, ...rest] = words;
   if (!COMMANDS.includes(command as (typeof COMMANDS)[number])) {
-    console.error(command === undefined ? USAGE : `unknown command ${command}\n\n${USAGE}`);
+    console.error(command === undefined ? USAGE : printable(`unknown command ${command}\n\n${USAGE}`));
     return 1;
   }
   // The CLI embeds in-process against the same embedder the library documents:
@@ -192,14 +195,6 @@ function interrupted(): Promise<void> {
     process.once("SIGTERM", () => done());
   });
 }
-
-/**
- * Every string the CLI echoes is note-controlled — a filename, a title, a link
- * target a human (or an LLM) wrote. A bare `\r` or an ESC sequence in one of
- * them would rewrite the line the terminal has already drawn, so control
- * characters print as `?`; the newlines the CLI itself writes are added after.
- */
-const safe = (line: string): string => line.replace(/\p{Cc}/gu, "?");
 
 function print(r: DoctorReport): void {
   const lines = [

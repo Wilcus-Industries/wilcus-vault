@@ -1,7 +1,7 @@
 import { test, expect, afterAll } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { openDb, dbPath, ensureVectors } from "../src/db";
+import { openDb, dbPath, resetVectors, vectorsStale } from "../src/db";
 import { TokenOverlapEmbedder, l2normalize } from "../src/embed";
 import { makeVault, cleanupVaults } from "./vault-fixture";
 
@@ -42,7 +42,9 @@ test("schema: notes, edges, notes_fts, vector_meta; edges are unique per (from_i
 
 test("vectors table is created lazily with the embedder's dims and cosine distance", () => {
   const db = openDb(dbPath(makeVault({})));
-  expect(ensureVectors(db, new TokenOverlapEmbedder(8))).toBe(false);
+  const e = new TokenOverlapEmbedder(8);
+  expect(vectorsStale(db, e)).toBe(false);
+  resetVectors(db, e, false);
   const sql = (db.query("select sql from sqlite_master where name='vectors'").get() as {
     sql: string;
   }).sql;
@@ -53,16 +55,24 @@ test("vectors table is created lazily with the embedder's dims and cosine distan
 
 test("a model or dims change drops the vec0 table and its meta", () => {
   const db = openDb(dbPath(makeVault({})));
-  ensureVectors(db, new TokenOverlapEmbedder(8));
+  resetVectors(db, new TokenOverlapEmbedder(8), false);
   db.run("insert into vectors (note_id, emb) values (1, ?)", [new Float32Array(8).fill(0.25)]);
   db.run("insert into vector_meta (note_id, model, dims) values (1, 'token-overlap-v1', 8)");
 
   // same embedder: left alone
-  expect(ensureVectors(db, new TokenOverlapEmbedder(8))).toBe(false);
+  const same = new TokenOverlapEmbedder(8);
+  expect(vectorsStale(db, same)).toBe(false);
+  resetVectors(db, same, false);
   expect(db.query("select count(*) as c from vectors").get()).toEqual({ c: 1 });
 
-  // different dims: dropped, recreated at the new width, meta cleared
-  expect(ensureVectors(db, new TokenOverlapEmbedder(16))).toBe(true);
+  // different dims: reported stale — and *only* reported, so a caller that goes
+  // on to fail before it has replacements still has the vectors it started with
+  const wider = new TokenOverlapEmbedder(16);
+  expect(vectorsStale(db, wider)).toBe(true);
+  expect(db.query("select count(*) as c from vectors").get()).toEqual({ c: 1 });
+
+  // acting on it is the separate, destructive step
+  resetVectors(db, wider, true);
   expect(db.query("select count(*) as c from vectors").get()).toEqual({ c: 0 });
   expect(db.query("select count(*) as c from vector_meta").get()).toEqual({ c: 0 });
   expect(

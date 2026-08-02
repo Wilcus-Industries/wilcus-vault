@@ -12,6 +12,9 @@ export const stubEmbedder = (
   embed: Embedder["embed"] = async (texts) => texts.map(() => new Float32Array(dims).fill(1)),
 ): Embedder => ({ model, dims, embed });
 
+/** set while a `withEnv` owns the process environment */
+let held = false;
+
 /**
  * Run `fn` with exactly the `VAULT_EMBED_*` environment it asks for — the rest
  * cleared, so a developer's own key or endpoint cannot decide a test — then put
@@ -19,6 +22,10 @@ export const stubEmbedder = (
  * environment *after* it returns its promise, so the restore waits for it.
  */
 export function withEnv<T>(env: Record<string, string>, fn: () => T): T {
+  // One process-wide environment, so two of these at once would restore each
+  // other's state and leave a test reading someone else's endpoint. Refused
+  // loudly rather than debugged later as flakiness.
+  if (held) throw new Error("withEnv is not re-entrant: await the outer one first");
   const names = ["VAULT_EMBED_API_KEY", "VAULT_EMBED_ENDPOINT", "VAULT_EMBED_MODEL", "VAULT_EMBED_DIMS"];
   const prev = names.map((n) => [n, process.env[n]] as const);
   const restore = () => {
@@ -29,15 +36,20 @@ export function withEnv<T>(env: Record<string, string>, fn: () => T): T {
   };
   for (const n of names) delete process.env[n];
   for (const [n, v] of Object.entries(env)) process.env[n] = v;
+  held = true;
+  const done = () => {
+    held = false;
+    restore();
+  };
   let out: T;
   try {
     out = fn();
   } catch (e) {
-    restore();
+    done();
     throw e;
   }
-  if (out instanceof Promise) return out.finally(restore) as T;
-  restore();
+  if (out instanceof Promise) return out.finally(done) as T;
+  done();
   return out;
 }
 
