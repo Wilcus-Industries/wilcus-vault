@@ -183,7 +183,8 @@ half-indexed note and re-embedded on every pass.
 
 ## Write gate
 
-Every programmatic write goes through `vault.propose(candidate)`:
+Every programmatic write goes through `vault.propose(candidate)` (gaining a
+per-call `VaultContext` in #20 — see § Scopes and context):
 
 1. hybrid-search top-k similar notes, each one re-read from disk so the hash
    captured is the *file's*, not the index's — the index is derived data. The
@@ -255,6 +256,140 @@ note is never one of the outcomes.
 Human edits bypass the gate by definition (files are truth); the watcher +
 `doctor` pick them up.
 
+## Scopes and context
+
+Multiple agents share one vault; the vault needs to know *who* is calling and
+*what they may touch*. Two pieces, deliberately separate: **identity travels
+per call, policy is fixed at `open()`** — one process holds one vault handle on
+behalf of many agents, so baking the agent in at open time freezes exactly the
+values that vary per call (wilcus-core#43 learned this the hard way).
+
+**`VaultContext`** — per-call identity:
+
+```ts
+type VaultContext = { agent: string; source?: string };
+```
+
+`agent` names the caller (`core/scheduler`); `source` optionally records what
+prompted the call — a conversation id, a task id, freeform. It is the second
+parameter of `propose(candidate, ctx)`; the read paths carry it as
+`SearchOptions.ctx` and an optional trailing parameter on `get`/`list` (#21).
+The gate stamps provenance into the frontmatter of every note it writes:
+**`vault_agent`** and **`vault_source`** — namespaced, because `agent:` and
+`source:` are exactly the keys a human's own frontmatter plausibly holds, and
+the textual patcher replaces top-level lines (patching a human's nested
+`source:` block would orphan its children into a parse error). Both are
+single-line values, so `update`'s textual patch applies cleanly; `create` and
+`supersede` serialize them fresh on the note they author. `vault_agent`
+answers "which agent last wrote this note through the gate". Marking the
+*old* note `superseded_by` does not restamp its provenance — the marking is
+bookkeeping, not authorship, and the superseding agent is already on the
+successor. Provenance lives in the file, like every other truth here.
+
+**`ScopePolicy`** — optional in `VaultOptions` (`scopes?`); **absent means
+allow-all**, so existing single-agent callers change nothing. Present, it is
+an allowlist, and it fails closed: an agent with no entry is refused with a
+throw, not a silently empty result — silence is how an orchestrator typo
+makes an agent re-create the memory it thinks it lost — and a call without a
+`VaultContext` throws for the same reason. An empty policy `{}` therefore
+denies everyone: `{}` and `undefined` sit on opposite sides of the
+fail-open/fail-closed line, deliberately.
+
+```ts
+type ScopeRule = { prefix: string; read?: boolean; write?: boolean };
+type ScopePolicy = Record<string, ScopeRule[]>; // agent name → rules
+```
+
+A `prefix` names a namespace subtree and matches on **segment boundaries
+only**: every non-empty prefix is normalized to a trailing `/` at `open()`,
+and `ledger/` matches `ledger/q3.md` but not `ledger-archive/q3.md` — raw
+`startsWith` would grant across sibling namespaces, which is precisely what
+an allowlist exists to stop. `""` is the root rule: it matches every note,
+and a root-level note (no `/` in its path) matches only it. Resolution is
+**per permission, longest prefix wins**: for each of `read` and `write`
+independently, the longest matching prefix whose rule *specifies* that
+permission decides; a rule that leaves one unspecified defers to the
+next-shorter match; nothing specifies ⇒ denied. So
+`[{prefix: "", read: true, write: true}, {prefix: "ledger/", write: false}]`
+reads everywhere and writes everywhere except `ledger/`, which stays
+readable. Two rules with the same normalized prefix specifying the same
+permission contradict each other, and `open()` refuses the policy rather
+than pick a winner; it likewise refuses a subtree writable but not readable —
+a write-blind agent never sees its own notes as `similar`, so every propose
+lands as `create`: a duplicate factory, not a scope.
+
+Enforcement points, all inside the library so no caller re-implements them:
+
+- `search` — the scope filter runs over the **over-fetched** set (alongside
+  the supersede filter, before RRF caps at N), so a scoped agent gets **up
+  to** N readable hits. Up to: the over-fetch is a fixed 3×N, so an agent
+  scoped to a thin slice of the vault can exhaust it and see fewer — accepted,
+  and the over-fetch factor is where the fix goes if it bites. The one-hop
+  `expandLinks` pass is its own enforcement point: neighbour rows pass the
+  same read filter before they are appended, or a scoped agent would read
+  forbidden titles one wikilink away;
+- `get` / `list` — the read check. An unreadable `get` returns null, exactly
+  like an absent note: a scope is not an existence oracle. (`create`'s slug
+  collision suffixing can still betray that *something* holds a stem —
+  accepted: it leaks a stem's existence, never content.)
+- `propose` — the write check, twice. The candidate's target namespace is
+  checked *before* the decider runs (fail fast, no model spend on a doomed
+  write). Only notes the agent may read feed the decider as `similar` — an
+  agent must not have another agent's note bodies quoted back to it by the
+  prompt — and a note readable but not writable is marked read-only in that
+  prompt; a decision that targets one anyway **falls back to `create`**, like
+  a target that failed check-and-write twice: the candidate always lands
+  somewhere, losing it is never an outcome.
+
+Maintenance is unscoped: `doctor`, `reindex`, `watch` and `close` are
+operator operations on the whole vault and take no context — a scoped agent
+is not the one running repairs.
+
+Stated plainly: **scopes are advisory containment at the library API, not
+security.** Any process with filesystem access can read or edit the files
+directly; that is the files-are-truth contract, not a hole in it. The boundary
+that matters for hostile code is the OS, not this policy object.
+
+## Consolidation pass (spec — no implementation yet)
+
+Vaults accrete near-duplicates: the gate only sees top-k similar at write
+time, and humans add notes behind its back. Consolidation is the deliberate,
+occasional merge pass — **manually triggered** (`consolidate()` /
+`vault consolidate`), never a daemon; a background process that rewrites
+notes is exactly the surprise the write gate exists to prevent. It is an
+operator operation like `doctor`: unscoped, and the provenance it stamps is
+the `VaultContext` the operator hands it.
+
+- **Discovery** is embedding distance: pairs of live (non-superseded) notes
+  under a caller-set cosine-distance ceiling. The ceiling is mandatory, like
+  the gate's cutoffs and for the same reason — there is no universal number
+  for "duplicate", it is a property of the embedder. A cluster admits a note
+  only if *every* pair inside it is under the ceiling (complete linkage) —
+  single-linkage chains A~B~C into merging A with a C it does not resemble.
+  All-pairs over the vectors table is O(n²) and accepted: notes embed whole,
+  so n is the note count, thousands at most. Clusters that span namespaces
+  are reported but never merged — namespaces are boundaries, and collapsing
+  across one is a human call.
+- **Merging reuses the gate's rails, not its decider.** The caller injects a
+  merger (an LLM, like the decider) that turns a cluster — bodies re-read
+  from disk, like everything the gate shows a model — into one merged
+  candidate. The pass writes that candidate through the gate's create path
+  (slug confinement, collision suffixing) into the cluster's namespace, then
+  marks *each* member `superseded_by` the new note with the gate's existing
+  supersede-marking rail — textual patch, check-and-write per member,
+  `unmarked` reported for any member a human edited mid-flight. One cluster,
+  one new note, N marked members; no decider run, because the merger already
+  decided, and `propose`'s own search could neither see the cluster nor
+  supersede more than one note. Nothing is ever deleted: originals stay on
+  disk, marked, out of search.
+- **Dry-run is the default.** A run reports clusters and each would-be merge;
+  writing takes an explicit flag. A wrong ceiling discovered in a report
+  costs nothing; discovered in the files, it costs an afternoon.
+- **Per-run action cap**, counted in clusters merged (default single digits):
+  on hitting it the run stops and reports the remainder. A pass that wants to
+  rewrite half the vault is evidence the ceiling is wrong, and the cap turns
+  that evidence into a short report instead of a long mess.
+
 ## Doctor / watcher
 
 `vault doctor` — report + repair: rebuild stale index rows (hash mismatch), remove
@@ -324,3 +459,10 @@ one end-to-end pass that edits, creates and deletes real files under a real
 4. Write gate: decider contract, apply paths incl. check-and-write + path
    confinement, supersede chain, discard log.
 5. Watcher, embedding-model/dims-swap re-embed, CLI polish, README.
+
+Post-MVP (#18): 6. this design — scopes + consolidation spec (#19);
+7. provenance + `propose(candidate, ctx)` + discard log to
+`<root>/.discarded.log` (#20) — the log is durable history and must survive a
+`.vault/` nuke or `--rebuild`; it carries full candidate bodies, so an
+operator who commits their vault may want it in `.gitignore`; 8. `get`/`list`
+(#21); 9. CLI real embedder (#22); 10. scope enforcement (#23).
