@@ -139,7 +139,11 @@ in the ecosystem, this one):
   `.md`; `ledger/q3` names nothing — and returns the parsed note or null. It
   reads the **file**, never the index row, so a stale, missing or half-written
   row cannot change the answer; that is what makes it safe for another package
-  to delete its own parser. Only a regular file is a note, so a directory or a
+  to delete its own parser. The argument is canonicalized first, into the same
+  form the scan stores (`relative` + forward slashes): `./ledger/q3.md`,
+  `ledger//q3.md`, a Windows-joined `ledger\q3.md` and an absolute path inside
+  the vault are all the one note, and the `path` handed back is the identity a
+  caller may store — it cannot vary with how the caller spelled it. Only a regular file is a note, so a directory or a
   symlink at the path is null exactly like an absent one. The path's *parent* is
   put through the same `confinedPath` rail the write gate uses, so an escape, a
   dot-directory or a symlinked directory on the way down **throws** — a caller

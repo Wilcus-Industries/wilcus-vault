@@ -3,15 +3,25 @@
 // row never changes what `get` hands back — and only a regular `.md` file under
 // the root is a note at all.
 import { test, expect, afterAll } from "bun:test";
-import { mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { TokenOverlapEmbedder } from "../src/embed";
-import { open, type Vault } from "../src/vault";
+import { open, type Cutoffs, type Vault } from "../src/vault";
 import { makeVault, cleanupVaults, writeNote } from "./vault-fixture";
 
-afterAll(cleanupVaults);
+const opened: Vault[] = [];
+// Handles first, fixture directories second: removing a vault out from under a
+// live sqlite handle is how the other suites stay clean, and this one holds one
+// per test.
+afterAll(() => {
+  for (const v of opened.splice(0)) v.close();
+  cleanupVaults();
+});
 
 const embedder = new TokenOverlapEmbedder();
+const CUTOFFS: Cutoffs = { distanceCeiling: 0.9, bm25Ceiling: 0 };
+/** Only the symlinked-root test writes; every vault gets a gate anyway. */
+const GATE = { decider: async () => ({ action: "create" }) as const, cutoffs: CUTOFFS };
 
 const VAULT = {
   "ledger/q3.md": "---\ntitle: Q3\n---\n\nThe Q3 ledger.\n",
@@ -21,8 +31,14 @@ const VAULT = {
   "root-note.md": "# Root note\n\nAt the vault root.\n",
 };
 
+function openAt(root: string): Vault {
+  const v = open(root, { embedder, gate: GATE });
+  opened.push(v);
+  return v;
+}
+
 async function openVault(files: Record<string, string> = VAULT): Promise<Vault> {
-  const v = open(makeVault(files), { embedder });
+  const v = openAt(makeVault(files));
   await v.reindex();
   return v;
 }
@@ -60,6 +76,48 @@ test("get: absent, a directory, a symlink and a non-.md path are all null", asyn
   expect(await v.get("ledger/leak.md")).toBeNull();
 });
 
+test("get normalizes the path it is handed to the note's own identity", async () => {
+  const v = await openVault();
+  // Every one of these names `ledger/q3.md` — and `path` is the identity a
+  // caller stores, so it has to come back canonical whichever form went in.
+  for (const rel of [
+    "ledger/q3.md",
+    "./ledger/q3.md",
+    "ledger//q3.md",
+    "ledger/../ledger/q3.md",
+    join(v.root, "ledger", "q3.md"), // an absolute path inside the vault
+    "ledger\\q3.md", // what a Windows caller joins
+  ]) {
+    expect((await v.get(rel))?.path).toBe("ledger/q3.md");
+  }
+
+  // A NUL is not a byte any filename holds: "no note there", not the raw
+  // TypeError `lstat` throws at whoever called us.
+  expect(await v.get("ledger/q3.md\0")).toBeNull();
+  expect(await v.get("led\0ger/q3.md")).toBeNull();
+
+  // Normalizing is not a way out of the vault.
+  await expect(v.get("./../../etc/passwd")).rejects.toThrow(/outside the vault/);
+  await expect(v.get("ledger/../../etc/passwd")).rejects.toThrow(/outside the vault/);
+});
+
+test("a vault opened through a symlinked root still reads and writes", async () => {
+  const real = makeVault(VAULT);
+  const link = join(makeVault({}), "vault-link");
+  symlinkSync(real, link);
+
+  const v = openAt(link);
+  await v.reindex();
+  // A root-level note has nothing above it but the root, so this is the one
+  // read that would lstat the root itself — and the root is the symlink.
+  expect((await v.get("root-note.md"))?.title).toBe("Root note");
+  expect(v.list()).toContain("root-note.md");
+
+  const r = await v.propose({ title: "Through the link", namespace: "ledger", body: "Written.\n" });
+  expect(r).toMatchObject({ action: "create", path: "ledger/through-the-link.md" });
+  expect(existsSync(join(real, r.path!))).toBe(true);
+});
+
 test("get: outside the root, through a dot-directory or a symlinked one is refused", async () => {
   const v = await openVault();
   await expect(v.get("../../etc/passwd")).rejects.toThrow(/outside the vault/);
@@ -90,6 +148,10 @@ test("list: a prefix matches on segment boundaries, slash or no slash", async ()
   expect(v.list("ledger")).toEqual(ledger);
   expect(v.list("ledger/")).toEqual(ledger);
   expect(v.list("ledger-archive")).toEqual(["ledger-archive/q3.md"]);
+  // A leading or lone slash is the root namespace, not a path: "/" is the whole
+  // vault, and no note path starts with one.
+  expect(v.list("/")).toEqual(v.list());
+  expect(v.list("/ledger")).toEqual(ledger);
   // A prefix is a namespace, not a string match: neither half a segment nor a
   // namespace that does not exist brings anything back.
   expect(v.list("ledg")).toEqual([]);

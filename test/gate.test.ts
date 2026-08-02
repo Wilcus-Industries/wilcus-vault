@@ -5,7 +5,7 @@ import { test, expect, afterAll, spyOn } from "bun:test";
 import { existsSync, readdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { TokenOverlapEmbedder } from "../src/embed";
-import { parseDecision, slugify, type Decider, type DeciderInput } from "../src/gate";
+import { confinedPath, parseDecision, slugify, type Decider, type DeciderInput } from "../src/gate";
 import { gatePrompt } from "../src/gate";
 import { parseNote } from "../src/note";
 import { open, type Cutoffs, type Vault, type VaultContext } from "../src/vault";
@@ -491,6 +491,18 @@ test("path confinement: a traversing namespace or symlinked dir is refused", asy
   symlinkSync(join(v.root, "notes"), join(v.root, "linked"));
   await expect(v.propose({ ...CANDIDATE, namespace: "linked" })).rejects.toThrow(/symlink/);
   v.close();
+});
+
+test("path confinement: the vault root is not walked, so a symlinked root opens", () => {
+  const link = join(makeVault({}), "vault-link");
+  symlinkSync(makeVault({}), link);
+  // The path *is* the root: there is no segment between it and itself to
+  // check, and lstat-ing the root would refuse every vault whose own path is a
+  // symlink — which the scan is perfectly happy to walk.
+  expect(confinedPath(link, ".")).toBe(resolve(link));
+  expect(confinedPath(link, "")).toBe(resolve(link));
+  // Below the root the rule is unchanged.
+  expect(() => confinedPath(link, "../elsewhere.md")).toThrow(/outside the vault/);
 });
 
 test("path confinement: the decider cannot name a path the search did not return", async () => {

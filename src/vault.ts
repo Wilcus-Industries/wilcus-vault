@@ -2,7 +2,7 @@
 // it are the implementation. Embedder and decider are injected — the vault
 // never hardcodes a provider.
 import type { Database } from "bun:sqlite";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import { openDb, dbPath } from "./db";
 import {
   isNotePath,
@@ -39,8 +39,11 @@ export type Vault = {
   /**
    * One note by its identity — the vault-relative path, `.md` and all
    * (`ledger/q3.md`). Read from the **file**, so a stale or missing index row
-   * cannot change the answer. Null when nothing is there; throws when the path
-   * escapes the vault, or runs through a dot-directory or a symlinked one.
+   * cannot change the answer. The path is canonicalized first (`./x.md`,
+   * `a//x.md` and an absolute path inside the vault all name one note), so the
+   * returned `path` is that identity however the caller spelled it. Null when
+   * nothing is there; throws when the path escapes the vault, or runs through a
+   * dot-directory or a symlinked one.
    */
   get(path: string): Promise<Note | null>;
   /**
@@ -79,12 +82,21 @@ export function open(root: string, { embedder, gate }: VaultOptions): Vault {
     // that is merely absent, or holds a directory or a symlink, is null. Async
     // so both answers reach the caller the same way.
     async get(rel) {
+      // Canonicalized once, into exactly the form the scan stores: `./x.md`,
+      // `a//x.md`, `a/../a/x.md`, an absolute path inside the vault and a
+      // Windows-joined `a\x.md` all name one note, and `path` is the identity a
+      // caller keeps — it must not vary with how the caller spelled it. An
+      // escape becomes a leading `../`, which `confinedPath` refuses below.
+      const norm = relative(dir, resolve(dir, rel)).replaceAll("\\", "/");
+      // No filename holds a NUL, so there is no note here — and saying so is
+      // better than the raw TypeError `lstat` would throw at the caller.
+      if (norm.includes("\0")) return null;
       // The *parent* is confined, not the leaf: `noteEntry` already refuses a
       // symlink where the note should be (it is not a note, like a directory),
       // while a symlinked or hidden directory on the way down, and any escape,
       // still throw — a path cannot escape through its last segment alone.
-      confinedPath(dir, dirname(rel));
-      return isNotePath(rel) && noteEntry(dir, rel) ? readNote(dir, rel) : null;
+      confinedPath(dir, dirname(norm));
+      return isNotePath(norm) && noteEntry(dir, norm) ? readNote(dir, norm) : null;
     },
     // Derived data is fine here: these are paths, and every one of them is
     // rebuildable from the files. A prefix names a namespace and matches on
@@ -94,7 +106,10 @@ export function open(root: string, { embedder, gate }: VaultOptions): Vault {
     // ponytail: filters in JS rather than in SQL, where `like`'s wildcards
     // would need escaping. Push it into the query if a vault ever gets big.
     list(prefix) {
-      const under = prefix ? `${prefix.replace(/\/+$/, "")}/` : "";
+      // Slashes at either end are decoration: `/`, `` and `ledger/` say root,
+      // root and `ledger/`. Stored paths carry neither.
+      const ns = prefix?.replace(/^\/+|\/+$/g, "") ?? "";
+      const under = ns === "" ? "" : `${ns}/`;
       return (db.query(`select path from notes order by path`).all() as { path: string }[])
         .map((r) => r.path)
         .filter((path) => path.startsWith(under));

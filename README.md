@@ -136,6 +136,10 @@ when nothing is there, and a directory or a symlink at the path counts as
 nothing. A path that leaves the vault, or runs through `.vault/` or a symlinked
 directory, throws — that is a caller bug, not a missing note.
 
+Spell the path however your code built it — `./customers/acme.md`, a doubled
+slash, an absolute path inside the vault — and `note.path` still comes back as
+the one canonical identity, which is what makes it safe to store.
+
 `list` answers the cheap question from the index: which notes exist. Paths only,
 sorted, optionally under one namespace — and a namespace means whole segments,
 so `list("ledger")` never sweeps in `ledger-archive/`. Superseded notes are
