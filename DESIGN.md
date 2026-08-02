@@ -255,6 +255,93 @@ note is never one of the outcomes.
 Human edits bypass the gate by definition (files are truth); the watcher +
 `doctor` pick them up.
 
+## Scopes and context
+
+Multiple agents share one vault; the vault needs to know *who* is calling and
+*what they may touch*. Two pieces, deliberately separate: **identity travels
+per call, policy is fixed at `open()`** — one process holds one vault handle on
+behalf of many agents, so baking the agent in at open time freezes exactly the
+values that vary per call (wilcus-core#43 learned this the hard way).
+
+**`VaultContext`** — per-call identity:
+
+```ts
+type VaultContext = { agent: string; source?: string };
+```
+
+`agent` names the caller (`core/scheduler`); `source` optionally records what
+prompted the call — a conversation id, a task id, freeform. It is the second
+parameter of `propose(candidate, ctx)` and accompanies the read paths when a
+policy is in force. The gate stamps `agent` and `source` into the frontmatter
+of every note it writes (`create` and `supersede` serialize them fresh;
+`update` patches them textually, per the no-re-serialization rule) — provenance
+is the answer to "which agent wrote it", and it lives in the file, like every
+other truth here.
+
+**`ScopePolicy`** — optional at `open()`; absent means allow-all, so existing
+single-agent callers change nothing:
+
+```ts
+type ScopeRule = { prefix: string; read?: boolean; write?: boolean };
+type ScopePolicy = Record<string, ScopeRule[]>; // agent name → rules
+```
+
+A rule speaks about the namespace subtree at `prefix` (`""` is the whole
+vault). Resolution is **per permission, longest prefix wins**: for each of
+`read` and `write` independently, the longest matching prefix whose rule
+*specifies* that permission decides; a rule that leaves one unspecified defers
+to the next-shorter match. Nothing specifies ⇒ denied — a policy is an
+allowlist, and an agent with no entry can touch nothing. So
+`[{prefix: "", read: true, write: true}, {prefix: "ledger/", write: false}]`
+reads everywhere and writes everywhere except `ledger/`, which stays readable.
+
+Enforcement points, all inside the library so no caller re-implements them:
+
+- `search` — the scope filter runs over the **over-fetched** set (alongside the
+  supersede filter, before RRF caps at N), so a scoped agent gets N readable
+  hits, not N hits minus the confiscated ones;
+- `get` / `list` — the read check. An unreadable `get` returns null, exactly
+  like an absent note: a scope is not an existence oracle;
+- `propose` — the write check, twice. The candidate's target namespace is
+  checked *before* the decider runs (fail fast, no model spend on a doomed
+  write), and only notes the agent may read feed the decider as `similar` — an
+  agent must not have another agent's note bodies quoted back to it by the
+  prompt. A decider `target` outside the writable set is refused like any
+  other out-of-set target.
+
+When a policy is in force, calls without a `VaultContext` throw — silence is
+how an orchestrator bug reads another agent's notes. Stated plainly:
+**scopes are advisory containment at the library API, not security.** Any
+process with filesystem access can read or edit the files directly; that is
+the files-are-truth contract, not a hole in it. The boundary that matters for
+hostile code is the OS, not this policy object.
+
+## Consolidation pass (spec — no implementation yet)
+
+Vaults accrete near-duplicates: the gate only sees top-k similar at write
+time, and humans add notes behind its back. Consolidation is the deliberate,
+occasional merge pass — and it is **manually triggered** (`consolidate()` /
+`vault consolidate`), never a daemon; a background process that rewrites
+notes is exactly the surprise the write gate exists to prevent.
+
+- **Discovery** is embedding distance: pairs of live (non-superseded) notes
+  under a caller-set cosine-distance ceiling, clustered transitively. The
+  ceiling is mandatory, like the gate's cutoffs and for the same reason —
+  there is no universal number for "duplicate", it is a property of the
+  embedder.
+- **Every mutation goes through the existing write gate.** A merge is a
+  candidate (the merged text, produced by the caller's injected merger —
+  an LLM, like the decider) proposed via the normal `propose` path, expected
+  to land as `supersede`. Consolidation adds **no new write primitive**:
+  supersede, never delete — originals stay on disk, marked, out of search.
+  Check-and-write, confinement, and the discard log all apply for free.
+- **Dry-run is the default.** A run reports clusters and intended actions;
+  writing requires the explicit flag. A wrong distance ceiling discovered in a
+  report costs nothing; discovered in the files, it costs an afternoon.
+- **Per-run action cap** (default single digits): a pass that wants to rewrite
+  half the vault is evidence the ceiling is wrong, and the cap turns that
+  evidence into a short report instead of a long mess.
+
 ## Doctor / watcher
 
 `vault doctor` — report + repair: rebuild stale index rows (hash mismatch), remove
@@ -324,3 +411,8 @@ one end-to-end pass that edits, creates and deletes real files under a real
 4. Write gate: decider contract, apply paths incl. check-and-write + path
    confinement, supersede chain, discard log.
 5. Watcher, embedding-model/dims-swap re-embed, CLI polish, README.
+
+Post-MVP (#18): 6. this design — scopes + consolidation spec (#19);
+7. provenance + `propose(candidate, ctx)` + discard log to `<root>/.discarded.log`
+(#20); 8. `get`/`list` (#21); 9. CLI real embedder (#22); 10. scope
+enforcement (#23).
