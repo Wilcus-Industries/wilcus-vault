@@ -100,6 +100,11 @@ See [[acme]] and [[globex|Globex Inc]] and [[acme]] again.
   expect(n.links).toEqual(["acme", "globex", "in-a-fence", "spaced", "a"]);
 });
 
+test("wikilinks keep a path-qualified target whole", () => {
+  const n = parseNote("[[customers/acme]] [[vendors/acme|the vendor]] [[acme]]\n", "x/q.md");
+  expect(n.links).toEqual(["customers/acme", "vendors/acme", "acme"]);
+});
+
 test("links come from the body only", () => {
   const n = parseNote("---\nsuperseded_by: old/[[trap]]\n---\n[[real]]\n", "x/fm.md");
   expect(n.links).toEqual(["real"]);

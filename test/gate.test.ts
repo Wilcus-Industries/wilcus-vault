@@ -120,7 +120,9 @@ test("supersede writes the new note, marks the old one, and drops it from search
   expect(old).toContain(`superseded_by: "notes/acme-renewal-2026.md"`);
   expect(old).toContain("id: 01234 # legacy account number, must survive a gate write");
   expect(old).toContain("The Acme renewal closes in March. See [[support-rota]].");
-  expect(old).toContain("[[acme-renewal-2026]]"); // forward link to the successor
+  // the forward link is path-qualified: the gate knows the exact path, so the
+  // link cannot go ambiguous later behind a note that shares the stem
+  expect(old).toContain("[[notes/acme-renewal-2026]]");
   expect(read(v.root, "notes/acme-renewal-2026.md")).toContain("March 2026");
 
   // the supersede chain is excluded from the default search
@@ -129,6 +131,13 @@ test("supersede writes the new note, marks the old one, and drops it from search
   expect(hits).not.toContain("notes/acme-renewal.md");
   // and the forward wikilink resolves — no broken edge left behind
   expect((await v.doctor()).brokenLinks).toEqual([]);
+
+  // ...including once another namespace holds a note of the same stem, which
+  // is exactly what a bare `[[acme-renewal-2026]]` would not survive
+  writeNote(v.root, "archive/acme-renewal-2026.md", "# Archived copy\n");
+  const after = await v.doctor();
+  expect(after.brokenLinks).toEqual([]);
+  expect(after.ambiguousLinks).toEqual([]);
   v.close();
 });
 

@@ -343,7 +343,7 @@ async function apply(
     return { action: "supersede", path: created.path, unmarked: rel };
   }
   const marked = patchFrontmatter(current, "superseded_by", created.path!);
-  const link = `Superseded by [[${slugOf(created.path!)}]].\n`;
+  const link = `Superseded by [[${linkTo(created.path!)}]].\n`;
   await writeAtomic(abs, marked.endsWith("\n") ? `${marked}\n${link}` : `${marked}\n\n${link}`);
   return { action: "supersede", path: created.path, superseded: rel };
 }
@@ -386,9 +386,12 @@ async function create(
 
 /**
  * `<namespace>/<slug>.md`, confined to the vault and not already taken —
- * neither by a file nor by another note's stem, since wikilink slugs have to
- * be vault-wide unique. A collision suffixes rather than overwrites: the gate
- * does not get to lose someone else's note to a shared title.
+ * neither by a file nor by another note's stem. A collision suffixes rather
+ * than overwrites: the gate does not get to lose someone else's note to a
+ * shared title. Stems no longer *have* to be unique (`customers/acme` and
+ * `vendors/acme` are two legitimate notes), but the gate still keeps its own
+ * unique, because creating a second `acme` is what turns every human's
+ * `[[acme]]` ambiguous.
  */
 function freePath(db: Database, root: string, candidate: Candidate): { rel: string; abs: string } {
   // A title of nothing but CJK, Cyrillic or emoji slugifies to nothing — name
@@ -423,7 +426,11 @@ function logCandidate(root: string, candidate: Candidate, extra: Record<string, 
   appendFileSync(join(dir, "discarded.log"), `${JSON.stringify({ at: now(), candidate, ...extra })}\n`);
 }
 
-/** Wikilink target of a vault-relative path: the filename stem. */
-const slugOf = (rel: string): string => rel.slice(rel.lastIndexOf("/") + 1, -".md".length);
+/**
+ * Wikilink target of a vault-relative path: the whole path minus `.md`. The
+ * gate knows the exact path, so it writes the path-qualified form — a bare
+ * stem would go ambiguous the day a second namespace holds that stem.
+ */
+const linkTo = (rel: string): string => rel.slice(0, -".md".length);
 
 const now = (): string => new Date().toISOString();

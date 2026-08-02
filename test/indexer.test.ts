@@ -128,7 +128,7 @@ test("edits update in place; deleted files purge every table", async () => {
   db.close();
 });
 
-test("slug resolution: zero or ambiguous stem matches leave to_id null", async () => {
+test("bare-stem resolution: zero or several stem matches leave to_id null", async () => {
   const root = makeVault({
     "a.md": "# A\n\n[[dup]] and [[nowhere]]\n",
     "one/dup.md": "# Dup one\n",
@@ -149,6 +149,59 @@ test("slug resolution: zero or ambiguous stem matches leave to_id null", async (
   ).get();
   expect(resolved).toEqual({ path: "one/dup.md" });
   expect(db.query("select to_id from edges where to_slug='nowhere'").get()).toEqual({ to_id: null });
+  db.close();
+});
+
+test("path-qualified links resolve by exact path, past a duplicated stem", async () => {
+  const root = makeVault({
+    "hub.md":
+      "# Hub\n\n[[customers/acme]], [[vendors/acme]], [[acme]], [[customers/ghost]], [[../outside/secret]]\n",
+    "customers/acme.md": "# Acme the customer\n",
+    "vendors/acme.md": "# Acme the vendor\n",
+  });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  const idOf = (path: string) =>
+    (db.query("select id from notes where path = ?").get(path) as { id: number }).id;
+  const hub = idOf("hub.md");
+
+  expect(
+    db.query("select to_slug, to_id from edges where from_id = ? order by to_slug").all(hub),
+  ).toEqual([
+    // never path-joined to the filesystem: resolution is SQL against known
+    // note paths, so a traversing target simply matches nothing
+    { to_slug: "../outside/secret", to_id: null },
+    { to_slug: "acme", to_id: null }, // bare stem, two candidates ⇒ unresolved
+    { to_slug: "customers/acme", to_id: idOf("customers/acme.md") },
+    { to_slug: "customers/ghost", to_id: null }, // qualified, but no such note
+    { to_slug: "vendors/acme", to_id: idOf("vendors/acme.md") },
+  ]);
+
+  // the bare stem resolves again once only one note carries it, and the
+  // qualified links are untouched by that
+  rmSync(join(root, "vendors", "acme.md"));
+  await reindex(db, root, embedder);
+  expect(
+    db.query("select to_id from edges where from_id = ? and to_slug = 'acme'").get(hub),
+  ).toEqual({ to_id: idOf("customers/acme.md") });
+  expect(
+    db.query("select to_id from edges where from_id = ? and to_slug = 'vendors/acme'").get(hub),
+  ).toEqual({ to_id: null });
+  db.close();
+});
+
+test("a path-qualified link is a path, not a stem: no extension, no near-miss", async () => {
+  const root = makeVault({
+    "hub.md": "# Hub\n\n[[customers/acme.md]] [[/customers/acme]] [[./customers/acme]] [[acme]]\n",
+    "customers/acme.md": "# Acme\n",
+  });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  // only the bare stem resolves here: the qualified forms are matched against
+  // `notes.path` minus its `.md`, exactly, with no normalization
+  expect(
+    db.query("select to_slug from edges where to_id is not null").all(),
+  ).toEqual([{ to_slug: "acme" }]);
   db.close();
 });
 

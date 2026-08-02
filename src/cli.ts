@@ -19,7 +19,8 @@ const USAGE = `vault <command> [options]
   --                  end of flags, so a search query may start with a dash
 
 Exit code 0 on success, 1 on error — and 1 from doctor when it found links
-only a human can fix (broken, ambiguous, or a duplicate filename stem).`;
+only a human can fix: broken (nothing to point at) or ambiguous (a bare
+[[stem]] several notes answer to — qualify it as [[folder/stem]]).`;
 
 export async function main(argv: string[]): Promise<number> {
   try {
@@ -160,8 +161,7 @@ async function run(argv: string[]): Promise<number> {
   print(report);
   // Drift is repaired; links a human has to fix are not, so say so in the
   // exit code. (Orphans and malformed frontmatter are notes, not damage.)
-  const unrepaired =
-    report.brokenLinks.length + report.ambiguousLinks.length + report.duplicateStems.length;
+  const unrepaired = report.brokenLinks.length + report.ambiguousLinks.length;
   return unrepaired === 0 ? 0 : 1;
 }
 
@@ -182,8 +182,10 @@ function print(r: DoctorReport): void {
     `reindexed ${r.stale.length} stale, purged ${r.missing.length} deleted` +
       (r.reembedded ? ", re-embedded all notes (model or dims changed)" : ""),
     ...r.brokenLinks.map((l) => `broken link:    ${l.from} -> [[${l.slug}]]`),
-    ...r.ambiguousLinks.map((l) => `ambiguous link: ${l.from} -> [[${l.slug}]]`),
-    ...r.duplicateStems.map((d) => `duplicate stem: ${d.slug} (${d.paths.join(", ")})`),
+    // the candidates are the fix: qualify the link with one of these paths
+    ...r.ambiguousLinks.map(
+      (l) => `ambiguous link: ${l.from} -> [[${l.slug}]] (${l.candidates.join(", ")})`,
+    ),
     ...r.malformed.map((p) => `malformed frontmatter: ${p}`),
     ...r.orphans.map((p) => `orphan: ${p}`),
   ];

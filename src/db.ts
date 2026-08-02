@@ -35,8 +35,11 @@ function migrate(db: Database): void {
     malformed integer not null default 0
   )`);
   db.run(`create index if not exists notes_slug on notes(slug)`);
-  // to_id null ⇒ the link is broken or ambiguous; backlinks and orphans are
-  // then trivial SQL. Reindexing a note deletes its edges by from_id.
+  // `to_slug` is the link target as written — a bare filename stem or a
+  // vault-relative path without `.md` (see `resolveEdges`); the column keeps
+  // its name so an index built by an older version still opens. to_id null ⇒
+  // the link is broken or ambiguous; backlinks and orphans are then trivial
+  // SQL. Reindexing a note deletes its edges by from_id.
   db.run(`create table if not exists edges (
     from_id integer not null,
     to_slug text not null,

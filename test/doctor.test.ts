@@ -36,14 +36,31 @@ function snapshot(root: string): { notes: unknown[]; edges: unknown[] } {
   return { notes, edges };
 }
 
-test("doctor reports broken links, ambiguous links, orphans and duplicate stems", async () => {
+test("doctor separates broken links from ambiguous ones and names the candidates", async () => {
   const root = makeVault(GRAPH);
   const report = await doctor(root, embedder);
+  // 0 candidates is a typo or a deleted note; 2+ is a link that needs
+  // qualifying, and the report says what to qualify it with
   expect(report.brokenLinks).toEqual([{ from: "notes/acme.md", slug: "ghost" }]);
-  expect(report.ambiguousLinks).toEqual([{ from: "notes/acme.md", slug: "dup" }]);
+  expect(report.ambiguousLinks).toEqual([
+    { from: "notes/acme.md", slug: "dup", candidates: ["one/dup.md", "two/dup.md"] },
+  ]);
   expect(report.orphans).toEqual(["notes/lonely.md", "one/dup.md", "two/dup.md"]);
-  expect(report.duplicateStems).toEqual([{ slug: "dup", paths: ["one/dup.md", "two/dup.md"] }]);
   expect(report.malformed).toEqual([]);
+});
+
+test("a qualified link is broken, never ambiguous, and duplicate stems alone are fine", async () => {
+  const root = makeVault({
+    // namespaced notes may share a stem — that is what namespaces are for. Only
+    // a *bare* link to them is a problem, and qualifying it is the fix.
+    "notes/acme.md": "# Acme\n\n[[one/dup]] and [[two/dup]]\n",
+    "notes/gone.md": "# Gone\n\n[[one/ghost]]\n",
+    "one/dup.md": "# Dup one\n",
+    "two/dup.md": "# Dup two\n",
+  });
+  const report = await doctor(root, embedder);
+  expect(report.ambiguousLinks).toEqual([]);
+  expect(report.brokenLinks).toEqual([{ from: "notes/gone.md", slug: "one/ghost" }]);
 });
 
 test("doctor reports stale rows and missing files, then repairs them", async () => {
