@@ -242,8 +242,12 @@ export function gatePrompt({ candidate, similar }: DeciderInput): string {
               `--- begin note ---\n${fence(s.note.body)}\n--- end note ---`,
           )
           .join("\n\n");
-  // Said only when it applies: a scope-free vault should not have the model
-  // reading a rule about markings it will never see.
+  // A hint to the model, never the enforcement: a path or title is unfenced
+  // text, so a note could write ` (read-only)` into its own title, and nothing
+  // stops a decider from targeting a marked note anyway. The rail is the write
+  // check `propose` makes on `decision.target` — which is why neither is
+  // exploitable. Said only when it applies: a scope-free vault should not have
+  // the model reading a rule about markings it will never see.
   const readOnly = similar.some((s) => s.readOnly)
     ? "\nA note marked read-only is outside the calling agent's write scope: do not name it as a target — choose create instead.\n"
     : "";
@@ -318,10 +322,17 @@ export async function propose(
   // Both refusals a doomed write can earn, before the decider: no model spend
   // on a namespace the gate would not write into anyway. Confinement first, so
   // a namespace that is not a path at all is named as that rather than as a
-  // scope decision. Scope rules end at a segment boundary, so the namespace
-  // decides the answer for every filename the gate could pick inside it.
-  confinedPath(base, candidate.namespace ?? "");
-  const namespace = normalizePrefix(candidate.namespace);
+  // scope decision.
+  //
+  // Canonicalized *through* that rail and used from here on, because checking
+  // one spelling and writing another is a scope bypass: `notes/../ledger` is
+  // inside the vault and starts with `notes/`, so a raw check passes — and the
+  // file lands in `ledger/`. Scope rules end at a segment boundary, so the
+  // namespace alone decides the answer for every filename the gate could pick
+  // inside it.
+  const namespace = normalizePrefix(
+    relative(base, confinedPath(base, candidate.namespace ?? "")).replaceAll("\\", "/"),
+  );
   if (!scope.may("write", namespace)) {
     throw new Error(
       `write gate: ${JSON.stringify(safe(ctx?.agent ?? ""))} may not write to ` +
@@ -346,10 +357,10 @@ export async function propose(
     // like one that failed check-and-write twice — and re-asking the decider
     // would only spend another model call on the same forbidden note.
     if (decision.target !== undefined && !scope.may("write", decision.target)) break;
-    applied = await apply(db, base, candidate, decision, similar, ctx);
+    applied = await apply(db, base, candidate, namespace, decision, similar, ctx);
   }
   if (applied === null) {
-    applied = await create(db, base, candidate, undefined, ctx);
+    applied = await create(db, base, candidate, namespace, undefined, ctx);
     fellBack = true;
   }
   // The index never lags a write we made ourselves.
@@ -386,6 +397,11 @@ async function findSimilar(
   );
   const similar: SimilarNote[] = [];
   for (const hit of hits) {
+    // The search already filtered these in SQL. Checked again here because this
+    // is where note *bodies* leave the vault and enter a prompt: the highest
+    // consequence of a filter that ever goes wrong, and the cheapest place to
+    // not depend on one.
+    if (!scope.may("read", hit.path)) continue;
     confinedPath(root, hit.path); // the index is derived data, not a trusted path source
     const raw = await readRaw(root, hit.path);
     if (raw === null) continue; // indexed but gone: files are truth, the row is stale
@@ -400,11 +416,16 @@ async function findSimilar(
   return similar;
 }
 
-/** Apply one decision, or return null if the target changed under us. */
+/**
+ * Apply one decision, or return null if the target changed under us.
+ * `namespace` is the canonical, already-write-checked one from `propose` — the
+ * candidate's own string is never joined into a path again.
+ */
 async function apply(
   db: Database,
   root: string,
   candidate: Candidate,
+  namespace: string,
   decision: Decision,
   similar: SimilarNote[],
   ctx?: VaultContext,
@@ -413,7 +434,9 @@ async function apply(
     logCandidate(root, candidate, { decision });
     return { action: "discard" };
   }
-  if (decision.action === "create") return await create(db, root, candidate, decision.body, ctx);
+  if (decision.action === "create") {
+    return await create(db, root, candidate, namespace, decision.body, ctx);
+  }
 
   const hit = similar.find((s) => s.note.path === decision.target)!; // checked in propose
   const rel = hit.note.path;
@@ -439,7 +462,7 @@ async function apply(
 
   // supersede: the successor is written first, then the old note is marked and
   // linked forward to it.
-  const created = await create(db, root, candidate, decision.body, ctx);
+  const created = await create(db, root, candidate, namespace, decision.body, ctx);
   // Writing the successor took time, and the old note belongs to a human. If it
   // moved in that window the successor stands and the caller is told the old
   // note is unmarked — the alternative is overwriting an edit for bookkeeping.
@@ -498,10 +521,11 @@ async function create(
   db: Database,
   root: string,
   candidate: Candidate,
+  namespace: string,
   body?: string,
   ctx?: VaultContext,
 ): Promise<Applied> {
-  const { rel, abs } = freePath(db, root, candidate);
+  const { rel, abs } = freePath(db, root, candidate, namespace);
   const at = now();
   const text = serializeNote({
     frontmatter: {
@@ -527,7 +551,12 @@ async function create(
  * unique, because creating a second `acme` is what turns every human's
  * `[[acme]]` ambiguous.
  */
-function freePath(db: Database, root: string, candidate: Candidate): { rel: string; abs: string } {
+function freePath(
+  db: Database,
+  root: string,
+  candidate: Candidate,
+  namespace: string,
+): { rel: string; abs: string } {
   // A title of nothing but CJK, Cyrillic or emoji slugifies to nothing — name
   // the file after the candidate's own content rather than losing the note.
   const base =
@@ -539,7 +568,11 @@ function freePath(db: Database, root: string, candidate: Candidate): { rel: stri
   const taken = db.query(`select 1 from notes where slug = ?`);
   for (let i = 1; i <= MAX_SLUG_TRIES; i++) {
     const slug = i === 1 ? base : `${base}-${i}`;
-    const rel = candidate.namespace ? `${candidate.namespace}/${slug}.md` : `${slug}.md`;
+    // `namespace` is canonical and ends in `/` (or is empty, at the root), and
+    // it is the string `propose` write-checked — so the file lands exactly
+    // where the scope decision was made, and `rel` is the identity the caller
+    // gets back and the wikilink a supersede writes.
+    const rel = `${namespace}${slug}.md`;
     const abs = confinedPath(root, rel);
     if (!existsSync(abs) && taken.get(slug) === null) return { rel, abs };
   }

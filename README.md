@@ -246,9 +246,12 @@ await vault.propose(candidate, { agent: "core/support" });
   `ledger-archive/`; `""` is the root rule. For each of `read` and `write`
   separately, the longest matching prefix that *specifies* it wins; a rule that
   leaves one out defers to the next-shorter match, and nothing specifying it
-  means denied. `open()` refuses a policy that answers one question twice, and
-  one with a subtree writable but not readable — an agent that cannot see its
-  own notes re-creates them on every propose.
+  means denied. `open()` refuses a policy that answers one question twice, one
+  with a subtree writable but not readable (an agent that cannot see its own
+  notes re-creates them on every propose), a rule that is not
+  `{prefix, read?, write?}` with booleans — a JSON `read: "false"` is truthy,
+  and would grant where it meant to deny — and a prefix that is not a canonical
+  path (`./ledger`, `ledger//sub`), which would match nothing and deny nothing.
 - `search` filters unreadable notes out of the over-fetched set before capping,
   so you get *up to* N readable hits (and `expandLinks` neighbours are filtered
   too). `get` returns null for an unreadable note, exactly like an absent one.

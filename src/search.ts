@@ -89,12 +89,19 @@ export async function hybridSearch(
   db: Database,
   embedder: Embedder,
   query: string,
-  { n = 10, cutoffs = {}, expandLinks = false }: SearchOptions = {},
-  scope: Scope = ALLOW_ALL,
+  { n = 10, cutoffs = {}, expandLinks = false, ctx }: SearchOptions = {},
+  scope?: Scope,
 ): Promise<SearchHit[]> {
   if (!Number.isInteger(n) || n < 1) {
     throw new Error(`search: n must be a positive integer, got ${n}`);
   }
+  // Only the facade holds the policy, so only the facade can turn a `ctx` into
+  // a scope. A direct caller passing one would otherwise get allow-all — the
+  // silent grant an allowlist exists to prevent.
+  if (ctx !== undefined && scope === undefined) {
+    throw new Error("search: options.ctx is resolved by the vault — call vault.search()");
+  }
+  const scoped = scope ?? ALLOW_ALL;
   assertIndexedWith(db, embedder);
 
   const match = ftsQuery(query);
@@ -103,17 +110,17 @@ export async function hybridSearch(
 
   let rows: Omit<SearchHit, "expansion">[];
   try {
-    rows = fuse(db, vector, match, n, cutoffs, scope);
+    rows = fuse(db, vector, match, n, cutoffs, scoped);
   } catch (e) {
     // The quoting above should make an FTS5 parse error unreachable; if a
     // tokenizer or Unicode-table skew still produces one, the keyword signal
     // drops out rather than taking the whole search down with it.
     if (match === null || !/fts5/i.test(String(e))) throw e;
-    rows = fuse(db, vector, null, n, cutoffs, scope);
+    rows = fuse(db, vector, null, n, cutoffs, scoped);
   }
 
   const direct = rows.map((r) => ({ ...r, expansion: false }));
-  return expandLinks ? [...direct, ...expand(db, direct, n, scope)] : direct;
+  return expandLinks ? [...direct, ...expand(db, direct, n, scoped)] : direct;
 }
 
 /** One statement: both signals, their cutoffs, and the RRF fusion over them. */

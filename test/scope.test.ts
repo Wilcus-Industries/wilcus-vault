@@ -3,7 +3,10 @@
 // library so no caller re-implements one. Deterministic embedder, fake
 // deciders, no network.
 import { test, expect, afterAll } from "bun:test";
+import { Database } from "bun:sqlite";
+import { dbPath, openDb } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
+import { hybridSearch } from "../src/search";
 import { compileScopes, scopeFor, type Permission, type ScopePolicy } from "../src/scope";
 import { gatePrompt, type DeciderInput } from "../src/gate";
 import { open, type Cutoffs, type Decider, type Vault } from "../src/vault";
@@ -124,6 +127,27 @@ test("open refuses a policy that contradicts itself", async () => {
   expect(refuse(POLICY)).not.toThrow();
 });
 
+test("open refuses a rule that is not a rule", async () => {
+  const root = makeVault({});
+  const refuse = (scopes: unknown): (() => Vault) => () =>
+    open(root, { embedder, scopes: scopes as ScopePolicy });
+
+  // A policy usually arrives as operator config — JSON, a config file, another
+  // process's object. `read: "false"` is truthy, so a policy that grants where
+  // it meant to deny must not type-check its way past `open()`.
+  expect(refuse({ a: [{ prefix: "notes/", read: "false" }] })).toThrow(/read must be true/);
+  expect(refuse({ a: [{ prefix: "notes/", read: true, write: 1 }] })).toThrow(/write must be true/);
+  expect(refuse({ a: [{ prefix: 7, read: true }] })).toThrow(/prefix must be a string/);
+  expect(refuse({ a: [null] })).toThrow(/rule must be/);
+  expect(refuse({ a: { prefix: "notes/", read: true } })).toThrow(/must be a list of rules/);
+
+  // A prefix that is not the canonical form of a path matches nothing, so a
+  // deny spelled that way is a deny that never fires. Refused, not normalized.
+  for (const prefix of ["./ledger", "ledger//sub", "ledger/./sub", "ledger/../x", ".."]) {
+    expect(refuse({ a: [{ prefix, read: true }] })).toThrow(/not a canonical namespace/);
+  }
+});
+
 test("a prefix is a namespace, matched on segment boundaries only", () => {
   const may = checker(DESIGN_EXAMPLE, "core/scheduler");
   // `ledger/` is the write-denied subtree; its sibling namespace is not.
@@ -170,6 +194,70 @@ test("resolution is per permission, longest prefix wins, unspecified defers", ()
   expect(thin("read", "other/x.md")).toBe(false);
 });
 
+test("the SQL read filter answers exactly what `may` answers", () => {
+  // `search` has to filter inside the query, so the rules exist twice: as
+  // `may` and as SQL. Two spellings of one rule drift — this is the test that
+  // holds them together, and it is why the prefix is measured by SQLite rather
+  // than by JS (a `🔒` is one character there and two code units here).
+  const policies: ScopePolicy[] = [
+    { a: [] },
+    { a: [{ prefix: "", read: true, write: false }] },
+    { a: [{ prefix: "notes/", read: true, write: true }, { prefix: "ledger/", read: true }] },
+    // deny inside an allow: the `then 0` arm nothing else in this suite reaches
+    { a: [{ prefix: "", read: true, write: false }, { prefix: "secret/", read: false }] },
+    { a: [{ prefix: "", read: true, write: false }, { prefix: "🔒secret/", read: false }] },
+    {
+      a: [
+        { prefix: "", read: true, write: false },
+        { prefix: "a/", read: false },
+        { prefix: "a/b/", read: true },
+      ],
+    },
+  ];
+  const PROBES = [
+    "x.md",
+    "notes/x.md",
+    "notes/deep/x.md",
+    "ledger/q3.md",
+    "ledger-archive/q3.md",
+    "secret/plans.md",
+    "secretive/plans.md",
+    "🔒secret/plans.md",
+    "🔒secretive/plans.md",
+    "a/x.md",
+    "a/b/x.md",
+  ];
+
+  const db = new Database(":memory:");
+  for (const policy of policies) {
+    const scope = scopeFor(compileScopes(policy), { agent: "a" });
+    const { sql, params } = scope.readSql;
+    const query = db.query(`select (${sql}) as ok from (select ? as path) as n`);
+    for (const path of PROBES) {
+      const { ok } = query.get(...params, path) as { ok: number };
+      // The policy and path ride along so a failure names which pair drifted.
+      expect([policy, path, ok === 1]).toEqual([policy, path, scope.may("read", path)]);
+    }
+  }
+  db.close();
+});
+
+test("search's filter measures a prefix the way SQLite does, not the way JS does", async () => {
+  // `"🔒secret/"` is 8 characters and 9 UTF-16 code units: a length measured in
+  // JS makes the deny arm miss and the root allow answer instead.
+  const v = await openVault(
+    { a: [{ prefix: "", read: true, write: false }, { prefix: "🔒secret/", read: false }] },
+    undefined,
+    {
+      "🔒secret/plans.md": "# Secret plans\n\nThe Acme renewal pricing nobody else may read.\n",
+      "notes/acme-renewal.md": "# Acme renewal\n\nThe Acme renewal closes in March.\n",
+    },
+  );
+  const hits = paths(await v.search("acme renewal pricing", { ctx: { agent: "a" }, n: 10 }));
+  expect(hits).toEqual(["notes/acme-renewal.md"]);
+  expect(v.list(undefined, { agent: "a" })).toEqual(["notes/acme-renewal.md"]);
+});
+
 test("a policy in force fails closed: no context, an unknown agent, or `{}`", async () => {
   const v = await openVault(POLICY);
   // Silence is how an orchestrator typo makes an agent re-create the memory it
@@ -187,6 +275,18 @@ test("a policy in force fails closed: no context, an unknown agent, or `{}`", as
   // `{}` and `undefined` sit on opposite sides of the fail-closed line.
   const empty = await openVault({});
   await expect(empty.get("notes/hub.md", NOTES)).rejects.toThrow(/has no scope/);
+});
+
+test("hybridSearch refuses a context only the facade can resolve", async () => {
+  const v = await openVault(POLICY);
+  const db = openDb(dbPath(v.root));
+  // The policy lives on the vault handle, so a direct caller handing `ctx` to
+  // the search function would otherwise be answered allow-all — the silent
+  // grant the allowlist exists to prevent.
+  await expect(hybridSearch(db, embedder, "acme", { ctx: NOTES })).rejects.toThrow(
+    /call vault\.search/,
+  );
+  db.close();
 });
 
 test("search returns only readable hits, filtered over the over-fetched set", async () => {
@@ -285,6 +385,29 @@ test("propose refuses an unwritable namespace before the decider runs", async ()
     path: "notes/acme-renewal-2026.md",
   });
   expect(seen.length).toBe(1);
+});
+
+test("propose canonicalizes the namespace before checking it, not after", async () => {
+  const seen: DeciderInput[] = [];
+  const v = await openVault(POLICY, async (input) => {
+    seen.push(input);
+    return { action: "create" };
+  });
+
+  // `notes/../ledger` is inside the vault, so confinement passes; it starts
+  // with `notes/`, so a raw check passes — and the file lands in `ledger/`,
+  // the one subtree this agent may not write. The check and the write have to
+  // be looking at the same string.
+  for (const namespace of ["notes/../ledger", "./ledger", "ledger/", "ledger/../ledger"]) {
+    await expect(v.propose({ ...CANDIDATE, namespace }, NOTES)).rejects.toThrow(/may not write/);
+  }
+  // An absolute namespace is not a spelling of anything inside the vault, so
+  // it is refused by the older rail before the scope is consulted at all.
+  await expect(v.propose({ ...CANDIDATE, namespace: "/ledger" }, NOTES)).rejects.toThrow(
+    /outside the vault/,
+  );
+  expect(seen).toEqual([]);
+  expect(v.list("ledger", SCHEDULER)).toEqual(["ledger/q3.md"]); // nothing landed
 });
 
 test("only readable notes feed the decider, and unwritable ones are marked read-only", async () => {
