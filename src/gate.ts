@@ -4,7 +4,16 @@
 // touched mid-flight is clobbered) and path confinement (an LLM-derived string
 // never names a raw filesystem path).
 import type { Database } from "bun:sqlite";
-import { appendFileSync, existsSync, lstatSync, mkdirSync, renameSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  writeSync,
+} from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import {
   linkTarget,
@@ -37,6 +46,15 @@ export type SimilarNote = {
    */
   hash: string;
 };
+
+/**
+ * Who is calling, per call (DESIGN.md § Scopes and context). `agent` names the
+ * caller (`core/scheduler`); `source` optionally records what prompted the call
+ * — a conversation id, a task id, freeform. Identity travels per call rather
+ * than being frozen at `open()`, because one process holds one vault handle on
+ * behalf of many agents. Optional until scope policy lands (#23).
+ */
+export type VaultContext = { agent: string; source?: string };
 
 export type DeciderInput = { candidate: Candidate; similar: SimilarNote[] };
 
@@ -238,6 +256,9 @@ Reply with one JSON object and nothing else — no prose, no markdown fence:
  *
  * Touched files are reindexed before this returns, so the index never lags a
  * write we made ourselves.
+ *
+ * `ctx` is the caller's identity for this one call; given, its provenance is
+ * stamped into every note the gate *authors* (§ Scopes and context).
  */
 export async function propose(
   db: Database,
@@ -245,6 +266,7 @@ export async function propose(
   embedder: Embedder,
   candidate: Candidate,
   { decider, cutoffs, n = 5 }: GateOptions,
+  ctx?: VaultContext,
 ): Promise<GateResult> {
   // `{}` type-checks, which would make the mandate above cosmetic: with no
   // ceiling at all the search returns the least unrelated note and the gate
@@ -254,6 +276,12 @@ export async function propose(
       "write gate: cutoffs must set distanceCeiling or bm25Ceiling — without one, " +
         "'most similar note' is only 'least unrelated note'",
     );
+  }
+  // A blank agent is a caller that meant to identify itself and did not. It
+  // would be stamped into files as an empty string and, once scope policy
+  // keys on it (#23), match no rule — refuse it here, before any write.
+  if (ctx !== undefined && ctx.agent.trim() === "") {
+    throw new Error("write gate: ctx.agent must name the calling agent");
   }
   const base = resolve(root);
   let applied: Applied | null = null;
@@ -270,10 +298,10 @@ export async function propose(
         `write gate: decider targeted ${decision.target}, which was not among the similar notes`,
       );
     }
-    applied = await apply(db, base, candidate, decision, similar);
+    applied = await apply(db, base, candidate, decision, similar, ctx);
   }
   if (applied === null) {
-    applied = await create(db, base, candidate);
+    applied = await create(db, base, candidate, undefined, ctx);
     fellBack = true;
   }
   // The index never lags a write we made ourselves.
@@ -318,12 +346,13 @@ async function apply(
   candidate: Candidate,
   decision: Decision,
   similar: SimilarNote[],
+  ctx?: VaultContext,
 ): Promise<Applied | null> {
   if (decision.action === "discard") {
     logCandidate(root, candidate, { decision });
     return { action: "discard" };
   }
-  if (decision.action === "create") return await create(db, root, candidate, decision.body);
+  if (decision.action === "create") return await create(db, root, candidate, decision.body, ctx);
 
   const hit = similar.find((s) => s.note.path === decision.target)!; // checked in propose
   const rel = hit.note.path;
@@ -333,15 +362,23 @@ async function apply(
   if (raw === null || parseNote(raw, rel).hash !== hit.hash) return null;
 
   if (decision.action === "update") {
-    // Frontmatter is the note's identity — keep it verbatim, bump `updated`.
-    const bumped = patchFrontmatter(raw, "updated", now());
-    await writeAtomic(abs, replaceBody(bumped, decision.body ?? candidate.body));
+    // Frontmatter is the note's identity — keep it verbatim, bump `updated`
+    // and record who wrote it. Both are textual patches: we did not author
+    // this note, so it is never re-serialized. Every gate-owned key is set or
+    // *unset* to match this call exactly — a leftover `vault_source` beside a
+    // new `vault_agent` would assert a pairing that never happened.
+    const stamp = provenance(ctx);
+    let patched = patchFrontmatter(raw, "updated", now());
+    for (const key of PROVENANCE_KEYS) {
+      patched = patchFrontmatter(patched, key, stamp[key] ?? null);
+    }
+    await writeAtomic(abs, replaceBody(patched, decision.body ?? candidate.body));
     return { action: "update", path: rel };
   }
 
   // supersede: the successor is written first, then the old note is marked and
   // linked forward to it.
-  const created = await create(db, root, candidate, decision.body);
+  const created = await create(db, root, candidate, decision.body, ctx);
   // Writing the successor took time, and the old note belongs to a human. If it
   // moved in that window the successor stands and the caller is told the old
   // note is unmarked — the alternative is overwriting an edit for bookkeeping.
@@ -349,6 +386,8 @@ async function apply(
   if (current === null || parseNote(current, rel).hash !== hit.hash) {
     return { action: "supersede", path: created.path, unmarked: rel };
   }
+  // Marked, not restamped: the marking is bookkeeping, not authorship, and the
+  // superseding agent is already recorded on the successor.
   const marked = patchFrontmatter(current, "superseded_by", created.path!);
   // The gate knows the exact path, so it links by path rather than by stem: a
   // namespaced successor cannot go ambiguous later. (A successor written to the
@@ -372,12 +411,34 @@ async function writeAtomic(abs: string, text: string): Promise<void> {
   renameSync(tmp, abs);
 }
 
+/**
+ * The frontmatter keys the gate owns. Namespaced (`vault_`) because `agent:`
+ * and `source:` are exactly the keys a human's own frontmatter plausibly holds,
+ * and the textual patcher replaces *top-level* lines — patching a human's
+ * nested `source:` block would orphan its children into a parse error. Listed
+ * rather than derived, because `update` has to clear the ones this call does
+ * not set, which means knowing them all.
+ */
+const PROVENANCE_KEYS = ["vault_agent", "vault_source"] as const;
+
+/**
+ * The provenance for a note the gate authors or rewrites, or `{}` when the
+ * caller gave no context. Both values are single-line, so `update`'s textual
+ * patch applies cleanly. `vault_agent` answers "which agent last wrote this
+ * note through the gate".
+ */
+function provenance(ctx?: VaultContext): Record<string, string> {
+  if (ctx === undefined) return {};
+  return { vault_agent: ctx.agent, ...(ctx.source !== undefined && { vault_source: ctx.source }) };
+}
+
 /** Write a note we authored ourselves — the one place `serializeNote` is used. */
 async function create(
   db: Database,
   root: string,
   candidate: Candidate,
   body?: string,
+  ctx?: VaultContext,
 ): Promise<Applied> {
   const { rel, abs } = freePath(db, root, candidate);
   const at = now();
@@ -387,6 +448,7 @@ async function create(
       ...(candidate.type !== undefined && { type: candidate.type }),
       created: at,
       updated: at,
+      ...provenance(ctx),
     },
     body: body ?? candidate.body,
   });
@@ -427,14 +489,32 @@ function freePath(db: Database, root: string, candidate: Candidate): { rel: stri
 }
 
 /**
- * Append a candidate to `.vault/discarded.log` as JSONL, whole: a wrong decider
- * call — or a gate that cannot write the file — costs a line in a log, never
- * the information itself.
+ * The discard log: durable history, so it sits beside the notes rather than in
+ * `.vault/`, which is a disposable index directory — a `doctor --rebuild` or a
+ * nuke of `.vault/` must not take it. A dot-file, so the scan never indexes it.
+ * It carries whole candidate bodies, so a vault kept in git may want it in
+ * `.gitignore`.
+ */
+export const discardLog = (root: string): string => join(root, ".discarded.log");
+
+/**
+ * Append a candidate to the discard log as JSONL, whole: a wrong decider call —
+ * or a gate that cannot place the note — costs a line in a log, never the
+ * information itself.
+ *
+ * `O_NOFOLLOW`, because this is the gate's one write to a fixed, user-visible
+ * path — every other write lands through a rename, which replaces a symlink
+ * rather than following it. A symlink dropped here would redirect whole
+ * candidate bodies out of the vault; opening one fails instead (ELOOP).
  */
 function logCandidate(root: string, candidate: Candidate, extra: Record<string, unknown>): void {
-  const dir = join(root, ".vault");
-  mkdirSync(dir, { recursive: true });
-  appendFileSync(join(dir, "discarded.log"), `${JSON.stringify({ at: now(), candidate, ...extra })}\n`);
+  const { O_WRONLY, O_APPEND, O_CREAT, O_NOFOLLOW } = constants;
+  const fd = openSync(discardLog(root), O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW);
+  try {
+    writeSync(fd, `${JSON.stringify({ at: now(), candidate, ...extra })}\n`);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 const now = (): string => new Date().toISOString();

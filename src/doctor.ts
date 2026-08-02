@@ -1,8 +1,10 @@
 // doctor is the safety net for "files are truth": it compares the index to the
 // files, repairs what drifted, and reports what only a human can fix.
 import type { Database } from "bun:sqlite";
-import { renameSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { openDb, dbPath } from "./db";
+import { discardLog } from "./gate";
 import { reindex, readNote, scanVault } from "./indexer";
 import { linkTarget } from "./note";
 import type { Embedder } from "./embed";
@@ -34,6 +36,8 @@ export type DoctorReport = {
   malformed: string[];
   /** every note was re-embedded: the model or dims changed, or this was a rebuild */
   reembedded: boolean;
+  /** a discard log left in `.vault/` was moved out to `<root>/.discarded.log` */
+  migratedDiscardLog: boolean;
 };
 
 export type DoctorOptions = {
@@ -49,6 +53,10 @@ export async function doctor(
   { repair = true, rebuild = false }: DoctorOptions = {},
 ): Promise<DoctorReport> {
   const path = dbPath(root);
+  // First, before anything touches `.vault/`: history that is still in there is
+  // one `rm -rf .vault` from being gone. Only on a repairing run, though — a
+  // `repair: false` call is a report, and a report does not move files.
+  const migratedDiscardLog = (repair || rebuild) && migrateDiscardLog(root);
   // Drift is measured before any repair, so the report says what was wrong.
   const drift = await withDb(path, (db) => diskDrift(db, root));
   let reembedded = rebuild; // a rebuild embeds every note from scratch
@@ -56,7 +64,28 @@ export async function doctor(
   else if (repair) {
     reembedded = (await withDb(path, (db) => reindex(db, root, embedder))).reembedded;
   }
-  return { ...drift, ...(await withDb(path, graphReport)), reembedded };
+  return { ...drift, ...(await withDb(path, graphReport)), reembedded, migratedDiscardLog };
+}
+
+/**
+ * The discard log used to live in `.vault/` — a disposable index directory, so
+ * a rebuild or a nuke took durable history with it. Move it beside the notes,
+ * once: append rather than replace, because both files may hold lines and
+ * neither is disposable, then drop the old one so the next run is a no-op.
+ * ponytail: append-then-remove is not atomic — a crash in between re-appends
+ * the same lines next run (duplicated history, never lost history), and an old
+ * log we cannot read (EACCES, or a directory in its place) throws out of
+ * doctor. Both are one-shot migration paths; a temp-file swap is the upgrade if
+ * either ever actually bites.
+ */
+function migrateDiscardLog(root: string): boolean {
+  const old = join(root, ".vault", "discarded.log");
+  if (!existsSync(old)) return false;
+  const lines = readFileSync(old, "utf8");
+  // JSONL: a last line without its newline would otherwise fuse with ours.
+  if (lines !== "") appendFileSync(discardLog(root), lines.endsWith("\n") ? lines : `${lines}\n`);
+  rmSync(old);
+  return true;
 }
 
 async function withDb<T>(path: string, fn: (db: Database) => T | Promise<T>): Promise<T> {
@@ -92,7 +121,9 @@ async function diskDrift(
   return { stale, missing: [...indexed.keys()].sort() };
 }
 
-function graphReport(db: Database): Omit<DoctorReport, "stale" | "missing" | "reembedded"> {
+function graphReport(
+  db: Database,
+): Omit<DoctorReport, "stale" | "missing" | "reembedded" | "migratedDiscardLog"> {
   const unresolved = db
     .query(
       `select n.path as "from", e.to_slug as slug

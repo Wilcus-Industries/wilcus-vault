@@ -202,15 +202,29 @@ function frontmatterBlock(
  * comments and rewrites `01234` and `1.0`. A file with no usable frontmatter
  * block (absent, or malformed enough that `parseNote` ignores it) gets a fresh
  * block prepended; its content is left untouched below.
+ *
+ * A `null` value **unsets** the key instead — every line defining it goes. A
+ * gate-owned key has to be removable, or it would outlive the fact it records
+ * (a stale `vault_source` beside a fresh `vault_agent` asserts a pairing that
+ * never happened).
  */
-export function patchFrontmatter(raw: string, key: string, value: string): string {
+export function patchFrontmatter(raw: string, key: string, value: string | null): string {
   // Keys are ours (`superseded_by`, `updated`); anything else could be YAML or
   // regex syntax rather than a key, and this function does not sanitize.
   if (!/^[A-Za-z0-9_-]+$/.test(key)) throw new Error(`patchFrontmatter: unusable key ${key}`);
+  const at = frontmatterBlock(raw);
+  if (value === null) {
+    // Unsetting is only ever a deletion: a file with no usable block does not
+    // gain one to hold the absence of a key, and an absent key is already gone.
+    if (at === null) return raw;
+    const gone = raw
+      .slice(at.start, at.end)
+      .replace(new RegExp(`^${key}[ \t]*:[^\r\n]*\r?\n?`, "gm"), "");
+    return raw.slice(0, at.start) + gone + raw.slice(at.end);
+  }
   // A timestamp is a YAML-native scalar and reads as one; anything else is
   // quoted, so a path or a colon can never become syntax.
   const line = `${key}: ${ISO_TIMESTAMP.test(value) ? value : JSON.stringify(value)}`;
-  const at = frontmatterBlock(raw);
   if (at === null) return `---\n${line}\n---\n${raw}`;
 
   const eol = raw.slice(0, at.start).endsWith("\r\n") ? "\r\n" : "\n";

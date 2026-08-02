@@ -183,8 +183,9 @@ half-indexed note and re-embedded on every pass.
 
 ## Write gate
 
-Every programmatic write goes through `vault.propose(candidate)` (gaining a
-per-call `VaultContext` in #20 — see § Scopes and context):
+Every programmatic write goes through `vault.propose(candidate, ctx?)`, where
+`ctx` is the caller's per-call identity (§ Scopes and context) — given, the gate
+stamps its provenance onto every note it authors; absent, nothing is stamped:
 
 1. hybrid-search top-k similar notes, each one re-read from disk so the hash
    captured is the *file's*, not the index's — the index is derived data. The
@@ -226,17 +227,24 @@ per-call `VaultContext` in #20 — see § Scopes and context):
      whose YAML the parser cannot read is *not* a block, and gets a fresh one
      prepended, or a `superseded_by` patched into it would be a line nothing
      ever reads.
-   - `create` writes a new file; `update` rewrites the target body and bumps
-     `updated` in its frontmatter (a textual patch, per the rule above); `supersede`
+   - `create` writes a new file; `update` rewrites the target body, bumps
+     `updated` and sets *or clears* the provenance keys to match the call
+     (textual patches, per the rule above — the patcher takes a `null` value as
+     an unset for exactly this); `supersede`
      writes the new note, adds `superseded_by` (vault-relative path) to the old
      note's frontmatter plus a **path-qualified** forward wikilink
      (`[[customers/acme-2026]]`) — the gate knows the exact path, so a
      namespaced successor's link cannot go ambiguous behind a note that shares
      the stem later (a successor written to the vault root has no qualified
      form, so its link is a bare stem and still can);
+     — and marking the old note does **not** restamp its provenance, since
+     marking is bookkeeping, not authorship;
      `discard` appends the candidate
-     as a JSONL line to `.vault/discarded.log` so a wrong LLM call never silently
-     loses information.
+     as a JSONL line to `<root>/.discarded.log` so a wrong LLM call never silently
+     loses information. That log is durable history, so it lives beside the notes
+     and not in the disposable `.vault/` index directory — a `--rebuild` or an
+     `rm -rf .vault` must not take it with them. It is a dot-file, so the scan
+     never indexes it, and `doctor` moves a log left in the old location once.
 
 Two consequences of the rails, recorded so they are not mistaken for slips. A
 traversing *title* is slugified rather than refused (`../../evil` is the note
@@ -250,7 +258,7 @@ unique any more, but the gate keeps *its* notes' stems unique anyway, because
 adding a second `acme.md` is exactly what turns a human's existing `[[acme]]`
 ambiguous. A title that slugifies to nothing (CJK, Cyrillic, emoji)
 is named `note-<8 hex of the candidate's hash>`; a candidate the gate cannot
-place at all is appended to `.vault/discarded.log` before it throws. Losing the
+place at all is appended to `<root>/.discarded.log` before it throws. Losing the
 note is never one of the outcomes.
 
 Human edits bypass the gate by definition (files are truth); the watcher +
@@ -272,8 +280,9 @@ type VaultContext = { agent: string; source?: string };
 
 `agent` names the caller (`core/scheduler`); `source` optionally records what
 prompted the call — a conversation id, a task id, freeform. It is the second
-parameter of `propose(candidate, ctx)`; the read paths carry it as
-`SearchOptions.ctx` and an optional trailing parameter on `get`/`list` (#21).
+parameter of `propose(candidate, ctx)` — optional until a `ScopePolicy` exists
+to require it (#23); the read paths carry it as `SearchOptions.ctx` and an
+optional trailing parameter on `get`/`list` (#21).
 The gate stamps provenance into the frontmatter of every note it writes:
 **`vault_agent`** and **`vault_source`** — namespaced, because `agent:` and
 `source:` are exactly the keys a human's own frontmatter plausibly holds, and
@@ -281,7 +290,12 @@ the textual patcher replaces top-level lines (patching a human's nested
 `source:` block would orphan its children into a parse error). Both are
 single-line values, so `update`'s textual patch applies cleanly; `create` and
 `supersede` serialize them fresh on the note they author. `vault_agent`
-answers "which agent last wrote this note through the gate". Marking the
+answers "which agent last wrote this note through the gate" — so on `update`
+these keys are set to *exactly* this call's context: a key the call does not
+supply is **removed**, not left standing. A stale `vault_source` beside a fresh
+`vault_agent` would assert a pairing that never happened, and a leftover
+`vault_agent` under a context-free write would name an agent that did not make
+it. An `agent` that is empty or whitespace is refused outright. Marking the
 *old* note `superseded_by` does not restamp its provenance — the marking is
 bookkeeping, not authorship, and the superseding agent is already on the
 successor. Provenance lives in the file, like every other truth here.
@@ -405,7 +419,12 @@ into a namespace.) A duplicate filename stem is
 *not* itself reported: two namespaces holding an `acme.md` is the point of
 namespaces, and only a bare link to them is a problem.
 `--rebuild` reindexes from scratch into a temp DB file, then atomically renames it
-over `index.db` (safe against a concurrently running watcher).
+over `index.db` (safe against a concurrently running watcher). Doctor also carries
+the one migration the vault has: a discard log still sitting in `.vault/` is
+appended to `<root>/.discarded.log` and removed, once, before anything else
+touches `.vault/`, and the report says so. It runs only on a **repairing** run
+(the default, or `--rebuild`); `repair: false` is a report, and a report does
+not move files.
 
 `vault watch` — `fs.watch` (recursive) on the root, acting only on `.md` paths
 outside dot-directories, so the index's own writes under `.vault/` cannot feed
