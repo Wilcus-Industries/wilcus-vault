@@ -114,7 +114,10 @@ const vault = open("/path/to/vault", {
 
 await vault.reindex();
 await vault.search("acme renewal", { n: 5, cutoffs: { distanceCeiling: 0.35 } });
-await vault.propose({ title: "Acme renewal 2026", type: "customer", namespace: "customers", body });
+await vault.propose(
+  { title: "Acme renewal 2026", type: "customer", namespace: "customers", body },
+  { agent: "core/scheduler", source: "task-42" }, // optional: who is writing, per call
+);
 await vault.doctor();
 
 const watcher = vault.watch();     // keep the index warm while a human edits
@@ -138,16 +141,28 @@ vault.close();                     // ...so this cannot close the DB under a wri
 
 Writes land through a temp file renamed into place, so a reader never sees half a
 note. A discarded candidate — or one the gate cannot place at all — is appended
-whole to `.vault/discarded.log`; losing the note is never an outcome. Notes the
+whole to `<root>/.discarded.log`; losing the note is never an outcome. That log is
+history, not index, so it sits beside the notes rather than in the disposable
+`.vault/` — a `doctor --rebuild` or an `rm -rf .vault` leaves it alone (a log left
+in the old place is moved out by the next `vault doctor`). It holds whole candidate
+bodies, so a vault kept in git may want it in `.gitignore` too. Notes the
 gate did not author are patched textually, never re-serialized, so comments,
 `01234` and `1.0` survive. Human edits bypass the gate by definition:
 `vault watch` and `vault doctor` pick them up.
 
 ```ts
-const result = await vault.propose(candidate);
+const result = await vault.propose(candidate, { agent: "core/scheduler" });
 // { action: "supersede", path: "customers/acme-renewal-2026.md",
 //   superseded: "customers/acme.md", fellBack: false }
 ```
+
+The second argument is a `VaultContext` — `{ agent, source? }`, the caller's
+identity for that one call. Given, the gate stamps `vault_agent` (and
+`vault_source`) into the frontmatter of every note it *authors*: a `create`, and
+a `supersede`'s successor, get them serialized in; an `update` gets them patched
+in beside its `updated` bump. Marking the superseded note is bookkeeping rather
+than authorship, so its own provenance is left alone. Omit the context and
+nothing is stamped.
 
 ### Embedders
 

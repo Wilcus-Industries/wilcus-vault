@@ -1,5 +1,5 @@
 import { test, expect, afterAll } from "bun:test";
-import { readdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { openDb, dbPath } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
@@ -110,6 +110,23 @@ test("--rebuild reproduces an identical index after the DB is deleted", async ()
   await doctor(root, embedder, { rebuild: true });
   expect(snapshot(root)).toEqual(before);
   expect(readdirSync(join(root, ".vault"))).toEqual(["index.db"]);
+});
+
+test("doctor moves a discard log left behind in .vault/ out of it, once", async () => {
+  const root = makeVault(GRAPH);
+  const log = join(root, ".discarded.log");
+  writeNote(root, ".vault/discarded.log", `{"at":"2026-01-01T00:00:00.000Z","candidate":{"title":"old"}}\n`);
+  writeNote(root, ".discarded.log", `{"at":"2026-02-01T00:00:00.000Z","candidate":{"title":"new"}}\n`);
+
+  const report = await doctor(root, embedder);
+  expect(report.migratedDiscardLog).toBe(true);
+  // appended, not replaced: both files are history and neither may be lost
+  expect(readFileSync(log, "utf8").trim().split("\n")).toHaveLength(2);
+  expect(existsSync(join(root, ".vault", "discarded.log"))).toBe(false);
+
+  // once — a second run must not re-append what it already moved
+  expect((await doctor(root, embedder)).migratedDiscardLog).toBe(false);
+  expect(readFileSync(log, "utf8").trim().split("\n")).toHaveLength(2);
 });
 
 test("--rebuild re-embeds by definition and reports it", async () => {

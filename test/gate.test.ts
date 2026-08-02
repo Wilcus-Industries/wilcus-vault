@@ -7,7 +7,8 @@ import { join, resolve } from "node:path";
 import { TokenOverlapEmbedder } from "../src/embed";
 import { parseDecision, slugify, type Decider, type DeciderInput } from "../src/gate";
 import { gatePrompt } from "../src/gate";
-import { open, type Cutoffs, type Vault } from "../src/vault";
+import { parseNote } from "../src/note";
+import { open, type Cutoffs, type Vault, type VaultContext } from "../src/vault";
 import { makeVault, cleanupVaults, writeNote } from "./vault-fixture";
 
 afterAll(cleanupVaults);
@@ -17,6 +18,10 @@ const embedder = new TokenOverlapEmbedder();
 const CUTOFFS: Cutoffs = { distanceCeiling: 0.9, bm25Ceiling: 0 };
 
 const read = (root: string, rel: string): string => readFileSync(join(root, rel), "utf8");
+/** A note's frontmatter as the parser reads it — `create` serializes, `update`
+ * patches textually, and provenance has to arrive either way. */
+const fm = (root: string, rel: string): Record<string, unknown> =>
+  parseNote(read(root, rel), rel).frontmatter;
 
 async function openVault(
   files: Record<string, string>,
@@ -51,6 +56,8 @@ const CANDIDATE = {
   namespace: "notes",
   body: "The Acme renewal closes in March 2026 at the agreed renewal pricing.\n",
 };
+
+const CTX: VaultContext = { agent: "core/scheduler", source: "task-42" };
 
 test("create writes a new note we authored, confined and indexed", async () => {
   const v = await openVault(VAULT, async () => ({ action: "create" }));
@@ -213,20 +220,95 @@ test("supersede patches a note with no usable frontmatter without eating its bod
   v.close();
 });
 
-test("discard appends the whole candidate to .vault/discarded.log", async () => {
+test("a ctx stamps provenance on a note the gate authors", async () => {
+  const v = await openVault(VAULT, async () => ({ action: "create" }));
+  const r = await v.propose(CANDIDATE, CTX);
+  expect(fm(v.root, r.path!)).toMatchObject({
+    vault_agent: "core/scheduler",
+    vault_source: "task-42",
+  });
+  v.close();
+});
+
+test("update stamps provenance by patching, and the last writer replaces the line", async () => {
+  const v = await openVault(VAULT, async () => ({
+    action: "update",
+    target: "notes/acme-renewal.md",
+    body: "# Acme renewal\n\nRenewal closes 2026-03-01.\n",
+  }));
+  await v.propose(CANDIDATE, CTX);
+  const raw = read(v.root, "notes/acme-renewal.md");
+  // patched textually, so the note we did not author is otherwise untouched
+  expect(raw).toContain("id: 01234 # legacy account number, must survive a gate write");
+  expect(raw).toContain("rate: 1.0");
+  expect(fm(v.root, "notes/acme-renewal.md")).toMatchObject({
+    vault_agent: "core/scheduler",
+    vault_source: "task-42",
+  });
+
+  // vault_agent is "who wrote this note last", not a growing list of writers
+  await v.propose(CANDIDATE, { agent: "core/librarian", source: "task-43" });
+  const again = read(v.root, "notes/acme-renewal.md");
+  expect(again.match(/^vault_agent:/gm)).toHaveLength(1);
+  expect(fm(v.root, "notes/acme-renewal.md")).toMatchObject({
+    vault_agent: "core/librarian",
+    vault_source: "task-43",
+  });
+  v.close();
+});
+
+test("supersede stamps the successor and does not restamp the note it retires", async () => {
+  const v = await openVault(VAULT, async () => ({
+    action: "supersede",
+    target: "notes/acme-renewal.md",
+  }));
+  const r = await v.propose(CANDIDATE, CTX);
+  expect(fm(v.root, r.path!)).toMatchObject({
+    vault_agent: "core/scheduler",
+    vault_source: "task-42",
+  });
+
+  // marking the old note is bookkeeping, not authorship — the superseding
+  // agent is already recorded on the successor
+  const old = fm(v.root, "notes/acme-renewal.md");
+  expect(old["superseded_by"]).toBe("notes/acme-renewal-2026.md");
+  expect(old["vault_agent"]).toBeUndefined();
+  expect(old["vault_source"]).toBeUndefined();
+  v.close();
+});
+
+test("no ctx stamps nothing, and a ctx without a source stamps the agent alone", async () => {
+  const v = await openVault(VAULT, async () => ({ action: "create" }));
+  const bare = await v.propose(CANDIDATE);
+  expect(read(v.root, bare.path!)).not.toContain("vault_");
+
+  const agentOnly = await v.propose({ ...CANDIDATE, title: "Acme renewal 2027" }, { agent: "core/scheduler" });
+  const raw = read(v.root, agentOnly.path!);
+  expect(raw).toContain("vault_agent");
+  expect(raw).not.toContain("vault_source"); // absent, not an empty key
+  v.close();
+});
+
+test("discard appends the whole candidate to <root>/.discarded.log", async () => {
   const v = await openVault(VAULT, async () => ({ action: "discard" }));
   const r = await v.propose(CANDIDATE);
   expect(r).toMatchObject({ action: "discard", fellBack: false });
   expect(r.path).toBeUndefined();
 
-  const lines = read(v.root, ".vault/discarded.log").trim().split("\n");
+  const lines = read(v.root, ".discarded.log").trim().split("\n");
   expect(lines).toHaveLength(1);
   const entry = JSON.parse(lines[0]!) as { candidate: unknown; at: string };
   expect(entry.candidate).toEqual(CANDIDATE); // recoverable in full
   expect(entry.at).toMatch(/^20\d\d-/);
 
   await v.propose({ ...CANDIDATE, title: "Second thought" });
-  expect(read(v.root, ".vault/discarded.log").trim().split("\n")).toHaveLength(2); // appended
+  expect(read(v.root, ".discarded.log").trim().split("\n")).toHaveLength(2); // appended
+
+  // durable history does not live in the disposable index directory: a
+  // `.vault/` nuke or a --rebuild must not take it with them
+  expect(existsSync(join(v.root, ".vault", "discarded.log"))).toBe(false);
+  await v.doctor({ rebuild: true });
+  expect(read(v.root, ".discarded.log").trim().split("\n")).toHaveLength(2);
   v.close();
 });
 
@@ -492,7 +574,7 @@ test("a vault out of free filenames logs the candidate before giving up", async 
   await expect(v.propose(CANDIDATE)).rejects.toThrow(/free filename/);
 
   // thrown, but not lost: the candidate is recoverable from the discard log
-  const entry = JSON.parse(read(v.root, ".vault/discarded.log").trim()) as {
+  const entry = JSON.parse(read(v.root, ".discarded.log").trim()) as {
     candidate: unknown;
     reason: string;
   };

@@ -189,6 +189,7 @@ function print(r: DoctorReport): void {
   const lines = [
     `reindexed ${r.stale.length} stale, purged ${r.missing.length} deleted` +
       (r.reembedded ? ", re-embedded all notes (model or dims changed)" : ""),
+    ...(r.migratedDiscardLog ? ["moved .vault/discarded.log -> .discarded.log"] : []),
     ...r.brokenLinks.map((l) => `broken link:    ${l.from} -> [[${l.slug}]]`),
     // the candidates are the fix: qualify the link with one of these paths
     ...r.ambiguousLinks.map(

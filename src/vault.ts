@@ -6,7 +6,13 @@ import { resolve } from "node:path";
 import { openDb, dbPath } from "./db";
 import { reindex as reindexVault, type IndexStats } from "./indexer";
 import { doctor as runDoctor, type DoctorOptions, type DoctorReport } from "./doctor";
-import { propose as runGate, type Candidate, type GateOptions, type GateResult } from "./gate";
+import {
+  propose as runGate,
+  type Candidate,
+  type GateOptions,
+  type GateResult,
+  type VaultContext,
+} from "./gate";
 import { hybridSearch, type SearchHit, type SearchOptions } from "./search";
 import { watch as watchVault, type WatchOptions, type Watcher } from "./watch";
 import type { Embedder } from "./embed";
@@ -22,8 +28,12 @@ export type Vault = {
   readonly root: string;
   /** hybrid search over the index (DESIGN.md § Retrieval) */
   search(query: string, options?: SearchOptions): Promise<SearchHit[]>;
-  /** the write gate: search → decide → apply with check-and-write + confinement */
-  propose(candidate: Candidate): Promise<GateResult>;
+  /**
+   * The write gate: search → decide → apply with check-and-write + confinement.
+   * `ctx` names the calling agent for this one call; given, its provenance is
+   * stamped on every note the gate authors (DESIGN.md § Scopes and context).
+   */
+  propose(candidate: Candidate, ctx?: VaultContext): Promise<GateResult>;
   /** hash-diff the files into the index */
   reindex(): Promise<IndexStats>;
   /** report and repair index drift; `--rebuild` reindexes from scratch */
@@ -42,11 +52,11 @@ export function open(root: string, { embedder, gate }: VaultOptions): Vault {
     search: (query, options) => hybridSearch(db, embedder, query, options),
     // async, so a missing gate is a rejected promise like every other failure
     // here rather than a synchronous throw a caller's .catch() would miss
-    async propose(candidate) {
+    async propose(candidate, ctx) {
       if (gate === undefined) {
         throw new Error("vault: propose needs a gate — open() with {gate: {decider, cutoffs}}");
       }
-      return runGate(db, dir, embedder, candidate, gate);
+      return runGate(db, dir, embedder, candidate, gate, ctx);
     },
     reindex: () => reindexVault(db, dir, embedder),
     async doctor(options) {
@@ -66,7 +76,7 @@ export function open(root: string, { embedder, gate }: VaultOptions): Vault {
   };
 }
 
-export type { Candidate, GateResult, GateOptions } from "./gate";
+export type { Candidate, GateResult, GateOptions, VaultContext } from "./gate";
 export type { SearchHit, SearchOptions, Cutoffs } from "./search";
 export type { Embedder } from "./embed";
 export type { DoctorReport, DoctorOptions } from "./doctor";
