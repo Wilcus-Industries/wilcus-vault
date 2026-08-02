@@ -200,8 +200,10 @@ Every programmatic write goes through `vault.propose(candidate)`:
      `updated` in its frontmatter (a textual patch, per the rule above); `supersede`
      writes the new note, adds `superseded_by` (vault-relative path) to the old
      note's frontmatter plus a **path-qualified** forward wikilink
-     (`[[customers/acme-2026]]`) — the gate knows the exact path, so its own
-     links can never go ambiguous behind a note that shares the stem;
+     (`[[customers/acme-2026]]`) — the gate knows the exact path, so a
+     namespaced successor's link cannot go ambiguous behind a note that shares
+     the stem later (a successor written to the vault root has no qualified
+     form, so its link is a bare stem and still can);
      `discard` appends the candidate
      as a JSONL line to `.vault/discarded.log` so a wrong LLM call never silently
      loses information.
@@ -231,8 +233,11 @@ rows for deleted files, drop-and-re-embed on embedding model/dims change, list
 broken links, ambiguous links, orphans, and malformed frontmatter. Broken and
 ambiguous are different problems and are reported apart: **broken** is 0
 candidates (a typo, or a note that is gone), **ambiguous** is 2+ and carries
-`candidates: string[]`, the paths that would qualify the link — the report says
-what to write, not just that something is wrong. A duplicate filename stem is
+`candidates: string[]` — link *targets*, not filenames (`customers/acme`, no
+`.md`), so the report is the fix and not merely the complaint: paste one into
+the note as `[[customers/acme]]`. (A candidate at the vault root has no
+qualified form and reads as the ambiguous stem itself; that note has to move
+into a namespace.) A duplicate filename stem is
 *not* itself reported: two namespaces holding an `acme.md` is the point of
 namespaces, and only a bare link to them is a problem.
 `--rebuild` reindexes from scratch into a temp DB file, then atomically renames it

@@ -6,7 +6,14 @@
 import type { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, renameSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { parseNote, patchFrontmatter, replaceBody, serializeNote, type Note } from "./note";
+import {
+  linkTarget,
+  parseNote,
+  patchFrontmatter,
+  replaceBody,
+  serializeNote,
+  type Note,
+} from "./note";
 import { readRaw, reindex } from "./indexer";
 import { hybridSearch, type Cutoffs } from "./search";
 import type { Embedder } from "./embed";
@@ -343,7 +350,11 @@ async function apply(
     return { action: "supersede", path: created.path, unmarked: rel };
   }
   const marked = patchFrontmatter(current, "superseded_by", created.path!);
-  const link = `Superseded by [[${linkTo(created.path!)}]].\n`;
+  // The gate knows the exact path, so it links by path rather than by stem: a
+  // namespaced successor cannot go ambiguous later. (A successor written to the
+  // vault root has no qualified form, so its link is a bare stem and *can* —
+  // DESIGN.md § Data model.)
+  const link = `Superseded by [[${linkTarget(created.path!)}]].\n`;
   await writeAtomic(abs, marked.endsWith("\n") ? `${marked}\n${link}` : `${marked}\n\n${link}`);
   return { action: "supersede", path: created.path, superseded: rel };
 }
@@ -425,12 +436,5 @@ function logCandidate(root: string, candidate: Candidate, extra: Record<string, 
   mkdirSync(dir, { recursive: true });
   appendFileSync(join(dir, "discarded.log"), `${JSON.stringify({ at: now(), candidate, ...extra })}\n`);
 }
-
-/**
- * Wikilink target of a vault-relative path: the whole path minus `.md`. The
- * gate knows the exact path, so it writes the path-qualified form — a bare
- * stem would go ambiguous the day a second namespace holds that stem.
- */
-const linkTo = (rel: string): string => rel.slice(0, -".md".length);
 
 const now = (): string => new Date().toISOString();

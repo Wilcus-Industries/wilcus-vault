@@ -34,6 +34,14 @@ export type Note = {
   malformedFrontmatter: boolean;
 };
 
+/**
+ * The path-qualified wikilink target of a vault-relative path: the path minus
+ * `.md`. What the write gate links with and what `doctor` offers as the fix for
+ * an ambiguous link, so both say the same thing. A note at the vault root has
+ * no qualified form — its path minus `.md` *is* its bare stem.
+ */
+export const linkTarget = (rel: string): string => rel.slice(0, -".md".length);
+
 /** Split a leading `---` block off the top of the file. */
 function splitFrontmatter(text: string): {
   yaml: string | null;

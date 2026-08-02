@@ -4,13 +4,19 @@ import type { Database } from "bun:sqlite";
 import { renameSync, rmSync } from "node:fs";
 import { openDb, dbPath } from "./db";
 import { reindex, readNote, scanVault } from "./indexer";
+import { linkTarget } from "./note";
 import type { Embedder } from "./embed";
 
 /** An unresolved link: `slug` is the target as written — bare stem or path. */
 export type LinkProblem = { from: string; slug: string };
 
-/** A bare-stem link several notes answer to; qualifying it with one of
- * `candidates` (`[[customers/acme]]`) is the fix. */
+/**
+ * A bare-stem link several notes answer to. `candidates` are link *targets*,
+ * not filenames (`customers/acme`, no `.md`), so writing one of them into the
+ * note as `[[customers/acme]]` is the whole fix. A candidate at the vault root
+ * has no qualified form and reads as the ambiguous stem itself — that note has
+ * to move into a namespace instead.
+ */
 export type AmbiguousLink = LinkProblem & { candidates: string[] };
 
 export type DoctorReport = {
@@ -108,9 +114,11 @@ function graphReport(db: Database): Omit<DoctorReport, "stale" | "missing" | "re
     )
     .all() as { slug: string; path: string }[];
   for (const { slug, path } of dupes) {
-    const paths = shared.get(slug);
-    if (paths) paths.push(path);
-    else shared.set(slug, [path]);
+    // stored as the link that would fix the note, not as the filename
+    const target = linkTarget(path);
+    const targets = shared.get(slug);
+    if (targets) targets.push(target);
+    else shared.set(slug, [target]);
   }
 
   const brokenLinks: LinkProblem[] = [];

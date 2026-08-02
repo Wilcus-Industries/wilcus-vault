@@ -115,7 +115,7 @@ async function run(argv: string[]): Promise<number> {
           ? "no matches"
           // score first so the ranking reads down the page, then the note's
           // identity, then what it is called
-          : hits.map((h) => `${h.score.toFixed(4)}  ${h.path} — ${h.title}`).join("\n"),
+          : hits.map((h) => safe(`${h.score.toFixed(4)}  ${h.path} — ${h.title}`)).join("\n"),
       );
     } finally {
       db.close();
@@ -143,7 +143,7 @@ async function run(argv: string[]): Promise<number> {
         onChange: (paths, stats) => {
           // An editor rewriting identical bytes is not news; a change is.
           if (stats.added || stats.updated || stats.removed) {
-            console.log(`${paths.join(" ")} — ${summary(stats)}`);
+            console.log(safe(`${paths.join(" ")} — ${summary(stats)}`));
           }
         },
       });
@@ -177,6 +177,14 @@ function interrupted(): Promise<void> {
   });
 }
 
+/**
+ * Every string the CLI echoes is note-controlled — a filename, a title, a link
+ * target a human (or an LLM) wrote. A bare `\r` or an ESC sequence in one of
+ * them would rewrite the line the terminal has already drawn, so control
+ * characters print as `?`; the newlines the CLI itself writes are added after.
+ */
+const safe = (line: string): string => line.replace(/\p{Cc}/gu, "?");
+
 function print(r: DoctorReport): void {
   const lines = [
     `reindexed ${r.stale.length} stale, purged ${r.missing.length} deleted` +
@@ -189,7 +197,7 @@ function print(r: DoctorReport): void {
     ...r.malformed.map((p) => `malformed frontmatter: ${p}`),
     ...r.orphans.map((p) => `orphan: ${p}`),
   ];
-  console.log(lines.join("\n"));
+  console.log(lines.map(safe).join("\n"));
 }
 
 if (import.meta.main) process.exit(await main(Bun.argv.slice(2)));

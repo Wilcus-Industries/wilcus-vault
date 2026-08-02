@@ -4,7 +4,7 @@ import { mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { openDb, dbPath } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
-import { reindex, scanVault, readNote } from "../src/indexer";
+import { reindex, indexPaths, scanVault, readNote } from "../src/indexer";
 import { doctor } from "../src/doctor";
 import { makeVault, writeNote, cleanupVaults, stubEmbedder, vecOf } from "./vault-fixture";
 
@@ -88,14 +88,32 @@ test("reindex writes notes, fts rows, L2-normalized vectors and resolved edges",
   db.close();
 });
 
-test("a second reindex with nothing changed writes nothing", async () => {
+test("a pass with nothing changed writes nothing", async () => {
   const root = makeVault(FIXTURE);
   const db = open(root);
   await reindex(db, root, embedder);
   const before = changes(db);
-  const stats = await reindex(db, root, embedder);
+  // the watcher's entry point: an editor saving identical bytes must not
+  // dirty the database
+  const stats = await indexPaths(db, root, embedder, scanVault(root));
   expect(stats).toEqual({ added: 0, updated: 0, removed: 0, unchanged: 3, reembedded: false });
   expect(changes(db)).toBe(before);
+  db.close();
+});
+
+test("reindex re-resolves every edge, even when no file changed", async () => {
+  // An index written under an older resolution rule holds `to_id` values that
+  // rule produced, and nothing on disk has to change for them to be wrong:
+  // `[[one/dup]]` was unresolvable before this rule and is exact under it. The
+  // whole-vault pass is the only place that can notice.
+  const root = makeVault({ "hub.md": "# Hub\n\n[[one/dup]]\n", "one/dup.md": "# Dup one\n" });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  db.run("update edges set to_id = null"); // an index built before the rule
+  expect(await reindex(db, root, embedder)).toMatchObject({ added: 0, updated: 0, unchanged: 2 });
+  expect(
+    db.query("select n.path from edges e join notes n on n.id = e.to_id").get(),
+  ).toEqual({ path: "one/dup.md" });
   db.close();
 });
 
@@ -252,9 +270,13 @@ test("a note with no tokens gets no vector row, and stays indexed and idempotent
     c: 1,
   });
   expect(db.query("select count(*) as c from notes_fts where rowid = ?").get(id)).toEqual({ c: 1 });
-  // must not look half-indexed on the next pass
+  // must not look half-indexed on the next pass (measured on `indexPaths`:
+  // `reindex` re-resolves edges on every run by design)
   const before = changes(db);
-  expect(await reindex(db, root, embedder)).toMatchObject({ unchanged: 2, updated: 0 });
+  expect(await indexPaths(db, root, embedder, scanVault(root))).toMatchObject({
+    unchanged: 2,
+    updated: 0,
+  });
   expect(changes(db)).toBe(before);
   db.close();
 });

@@ -42,8 +42,10 @@ test("doctor separates broken links from ambiguous ones and names the candidates
   // 0 candidates is a typo or a deleted note; 2+ is a link that needs
   // qualifying, and the report says what to qualify it with
   expect(report.brokenLinks).toEqual([{ from: "notes/acme.md", slug: "ghost" }]);
+  // candidates are written as links, not as filenames: the report's fix is
+  // paste-able straight into the note ([[one/dup]])
   expect(report.ambiguousLinks).toEqual([
-    { from: "notes/acme.md", slug: "dup", candidates: ["one/dup.md", "two/dup.md"] },
+    { from: "notes/acme.md", slug: "dup", candidates: ["one/dup", "two/dup"] },
   ]);
   expect(report.orphans).toEqual(["notes/lonely.md", "one/dup.md", "two/dup.md"]);
   expect(report.malformed).toEqual([]);

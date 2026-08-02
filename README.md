@@ -76,13 +76,21 @@ file, subdirectories as namespaces.
 Links resolve the way Obsidian resolves them, namespace-aware:
 
 - `[[customers/acme]]` — a path-qualified link: the vault-relative path without
-  `.md`. Always unambiguous, whatever else the vault holds. Prefer it, and it is
-  what the write gate writes;
+  `.md`. Always unambiguous, whatever else the vault holds. Prefer it; it is what
+  the write gate writes for a note in a namespace (a note at the vault root has
+  no qualified form — its path without `.md` *is* its stem — so keep notes you
+  link to in namespaces);
 - `[[acme]]` — a bare stem: resolves only while exactly one note in the vault is
   named `acme.md`. `customers/acme.md` and `vendors/acme.md` are two perfectly
   good notes, but a bare `[[acme]]` between them means nothing, so it stays
   unresolved rather than picking one. `vault doctor` lists it as ambiguous with
-  both paths; qualify it and it resolves.
+  both candidates, written as links, so the fix is a copy-paste:
+
+```
+$ vault doctor
+ambiguous link: notes/deal.md -> [[acme]] (customers/acme, vendors/acme)
+broken link:    notes/deal.md -> [[ghots]]
+```
 
 Obsidian hides dot-directories, so `.vault/` stays out of the way; the scan skips
 it (and `.git/`, `.obsidian/`, …) for the same reason. If the vault is a git repo,
