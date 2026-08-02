@@ -26,7 +26,8 @@ src/
   gate.ts    # write gate: top-k similar → decider → update|supersede|create|discard
   watch.ts   # fs.watch + debounce + hash dirty-check → reindex changed files
   vault.ts   # Vault facade (public API), incl. the direct reads: get(path), list(prefix?)
-  cli.ts     # vault doctor|reindex|search|watch
+  cli.ts     # vault doctor|reindex|search|watch — FetchEmbedder by default,
+             # --lexical for the offline (TokenOverlap) one
 ```
 
 `indexer.ts` has one write path, `indexPaths(paths)`: hash-diff those paths,
@@ -125,8 +126,10 @@ distinct terms — a whole note body is a legitimate query (the write gate passe
 one) but not a legitimate 400-term MATCH. If FTS5 rejects a query anyway, that
 signal drops out and the search continues on vectors alone. The cutoffs are the
 caller's policy — there is no default, because the ceiling that means
-"irrelevant" is a property of the embedder, and the `vault search` CLI
-(bag-of-tokens embedder) has no meaningful fixed one. Both are upper bounds on a
+"irrelevant" is a property of the embedder, so the `vault search`
+CLI sets none: it cannot know the ceiling for whichever provider is configured,
+and under `--lexical` (bag-of-tokens) there is no meaningful fixed one to know.
+Both are upper bounds on a
 lower-is-better quantity: cosine distance, and FTS5's negative `rank`. They live
 in one `cutoffs` option so a caller has to decide about them rather than inherit
 silence.
@@ -201,6 +204,12 @@ whatever holds `:11434`":
   that is merely not running. An endpoint the caller chose (a vLLM on `:8000`)
   surfaces its own error instead, and a timeout means something *is* listening
   and is reported as itself.
+
+The CLI is a caller like any other: every command builds that same defaulted
+`FetchEmbedder`, and `--lexical` substitutes `TokenOverlapEmbedder` for a machine
+with no daemon (and for the suite, so CI needs no Ollama). Either way a bad
+configuration or an unreachable endpoint reaches the user as the one sentence it
+was written as, and exit 1 — `main` prints `e.message`, never a stack.
 
 Requests are batched by text count *and* by characters, since a
 whole-note payload is what actually blows a provider's per-request limit. Notes

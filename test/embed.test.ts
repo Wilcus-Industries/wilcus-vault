@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import { FetchEmbedder, TokenOverlapEmbedder, l2normalize, type FetchEmbedderOptions } from "../src/embed";
+import { withEnv } from "./vault-fixture";
 
 const KEY = "sk-test-do-not-log-me";
 
@@ -9,26 +10,6 @@ const failure = (p: Promise<unknown>): Promise<Error> =>
     () => new Error("did not throw"),
     (e: Error) => e,
   );
-
-/**
- * Run `fn` with the `VAULT_EMBED_*` environment set to exactly `env` — every
- * other one unset, so a developer's own shell cannot decide what the defaults
- * test sees — then put the real environment back.
- */
-function withEnv<T>(env: Record<string, string>, fn: () => T): T {
-  const names = ["VAULT_EMBED_API_KEY", "VAULT_EMBED_ENDPOINT", "VAULT_EMBED_MODEL", "VAULT_EMBED_DIMS"];
-  const prev = names.map((n) => [n, process.env[n]] as const);
-  try {
-    for (const n of names) delete process.env[n];
-    for (const [n, v] of Object.entries(env)) process.env[n] = v;
-    return fn();
-  } finally {
-    for (const [n, v] of prev) {
-      if (v === undefined) delete process.env[n];
-      else process.env[n] = v;
-    }
-  }
-}
 
 /** A fetch stub that records its calls and answers with `dims`-wide vectors. */
 function stubFetch(dims: number, reply?: (input: string[]) => Response) {

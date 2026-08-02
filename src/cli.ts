@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { openDb, dbPath } from "./db";
 import { reindex, type IndexStats } from "./indexer";
 import { doctor, type DoctorReport } from "./doctor";
-import { TokenOverlapEmbedder } from "./embed";
+import { FetchEmbedder, TokenOverlapEmbedder } from "./embed";
 import { hybridSearch } from "./search";
 import { watch } from "./watch";
 
@@ -15,8 +15,15 @@ const USAGE = `vault <command> [options]
   watch               index every change as it is saved, until interrupted
 
   --vault <dir>       vault root (default: the current directory)
+  --lexical           embed offline, without a provider (see below)
   --help, -h          this text
   --                  end of flags, so a search query may start with a dash
+
+Notes embed on a local Ollama unless VAULT_EMBED_* names another
+OpenAI-compatible provider: run \`ollama pull all-minilm\` once, or pass
+--lexical for a deterministic bag-of-tokens embedder that needs nothing
+running — no network, and no semantics either. Switching between them
+re-embeds the vault, since they are different vector spaces.
 
 Exit code 0 on success, 1 on error — and 1 from doctor when it found links
 only a human can fix: broken (nothing to point at) or ambiguous (a bare
@@ -43,11 +50,13 @@ function parseArgs(argv: string[]): {
   root: string;
   words: string[];
   rebuild: boolean;
+  lexical: boolean;
   help: boolean;
 } {
   const words: string[] = [];
   let root = process.cwd();
   let rebuild = false;
+  let lexical = false;
   let help = false;
   let literal = false;
   for (let i = 0; i < argv.length; i++) {
@@ -60,6 +69,8 @@ function parseArgs(argv: string[]): {
       help = true;
     } else if (arg === "--rebuild") {
       rebuild = true;
+    } else if (arg === "--lexical") {
+      lexical = true;
     } else if (arg !== "--vault") {
       throw new Error(`unknown flag ${arg}\n\n${USAGE}`);
     } else {
@@ -72,13 +83,13 @@ function parseArgs(argv: string[]): {
       root = dir;
     }
   }
-  return { root, words, rebuild, help };
+  return { root, words, rebuild, lexical, help };
 }
 
 const COMMANDS = ["reindex", "doctor", "search", "watch"] as const;
 
 async function run(argv: string[]): Promise<number> {
-  const { root, words, rebuild, help } = parseArgs(argv);
+  const { root, words, rebuild, lexical, help } = parseArgs(argv);
   // Help was asked for, so answering it is a success — `vault --help | less`
   // reads it, and a script checking the exit code is not told it failed.
   if (help) {
@@ -90,9 +101,13 @@ async function run(argv: string[]): Promise<number> {
     console.error(command === undefined ? USAGE : `unknown command ${command}\n\n${USAGE}`);
     return 1;
   }
-  // The CLI embeds in-process: no daemon to start, and no note text leaves the
-  // machine unless a library caller points FetchEmbedder at a remote provider.
-  const embedder = new TokenOverlapEmbedder();
+  // The CLI embeds in-process against the same embedder the library documents:
+  // FetchEmbedder resolves its own configuration (VAULT_EMBED_*, else a local
+  // Ollama), so no note text leaves the machine unless the environment points it
+  // at a remote provider. `--lexical` is the escape hatch for a machine with no
+  // daemon — deterministic, offline, and lexical only. Whichever it is, a bad
+  // configuration throws here, before a database is opened, and `main` prints it.
+  const embedder = lexical ? new TokenOverlapEmbedder() : new FetchEmbedder();
 
   if (command === "search") {
     const query = rest.join(" ");
@@ -105,10 +120,11 @@ async function run(argv: string[]): Promise<number> {
         console.log("vault is not indexed (run vault reindex)");
         return 0;
       }
-      // No relevance cutoffs here: against a bag-of-tokens embedder no fixed
-      // cosine ceiling is meaningful (a one-word query is far from every long
-      // note by construction), so the CLI shows the ranking and lets the
-      // reader judge. Library callers with a real embedder pass their own.
+      // No relevance cutoffs here: the ceiling that means "irrelevant" is a
+      // property of the embedder — unknowable for whichever provider is
+      // configured, and meaningless under --lexical (a one-word query is far
+      // from every long note by construction) — so the CLI shows the ranking
+      // and lets the reader judge. Library callers pass their own.
       const hits = await hybridSearch(db, embedder, query);
       console.log(
         hits.length === 0
