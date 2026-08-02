@@ -49,6 +49,19 @@ when it found links only a human can fix: broken (nothing to point at) or
 ambiguous (a bare `[[stem]]` several notes answer to — `doctor` prints the
 candidate paths, and qualifying the link with one of them is the fix).
 
+Every command embeds through the zero-config default described under
+[Embedders](#embedders): a local Ollama (`all-minilm`, 384 dims), or whatever
+`VAULT_EMBED_*` points at. Run `ollama pull all-minilm` once; with nothing
+listening the command says so in one line — `no embedder configured: start
+Ollama ...` — and exits 1, rather than quietly falling back to a cloud API.
+
+`--lexical` swaps in the deterministic `TokenOverlapEmbedder` instead: no
+daemon, no network, and no semantics either — for an offline machine, and what
+the test suite runs on. The two are different vector spaces, so switching costs
+a full re-embed: `reindex`, `doctor` and `watch` do it on their next pass, and
+`search` refuses in the meantime (`... — run vault doctor to re-embed`) rather
+than compare vectors that are not comparable.
+
 ```
 $ vault search renewal terms
 0.0328  customers/acme.md — Acme Corp
@@ -56,9 +69,10 @@ $ vault search renewal terms
 ```
 
 One line per hit: fused RRF score, vault-relative path, title. The CLI sets no
-relevance cutoffs — no fixed cosine ceiling is meaningful for the bag-of-tokens
-embedder — so it shows the ranking and lets you judge it. Library callers with a
-real embedder pass their own (`cutoffs`), and the write gate must.
+relevance cutoffs — the ceiling that means "irrelevant" is a property of the
+embedder, and it cannot know yours (under `--lexical` no fixed one is meaningful
+at all) — so it shows the ranking and lets you judge it. Library callers pass
+their own (`cutoffs`), and the write gate must.
 
 `vault watch` reindexes once, then follows `fs.watch` (recursive) with a ~250ms
 per-path debounce, re-embedding only notes whose content hash actually changed.
@@ -198,11 +212,11 @@ sits on.
 An `Embedder` is `{ model, dims, embed(texts) }` and is always injected — the
 vault never hardcodes a provider. Two ship:
 
-- `TokenOverlapEmbedder` — deterministic bag-of-tokens, no network. What the CLI
-  and the test suite use: it exercises the plumbing, not semantics.
 - `FetchEmbedder` — any OpenAI-compatible `POST /v1/embeddings`. Unconfigured it
   is a local Ollama (`all-minilm`, 384 dims, no API key), so the zero-config
-  default keeps every note on your machine.
+  default keeps every note on your machine. What the CLI uses.
+- `TokenOverlapEmbedder` — deterministic bag-of-tokens, no network. What the test
+  suite and `vault --lexical` use: it exercises the plumbing, not semantics.
 
 ```ts
 import { open, FetchEmbedder } from "@wilcus/vault";

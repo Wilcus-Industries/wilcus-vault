@@ -7,6 +7,7 @@ import type { Database } from "bun:sqlite";
 import { watch as fsWatch } from "node:fs";
 import { indexPaths, isNotePath, reindex, type IndexStats } from "./indexer";
 import type { Embedder } from "./embed";
+import { printable } from "./term";
 
 export type WatchOptions = {
   /** quiet period per path before it is indexed (default 250ms) */
@@ -155,5 +156,8 @@ export function watch(
 }
 
 function logError(error: unknown): void {
-  console.error(`vault watch: ${error instanceof Error ? error.message : String(error)}`);
+  // A malformed note and a provider's error body both land here, and this runs
+  // for a whole watching session: an escape sequence in one would own the
+  // terminal for the rest of it.
+  console.error(`vault watch: ${printable(error)}`);
 }

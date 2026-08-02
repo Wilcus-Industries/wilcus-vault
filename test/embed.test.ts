@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import { FetchEmbedder, TokenOverlapEmbedder, l2normalize, type FetchEmbedderOptions } from "../src/embed";
+import { withEnv } from "./vault-fixture";
 
 const KEY = "sk-test-do-not-log-me";
 
@@ -9,26 +10,6 @@ const failure = (p: Promise<unknown>): Promise<Error> =>
     () => new Error("did not throw"),
     (e: Error) => e,
   );
-
-/**
- * Run `fn` with the `VAULT_EMBED_*` environment set to exactly `env` — every
- * other one unset, so a developer's own shell cannot decide what the defaults
- * test sees — then put the real environment back.
- */
-function withEnv<T>(env: Record<string, string>, fn: () => T): T {
-  const names = ["VAULT_EMBED_API_KEY", "VAULT_EMBED_ENDPOINT", "VAULT_EMBED_MODEL", "VAULT_EMBED_DIMS"];
-  const prev = names.map((n) => [n, process.env[n]] as const);
-  try {
-    for (const n of names) delete process.env[n];
-    for (const [n, v] of Object.entries(env)) process.env[n] = v;
-    return fn();
-  } finally {
-    for (const [n, v] of prev) {
-      if (v === undefined) delete process.env[n];
-      else process.env[n] = v;
-    }
-  }
-}
 
 /** A fetch stub that records its calls and answers with `dims`-wide vectors. */
 function stubFetch(dims: number, reply?: (input: string[]) => Response) {
@@ -142,8 +123,12 @@ test("FetchEmbedder reports a non-JSON body instead of throwing a parse error", 
 });
 
 test("FetchEmbedder refuses nonsense dims at construction", () => {
-  expect(() => new FetchEmbedder({ apiKey: KEY, dims: 0 })).toThrow(/dims/);
-  expect(() => new FetchEmbedder({ apiKey: KEY, dims: 1.5 })).toThrow(/dims/);
+  // inside withEnv like every other construction here: a developer shell with
+  // VAULT_EMBED_ENDPOINT set would otherwise make these fail on the key instead
+  withEnv({}, () => {
+    expect(() => new FetchEmbedder({ apiKey: KEY, dims: 0 })).toThrow(/dims/);
+    expect(() => new FetchEmbedder({ apiKey: KEY, dims: 1.5 })).toThrow(/dims/);
+  });
   withEnv({ VAULT_EMBED_DIMS: "wide" }, () => {
     expect(() => new FetchEmbedder({ apiKey: KEY })).toThrow(/dims/);
   });
@@ -223,12 +208,18 @@ test("FetchEmbedder makes a remote endpoint name its model and dims", () => {
   });
 });
 
-test("FetchEmbedder says which setting holds a malformed endpoint", () => {
+test("FetchEmbedder says which setting holds a malformed endpoint, never its value", () => {
+  // an endpoint may carry `user:password@`, and this message is printed, logged
+  // and pasted into bug reports: it names where to look, not what is there
+  const secret = "localhost:11434/x?token=sk-not-a-real-key";
   withEnv({}, () => {
-    expect(() => new FetchEmbedder({ endpoint: "localhost:11434" })).toThrow(/invalid endpoint.*localhost:11434/s);
+    const thrown = () => new FetchEmbedder({ endpoint: secret });
+    expect(thrown).toThrow(/invalid endpoint/);
+    expect(thrown).not.toThrow(/sk-not-a-real-key/);
   });
-  withEnv({ VAULT_EMBED_ENDPOINT: "localhost:11434" }, () => {
-    expect(() => new FetchEmbedder()).toThrow(/invalid VAULT_EMBED_ENDPOINT.*localhost:11434/s);
+  withEnv({ VAULT_EMBED_ENDPOINT: secret }, () => {
+    expect(() => new FetchEmbedder()).toThrow(/invalid VAULT_EMBED_ENDPOINT/);
+    expect(() => new FetchEmbedder()).not.toThrow(/sk-not-a-real-key/);
   });
 });
 

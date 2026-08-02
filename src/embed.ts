@@ -52,13 +52,16 @@ const NO_EMBEDDER =
  * Vets a configured endpoint and answers whether it is on this machine (which
  * is what decides that no API key is required to reach it). `localhost:11434`
  * — the plausible typo — *parses*, as the scheme `localhost:` with no host at
- * all, so a hostname is checked for rather than left to `new URL` to reject;
- * and the message names the setting to go and fix.
+ * all, so a hostname is checked for rather than left to `new URL` to reject.
+ *
+ * The message names the setting to go and fix but never quotes its value: a
+ * URL may carry `user:password@`, and this error is printed, logged and pasted
+ * into bug reports. The setting is where the reader can read it themselves.
  */
 function isLocal(endpoint: string, setting: string): boolean {
   const url = URL.parse(endpoint);
   if (url === null || !["http:", "https:"].includes(url.protocol) || url.hostname === "") {
-    throw new Error(`FetchEmbedder: invalid ${setting}: ${endpoint} — expected an http(s) URL`);
+    throw new Error(`FetchEmbedder: invalid ${setting} — expected an http(s) URL with a host`);
   }
   return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
 }

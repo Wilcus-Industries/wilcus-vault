@@ -273,29 +273,31 @@ test("vault search prints ranked hits", async () => {
   const err = spyOn(console, "error").mockImplementation(() => {});
   const said = () => log.mock.calls.flat().join("\n");
   try {
-    expect(await main(["search", "INV-2031", "--vault", root])).toBe(0);
+    // --lexical throughout: it is the embedder `indexed` built these vectors
+    // with, and it keeps the suite off any provider
+    expect(await main(["search", "INV-2031", "--lexical", "--vault", root])).toBe(0);
     expect(said()).toContain("ledger/invoice-2031.md");
 
     // the flag and its value are consumed wherever they sit, and never become
     // query words — this must find the same note as the line above
     log.mockClear();
-    expect(await main(["search", "--vault", root, "INV-2031"])).toBe(0);
+    expect(await main(["search", "--vault", root, "--lexical", "INV-2031"])).toBe(0);
     expect(said()).toContain("ledger/invoice-2031.md");
 
     log.mockClear();
-    expect(await main(["search", "🙂", "--vault", root])).toBe(0); // no signal either side
+    expect(await main(["search", "🙂", "--lexical", "--vault", root])).toBe(0); // no signal either side
     expect(said()).toBe("no matches");
 
     // an unindexed vault is not the same answer as "nothing matched"
     log.mockClear();
     const { root: emptyRoot } = await indexed({});
-    expect(await main(["search", "acme", "--vault", emptyRoot])).toBe(0);
+    expect(await main(["search", "acme", "--lexical", "--vault", emptyRoot])).toBe(0);
     expect(said()).toMatch(/not indexed.*reindex/);
 
-    expect(await main(["search", "--vault", root])).toBe(1); // no query at all
+    expect(await main(["search", "--lexical", "--vault", root])).toBe(1); // no query at all
     // an error is a message, not a stack trace
     err.mockClear();
-    expect(await main(["search", "acme", "--sideways", "--vault", root])).toBe(1);
+    expect(await main(["search", "acme", "--sideways", "--lexical", "--vault", root])).toBe(1);
     expect(err.mock.calls.flat().join("\n")).toContain("--sideways");
   } finally {
     log.mockRestore();

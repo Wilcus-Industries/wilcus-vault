@@ -18,7 +18,9 @@ no YAML dependency.
 src/
   note.ts    # parse/serialize a note: frontmatter (Bun.YAML), wikilinks, sha256 hash,
              # textual frontmatter patch for files we did not author
-  db.ts      # open DB (WAL, busy_timeout), load sqlite-vec, schema/migrations
+  db.ts      # open DB (WAL, busy_timeout), load sqlite-vec, schema/migrations,
+             # vectorsStale (read-only) / resetVectors (destructive)
+  term.ts    # scrub control characters out of anything echoed to a terminal
   embed.ts   # Embedder interface + deterministic test embedder + fetch-based API embedder
   indexer.ts # scan vault dir, hash-diff, upsert notes/fts/vectors, rewrite edges
   doctor.ts  # drift report + repair + --rebuild into a temp DB, renamed into place
@@ -26,7 +28,8 @@ src/
   gate.ts    # write gate: top-k similar → decider → update|supersede|create|discard
   watch.ts   # fs.watch + debounce + hash dirty-check → reindex changed files
   vault.ts   # Vault facade (public API), incl. the direct reads: get(path), list(prefix?)
-  cli.ts     # vault doctor|reindex|search|watch
+  cli.ts     # vault doctor|reindex|search|watch — FetchEmbedder by default,
+             # --lexical for the offline (TokenOverlap) one
 ```
 
 `indexer.ts` has one write path, `indexPaths(paths)`: hash-diff those paths,
@@ -125,8 +128,10 @@ distinct terms — a whole note body is a legitimate query (the write gate passe
 one) but not a legitimate 400-term MATCH. If FTS5 rejects a query anyway, that
 signal drops out and the search continues on vectors alone. The cutoffs are the
 caller's policy — there is no default, because the ceiling that means
-"irrelevant" is a property of the embedder, and the `vault search` CLI
-(bag-of-tokens embedder) has no meaningful fixed one. Both are upper bounds on a
+"irrelevant" is a property of the embedder, so the `vault search`
+CLI sets none: it cannot know the ceiling for whichever provider is configured,
+and under `--lexical` (bag-of-tokens) there is no meaningful fixed one to know.
+Both are upper bounds on a
 lower-is-better quantity: cosine distance, and FTS5's negative `rank`. They live
 in one `cutoffs` option so a caller has to decide about them rather than inherit
 silence.
@@ -201,6 +206,27 @@ whatever holds `:11434`":
   that is merely not running. An endpoint the caller chose (a vLLM on `:8000`)
   surfaces its own error instead, and a timeout means something *is* listening
   and is reported as itself.
+
+The CLI is a caller like any other: every command builds that same defaulted
+`FetchEmbedder`, and `--lexical` substitutes `TokenOverlapEmbedder` for a machine
+with no daemon (and for the suite, so CI needs no Ollama). Either way a bad
+configuration or an unreachable endpoint reaches the user as the one sentence it
+was written as, and exit 1 — never a stack, and never raw: an error now quotes a
+provider's response body, so it goes through `term.ts` like every other
+untrusted string the vault prints (`safe`/`printable` — control characters
+become `?`, so nothing can redraw the terminal's last line).
+
+**A model swap does not destroy anything until its replacements exist.**
+Staleness is *detected* read-only (`vectorsStale`) before `embed` is called, and
+the drop-and-recreate (`resetVectors`) runs inside the write transaction that
+files the new vectors. Embedding is a network call that fails for ordinary
+reasons — the daemon is not running, `--lexical` and the default were swapped —
+and the old order left the vault with an empty `vectors` table, an empty
+`vector_meta` and nothing recording that a re-embed was owed: `search` would
+then quietly answer on FTS alone, at exit 0. Now a failed swap rolls back whole,
+and `search` keeps refusing stale vectors until a pass has actually replaced
+them. (`doctor --rebuild` was always safe — it builds a temp DB and renames it
+into place.)
 
 Requests are batched by text count *and* by characters, since a
 whole-note payload is what actually blows a provider's per-request limit. Notes

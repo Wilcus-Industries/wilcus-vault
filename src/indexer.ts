@@ -4,7 +4,7 @@ import type { Database } from "bun:sqlite";
 import { lstatSync, readdirSync, type Stats } from "node:fs";
 import { join, relative } from "node:path";
 import { parseNote, type Note } from "./note";
-import { ensureVectors } from "./db";
+import { resetVectors, vectorsStale } from "./db";
 import { l2normalize, type Embedder } from "./embed";
 
 export type IndexStats = {
@@ -119,7 +119,11 @@ export async function indexPaths(
   embedder: Embedder,
   rels: Iterable<string>,
 ): Promise<IndexStats> {
-  const reembedded = ensureVectors(db, embedder);
+  // Only asked here, never acted on: the vectors this invalidates are the ones
+  // the vault searches with until the replacements exist, and `embed` below is
+  // a network call that fails for ordinary reasons. The drop happens in the
+  // write transaction, with the new vectors in hand.
+  const reembedded = vectorsStale(db, embedder);
   const rows = db.query(`select id, path, hash from notes`).all() as {
     id: number;
     path: string;
@@ -190,6 +194,9 @@ export async function indexPaths(
     returning id`);
 
   db.transaction(() => {
+    // Now: the replacements are embedded and validated, and a failure from here
+    // on rolls the drop back with everything else.
+    resetVectors(db, embedder, reembedded);
     for (const [i, { note, mtime }] of dirty.entries()) {
       const supersededBy = note.frontmatter["superseded_by"];
       const { id } = upsert.get(

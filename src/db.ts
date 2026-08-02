@@ -56,17 +56,24 @@ function migrate(db: Database): void {
 }
 
 /**
- * Create the vec0 table lazily — its dims live in the DDL, so they come from
- * the embedder. A change of model *or* dims invalidates every stored vector:
- * drop the table and clear the meta so the indexer re-embeds. Returns true
- * when that happened.
+ * dims reach the vec0 DDL by interpolation (vec0 cannot bind them), so an
+ * injected embedder does not get to write SQL. Checked before either half of
+ * the swap, so a nonsense embedder fails before a vault is embedded against it.
  */
-export function ensureVectors(db: Database, embedder: Embedder): boolean {
-  // dims reach the DDL by interpolation (vec0 can't bind them), so an injected
-  // embedder does not get to write SQL.
+function checkDims(embedder: Embedder): void {
   if (!Number.isInteger(embedder.dims) || embedder.dims < 1 || embedder.dims > 8192) {
     throw new Error(`embedder ${embedder.model}: dims must be an integer in 1..8192`);
   }
+}
+
+/**
+ * Is every stored vector invalid — a different model, or a table of a different
+ * width than this embedder returns? **Read-only, deliberately**: answering this
+ * is what a caller does *before* embedding, and the answer is worthless if
+ * asking for it has already thrown the old vectors away. See `resetVectors`.
+ */
+export function vectorsStale(db: Database, embedder: Embedder): boolean {
+  checkDims(embedder);
   const staleModel =
     db
       .query(`select 1 from vector_meta where model <> ? or dims <> ? limit 1`)
@@ -75,8 +82,20 @@ export function ensureVectors(db: Database, embedder: Embedder): boolean {
     | { sql: string }
     | null;
   const currentDims = Number(existing?.sql.match(/float\[(\d+)\]/)?.[1] ?? 0);
-  const wiped = staleModel || (existing != null && currentDims !== embedder.dims);
-  if (wiped) {
+  return staleModel || (existing != null && currentDims !== embedder.dims);
+}
+
+/**
+ * Bring the vec0 table into line with `embedder`. `stale` (what `vectorsStale`
+ * said) drops it and clears the meta — its rows belong to another vector space
+ * — and is destructive, so call it with the replacement vectors already in
+ * hand and inside the transaction that writes them: a re-embed that never
+ * arrives must not leave a vault with no vectors and nothing saying so.
+ * Otherwise the table is created only if it is missing; its dims are its DDL.
+ */
+export function resetVectors(db: Database, embedder: Embedder, stale: boolean): void {
+  checkDims(embedder);
+  if (stale) {
     db.run(`drop table if exists vectors`);
     db.run(`delete from vector_meta`);
   }
@@ -84,5 +103,4 @@ export function ensureVectors(db: Database, embedder: Embedder): boolean {
     note_id integer primary key,
     emb float[${embedder.dims}] distance_metric=cosine
   )`);
-  return wiped;
 }
