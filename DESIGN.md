@@ -126,14 +126,30 @@ Unconfigured, `FetchEmbedder` is **local**: `http://localhost:11434/v1/embedding
 with `all-minilm` at 384 dims — Ollama's OpenAI-compatible route, so the default
 costs no dependency and no note ever leaves the machine. A cloud provider is
 supported but never inherited: whole note bodies leave the machine on every
-embed, so that is a choice a caller makes explicitly (and then supplies `model`
-and `dims` for — the defaults describe the local model). An endpoint on
-localhost needs no API key; any other endpoint refuses to construct without one.
-When nothing answers at a local endpoint the first request fails with
-"no embedder configured: start Ollama (`ollama pull all-minilm`) or configure a
-remote provider" — one attempt, no retry, and no fallback to a remote provider,
-which would ship note bodies off the machine to fix a daemon that is merely not
-running. A timeout means something *is* listening and is reported as itself.
+embed, so that is a choice a caller makes explicitly — and one it spells out,
+since a **remote endpoint must name its `model` and `dims`** (option or env).
+The defaults describe the local model; inheriting them would post note bodies
+under a model name the provider never heard of and file the answer as if it
+were that vector space.
+
+Three rules follow from "the default endpoint is nobody's choice, it is just
+whatever holds `:11434`":
+
+- **Keys are not adopted by it.** A `VAULT_EMBED_API_KEY` in the environment was
+  put there for someone's remote provider; the defaulted endpoint never sends
+  it, so a local process cannot harvest a cloud key. Configure an endpoint (or
+  pass `apiKey` — a local gateway may want one) and the key travels.
+- **No key is required to reach localhost**; any other endpoint refuses to
+  construct without one. A configured endpoint is validated as an http(s) URL
+  with a host, and the error names the setting that holds the bad value.
+- **"Start Ollama" is only said about that endpoint.** When nothing answers
+  there the first request fails with "no embedder configured: start Ollama
+  (`ollama pull all-minilm`) or configure a remote provider", the original
+  failure attached as its `cause` — one attempt, no retry, and no fallback to a
+  remote provider, which would ship note bodies off the machine to fix a daemon
+  that is merely not running. An endpoint the caller chose (a vLLM on `:8000`)
+  surfaces its own error instead, and a timeout means something *is* listening
+  and is reported as itself.
 
 Requests are batched by text count *and* by characters, since a
 whole-note payload is what actually blows a provider's per-request limit. Notes

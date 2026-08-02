@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { FetchEmbedder, TokenOverlapEmbedder, l2normalize } from "../src/embed";
+import { FetchEmbedder, TokenOverlapEmbedder, l2normalize, type FetchEmbedderOptions } from "../src/embed";
 
 const KEY = "sk-test-do-not-log-me";
 
@@ -182,6 +182,74 @@ test("FetchEmbedder fails fast and actionably when the local endpoint is unreach
   // silent second try against somebody's cloud API
   expect(calls).toEqual(["http://localhost:11434/v1/embeddings"]);
   expect((Bun.nanoseconds() - started) / 1e6).toBeLessThan(1_000);
+});
+
+test("FetchEmbedder zero-config never sends an ambient cloud key to localhost", async () => {
+  // A key in the environment was put there for somebody's cloud provider. The
+  // default endpoint is whatever process holds :11434 — it does not get to
+  // harvest that key just by being the default.
+  const { calls, fn } = stubFetch(384);
+  const keyless = withEnv({ VAULT_EMBED_API_KEY: KEY }, () => new FetchEmbedder({ fetch: fn }));
+  await keyless.embed(["a"]);
+  expect(calls[0]!.url).toBe("http://localhost:11434/v1/embeddings");
+  expect(JSON.stringify(calls[0]!.init.headers)).not.toContain(KEY);
+
+  // An explicit key is a deliberate choice and still travels — a local gateway
+  // (LiteLLM and friends) legitimately wants one.
+  const gateway = withEnv({}, () => new FetchEmbedder({ apiKey: KEY, fetch: fn }));
+  await gateway.embed(["a"]);
+  expect((calls[1]!.init.headers as Record<string, string>)["authorization"]).toBe(`Bearer ${KEY}`);
+
+  // ...and so is an endpoint: configure one and the environment's key is yours.
+  const configured = withEnv({ VAULT_EMBED_API_KEY: KEY }, () =>
+    new FetchEmbedder({ endpoint: "http://localhost:11434/v1/embeddings", fetch: fn }),
+  );
+  await configured.embed(["a"]);
+  expect((calls[2]!.init.headers as Record<string, string>)["authorization"]).toBe(`Bearer ${KEY}`);
+});
+
+test("FetchEmbedder makes a remote endpoint name its model and dims", () => {
+  const remote = (o: Partial<FetchEmbedderOptions> = {}) =>
+    () => new FetchEmbedder({ apiKey: KEY, endpoint: "https://api.openai.com/v1/embeddings", ...o });
+  // silently posting note bodies as all-minilm/384 is a wrong answer, not a default
+  withEnv({}, () => {
+    expect(remote()).toThrow(/model and dims/);
+    expect(remote({ model: "text-embedding-3-small" })).toThrow(/dims/);
+    expect(remote({ dims: 1536 })).toThrow(/model/);
+    expect(remote({ model: "text-embedding-3-small", dims: 1536 })).not.toThrow();
+  });
+  withEnv({ VAULT_EMBED_MODEL: "text-embedding-3-small", VAULT_EMBED_DIMS: "1536" }, () => {
+    expect(remote()).not.toThrow();
+  });
+});
+
+test("FetchEmbedder says which setting holds a malformed endpoint", () => {
+  withEnv({}, () => {
+    expect(() => new FetchEmbedder({ endpoint: "localhost:11434" })).toThrow(/invalid endpoint.*localhost:11434/s);
+  });
+  withEnv({ VAULT_EMBED_ENDPOINT: "localhost:11434" }, () => {
+    expect(() => new FetchEmbedder()).toThrow(/invalid VAULT_EMBED_ENDPOINT.*localhost:11434/s);
+  });
+});
+
+test("FetchEmbedder keeps the underlying failure as the cause of 'start Ollama'", async () => {
+  const refused = new Error("Unable to connect. Is the computer able to access the url?");
+  const fn = (async () => {
+    throw refused;
+  }) as unknown as typeof fetch;
+  const e = withEnv({}, () => new FetchEmbedder({ fetch: fn }));
+  expect((await failure(e.embed(["a"]))).cause).toBe(refused);
+});
+
+test("FetchEmbedder only says 'start Ollama' about the endpoint it chose itself", async () => {
+  // a local vLLM on :8000 is somebody's explicit choice; `ollama pull` is not
+  // the fix for it, so its own error survives
+  const refused = new Error("Unable to connect. Is the computer able to access the url?");
+  const fn = (async () => {
+    throw refused;
+  }) as unknown as typeof fetch;
+  const e = withEnv({}, () => new FetchEmbedder({ endpoint: "http://localhost:8000/v1/embeddings", fetch: fn }));
+  expect(await failure(e.embed(["a"]))).toBe(refused);
 });
 
 test("FetchEmbedder reports a hung local endpoint as a timeout, not as 'start Ollama'", async () => {
