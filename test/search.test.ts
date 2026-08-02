@@ -228,6 +228,25 @@ test("expandLinks appends one-hop neighbours below every direct hit", async () =
   db.close();
 });
 
+test("expandLinks walks a path-qualified link, past a stem two notes share", async () => {
+  // the neighbour is reached by exact path — a bare [[globex]] here would be
+  // ambiguous, resolve to nothing, and expand to nothing (the test above is
+  // the bare-stem half of this)
+  const { db } = await indexed({
+    "notes/acme-renewal.md":
+      "---\ntype: customer\n---\n# Acme renewal\n\nThe Acme renewal closes in March. Renewal pricing is agreed; Acme signs the order form. See [[vendors/globex]].\n",
+    "vendors/globex.md": EVAL_VAULT["notes/globex.md"]!,
+    "customers/globex.md": "# Globex the customer\n\nA different account with the same stem.\n",
+  });
+  const expanded = await hybridSearch(db, embedder, "acme renewal march", {
+    n: 1,
+    expandLinks: true,
+  });
+  expect(paths(expanded)).toEqual(["notes/acme-renewal.md", "vendors/globex.md"]);
+  expect(expanded[1]).toMatchObject({ expansion: true });
+  db.close();
+});
+
 test("n caps the result and an empty vault returns nothing", async () => {
   const { db } = await indexed(EVAL_VAULT);
   expect(await hybridSearch(db, embedder, "acme", { n: 2 })).toHaveLength(2);

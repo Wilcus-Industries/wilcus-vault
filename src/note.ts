@@ -6,13 +6,18 @@ import { basename } from "node:path";
 export type Note = {
   /** vault-relative path — the note's identity */
   path: string;
-  /** filename stem — the wikilink target */
+  /** filename stem — what a bare `[[stem]]` link resolves against */
   slug: string;
   title: string;
   type: string | undefined;
   frontmatter: Record<string, unknown>;
   body: string;
-  /** deduped wikilink slugs, in first-seen order */
+  /**
+   * Deduped wikilink targets as written, in first-seen order: a bare filename
+   * stem (`[[acme]]`) or a vault-relative path without its extension
+   * (`[[customers/acme]]`). Resolution is `resolveEdges`' job — a target is
+   * matched against the indexed note paths, never joined onto the filesystem.
+   */
   links: string[];
   /**
    * sha256 (hex) of `raw` re-encoded as UTF-8 — the decoded string, not the
@@ -28,6 +33,14 @@ export type Note = {
    */
   malformedFrontmatter: boolean;
 };
+
+/**
+ * The path-qualified wikilink target of a vault-relative path: the path minus
+ * `.md`. What the write gate links with and what `doctor` offers as the fix for
+ * an ambiguous link, so both say the same thing. A note at the vault root has
+ * no qualified form — its path minus `.md` *is* its bare stem.
+ */
+export const linkTarget = (rel: string): string => rel.slice(0, -".md".length);
 
 /** Split a leading `---` block off the top of the file. */
 function splitFrontmatter(text: string): {
@@ -117,7 +130,8 @@ export function parseNote(raw: string, relPath: string): Note {
   // ponytail: regex scan, no markdown parse — wikilinks and headings inside code
   // fences are counted (documented MVP simplification); parse structure if it bites.
   // Single-line and length-capped: a stray `[[` must not pair with a `]]` pages
-  // later and invent an edge.
+  // later and invent an edge. `/` is ordinary content here — a path-qualified
+  // target travels whole and is resolved as SQL, never as a filesystem path.
   const links = [
     ...new Set(
       Array.from(body.matchAll(/\[\[([^\[\]\n]{1,256})\]\]/g), (m) =>

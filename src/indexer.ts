@@ -28,7 +28,11 @@ export function scanVault(root: string): string[] {
       if (entry.name.startsWith(".") || entry.isSymbolicLink()) continue;
       const abs = join(dir, entry.name);
       if (entry.isDirectory()) walk(abs);
-      else if (entry.isFile() && entry.name.endsWith(".md")) out.push(relative(root, abs));
+      // Separators are normalized to `/`: a stored path is compared against
+      // `/`-written wikilink targets, and `relative` yields `\` on Windows.
+      else if (entry.isFile() && entry.name.endsWith(".md")) {
+        out.push(relative(root, abs).replaceAll("\\", "/"));
+      }
     }
   };
   walk(root);
@@ -78,7 +82,15 @@ export async function reindex(
   const indexed = (db.query(`select path from notes`).all() as { path: string }[]).map(
     (r) => r.path,
   );
-  return indexPaths(db, root, embedder, [...scanVault(root), ...indexed]);
+  const stats = await indexPaths(db, root, embedder, [...scanVault(root), ...indexed]);
+  // Unconditionally, unlike the pass inside `indexPaths`: an index written by
+  // an older version holds `to_id` values *that* rule produced, and no file has
+  // to change for them to be wrong. The whole-vault entry point is where a
+  // changed rule gets applied — otherwise a link that only the new rule can
+  // resolve stays broken until someone edits a note or runs `--rebuild`. The
+  // watcher's no-op pass stays writeless because it does not come through here.
+  resolveEdges(db);
+  return stats;
 }
 
 /**
@@ -187,8 +199,10 @@ export async function indexPaths(
         note.body,
       ]);
       db.run(`delete from edges where from_id = ?`, [id]);
-      for (const slug of note.links) {
-        db.run(`insert or ignore into edges (from_id, to_slug) values (?, ?)`, [id, slug]);
+      // `to_slug` holds the link as written — a bare stem or a path; see
+      // `resolveEdges` for how each is resolved.
+      for (const target of note.links) {
+        db.run(`insert or ignore into edges (from_id, to_slug) values (?, ?)`, [id, target]);
       }
       db.run(`delete from vectors where note_id = ?`, [id]);
       // A note with no tokens the embedder recognises (CJK, emoji, empty)
@@ -231,15 +245,27 @@ export function purgeNote(db: Database, id: number): void {
 }
 
 /**
- * Resolve every wikilink by exact stem match — a slug is never path-joined.
- * Exactly one match wins; zero or several leave to_id null for doctor to
- * report. Recomputed wholesale because adding or removing *any* note can flip
- * a link either way, including links in notes that did not themselves change.
- * ponytail: rewrites every edge on any change — scope it to the touched slugs
+ * Resolve every wikilink, namespace-aware (DESIGN.md § Data model). A target
+ * carrying a `/` is a **path**: it matches one note's vault-relative path minus
+ * its `.md`, exactly, so `[[customers/acme]]` and `[[vendors/acme]]` are two
+ * different notes. A target without one is a **bare stem**: it resolves only
+ * when exactly one note in the vault carries that filename stem — several
+ * candidates leave `to_id` null (ambiguous) rather than picking a winner, which
+ * is the only answer that cannot silently point at the wrong note.
+ *
+ * Both branches are SQL against paths the scan already found: a link is never
+ * joined onto the filesystem, so `[[../../etc/passwd]]` is not a traversal, it
+ * is a string that matches no row.
+ *
+ * Recomputed wholesale because adding or removing *any* note can flip a link
+ * either way, including links in notes that did not themselves change.
+ * ponytail: rewrites every edge on any change — scope it to the touched targets
  * if a vault ever gets big enough for that to show up.
  */
 export function resolveEdges(db: Database): void {
-  db.run(`update edges set to_id = (
-    select min(n.id) from notes n where n.slug = edges.to_slug having count(*) = 1
-  )`);
+  db.run(`update edges set to_id = case
+    when instr(to_slug, '/') > 0
+      then (select n.id from notes n where n.path = edges.to_slug || '.md')
+      else (select min(n.id) from notes n where n.slug = edges.to_slug having count(*) = 1)
+  end`);
 }

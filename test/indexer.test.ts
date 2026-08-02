@@ -4,7 +4,7 @@ import { mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { openDb, dbPath } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
-import { reindex, scanVault, readNote } from "../src/indexer";
+import { reindex, indexPaths, scanVault, readNote } from "../src/indexer";
 import { doctor } from "../src/doctor";
 import { makeVault, writeNote, cleanupVaults, stubEmbedder, vecOf } from "./vault-fixture";
 
@@ -88,14 +88,32 @@ test("reindex writes notes, fts rows, L2-normalized vectors and resolved edges",
   db.close();
 });
 
-test("a second reindex with nothing changed writes nothing", async () => {
+test("a pass with nothing changed writes nothing", async () => {
   const root = makeVault(FIXTURE);
   const db = open(root);
   await reindex(db, root, embedder);
   const before = changes(db);
-  const stats = await reindex(db, root, embedder);
+  // the watcher's entry point: an editor saving identical bytes must not
+  // dirty the database
+  const stats = await indexPaths(db, root, embedder, scanVault(root));
   expect(stats).toEqual({ added: 0, updated: 0, removed: 0, unchanged: 3, reembedded: false });
   expect(changes(db)).toBe(before);
+  db.close();
+});
+
+test("reindex re-resolves every edge, even when no file changed", async () => {
+  // An index written under an older resolution rule holds `to_id` values that
+  // rule produced, and nothing on disk has to change for them to be wrong:
+  // `[[one/dup]]` was unresolvable before this rule and is exact under it. The
+  // whole-vault pass is the only place that can notice.
+  const root = makeVault({ "hub.md": "# Hub\n\n[[one/dup]]\n", "one/dup.md": "# Dup one\n" });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  db.run("update edges set to_id = null"); // an index built before the rule
+  expect(await reindex(db, root, embedder)).toMatchObject({ added: 0, updated: 0, unchanged: 2 });
+  expect(
+    db.query("select n.path from edges e join notes n on n.id = e.to_id").get(),
+  ).toEqual({ path: "one/dup.md" });
   db.close();
 });
 
@@ -128,7 +146,7 @@ test("edits update in place; deleted files purge every table", async () => {
   db.close();
 });
 
-test("slug resolution: zero or ambiguous stem matches leave to_id null", async () => {
+test("bare-stem resolution: zero or several stem matches leave to_id null", async () => {
   const root = makeVault({
     "a.md": "# A\n\n[[dup]] and [[nowhere]]\n",
     "one/dup.md": "# Dup one\n",
@@ -149,6 +167,59 @@ test("slug resolution: zero or ambiguous stem matches leave to_id null", async (
   ).get();
   expect(resolved).toEqual({ path: "one/dup.md" });
   expect(db.query("select to_id from edges where to_slug='nowhere'").get()).toEqual({ to_id: null });
+  db.close();
+});
+
+test("path-qualified links resolve by exact path, past a duplicated stem", async () => {
+  const root = makeVault({
+    "hub.md":
+      "# Hub\n\n[[customers/acme]], [[vendors/acme]], [[acme]], [[customers/ghost]], [[../outside/secret]]\n",
+    "customers/acme.md": "# Acme the customer\n",
+    "vendors/acme.md": "# Acme the vendor\n",
+  });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  const idOf = (path: string) =>
+    (db.query("select id from notes where path = ?").get(path) as { id: number }).id;
+  const hub = idOf("hub.md");
+
+  expect(
+    db.query("select to_slug, to_id from edges where from_id = ? order by to_slug").all(hub),
+  ).toEqual([
+    // never path-joined to the filesystem: resolution is SQL against known
+    // note paths, so a traversing target simply matches nothing
+    { to_slug: "../outside/secret", to_id: null },
+    { to_slug: "acme", to_id: null }, // bare stem, two candidates ⇒ unresolved
+    { to_slug: "customers/acme", to_id: idOf("customers/acme.md") },
+    { to_slug: "customers/ghost", to_id: null }, // qualified, but no such note
+    { to_slug: "vendors/acme", to_id: idOf("vendors/acme.md") },
+  ]);
+
+  // the bare stem resolves again once only one note carries it, and the
+  // qualified links are untouched by that
+  rmSync(join(root, "vendors", "acme.md"));
+  await reindex(db, root, embedder);
+  expect(
+    db.query("select to_id from edges where from_id = ? and to_slug = 'acme'").get(hub),
+  ).toEqual({ to_id: idOf("customers/acme.md") });
+  expect(
+    db.query("select to_id from edges where from_id = ? and to_slug = 'vendors/acme'").get(hub),
+  ).toEqual({ to_id: null });
+  db.close();
+});
+
+test("a path-qualified link is a path, not a stem: no extension, no near-miss", async () => {
+  const root = makeVault({
+    "hub.md": "# Hub\n\n[[customers/acme.md]] [[/customers/acme]] [[./customers/acme]] [[acme]]\n",
+    "customers/acme.md": "# Acme\n",
+  });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  // only the bare stem resolves here: the qualified forms are matched against
+  // `notes.path` minus its `.md`, exactly, with no normalization
+  expect(
+    db.query("select to_slug from edges where to_id is not null").all(),
+  ).toEqual([{ to_slug: "acme" }]);
   db.close();
 });
 
@@ -199,9 +270,13 @@ test("a note with no tokens gets no vector row, and stays indexed and idempotent
     c: 1,
   });
   expect(db.query("select count(*) as c from notes_fts where rowid = ?").get(id)).toEqual({ c: 1 });
-  // must not look half-indexed on the next pass
+  // must not look half-indexed on the next pass (measured on `indexPaths`:
+  // `reindex` re-resolves edges on every run by design)
   const before = changes(db);
-  expect(await reindex(db, root, embedder)).toMatchObject({ unchanged: 2, updated: 0 });
+  expect(await indexPaths(db, root, embedder, scanVault(root))).toMatchObject({
+    unchanged: 2,
+    updated: 0,
+  });
   expect(changes(db)).toBe(before);
   db.close();
 });

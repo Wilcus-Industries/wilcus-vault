@@ -6,7 +6,14 @@
 import type { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, renameSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { parseNote, patchFrontmatter, replaceBody, serializeNote, type Note } from "./note";
+import {
+  linkTarget,
+  parseNote,
+  patchFrontmatter,
+  replaceBody,
+  serializeNote,
+  type Note,
+} from "./note";
 import { readRaw, reindex } from "./indexer";
 import { hybridSearch, type Cutoffs } from "./search";
 import type { Embedder } from "./embed";
@@ -343,7 +350,11 @@ async function apply(
     return { action: "supersede", path: created.path, unmarked: rel };
   }
   const marked = patchFrontmatter(current, "superseded_by", created.path!);
-  const link = `Superseded by [[${slugOf(created.path!)}]].\n`;
+  // The gate knows the exact path, so it links by path rather than by stem: a
+  // namespaced successor cannot go ambiguous later. (A successor written to the
+  // vault root has no qualified form, so its link is a bare stem and *can* —
+  // DESIGN.md § Data model.)
+  const link = `Superseded by [[${linkTarget(created.path!)}]].\n`;
   await writeAtomic(abs, marked.endsWith("\n") ? `${marked}\n${link}` : `${marked}\n\n${link}`);
   return { action: "supersede", path: created.path, superseded: rel };
 }
@@ -386,9 +397,12 @@ async function create(
 
 /**
  * `<namespace>/<slug>.md`, confined to the vault and not already taken —
- * neither by a file nor by another note's stem, since wikilink slugs have to
- * be vault-wide unique. A collision suffixes rather than overwrites: the gate
- * does not get to lose someone else's note to a shared title.
+ * neither by a file nor by another note's stem. A collision suffixes rather
+ * than overwrites: the gate does not get to lose someone else's note to a
+ * shared title. Stems no longer *have* to be unique (`customers/acme` and
+ * `vendors/acme` are two legitimate notes), but the gate still keeps its own
+ * unique, because creating a second `acme` is what turns every human's
+ * `[[acme]]` ambiguous.
  */
 function freePath(db: Database, root: string, candidate: Candidate): { rel: string; abs: string } {
   // A title of nothing but CJK, Cyrillic or emoji slugifies to nothing — name
@@ -422,8 +436,5 @@ function logCandidate(root: string, candidate: Candidate, extra: Record<string, 
   mkdirSync(dir, { recursive: true });
   appendFileSync(join(dir, "discarded.log"), `${JSON.stringify({ at: now(), candidate, ...extra })}\n`);
 }
-
-/** Wikilink target of a vault-relative path: the filename stem. */
-const slugOf = (rel: string): string => rel.slice(rel.lastIndexOf("/") + 1, -".md".length);
 
 const now = (): string => new Date().toISOString();

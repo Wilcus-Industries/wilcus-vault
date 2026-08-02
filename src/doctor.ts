@@ -4,23 +4,32 @@ import type { Database } from "bun:sqlite";
 import { renameSync, rmSync } from "node:fs";
 import { openDb, dbPath } from "./db";
 import { reindex, readNote, scanVault } from "./indexer";
+import { linkTarget } from "./note";
 import type { Embedder } from "./embed";
 
+/** An unresolved link: `slug` is the target as written — bare stem or path. */
 export type LinkProblem = { from: string; slug: string };
+
+/**
+ * A bare-stem link several notes answer to. `candidates` are link *targets*,
+ * not filenames (`customers/acme`, no `.md`), so writing one of them into the
+ * note as `[[customers/acme]]` is the whole fix. A candidate at the vault root
+ * has no qualified form and reads as the ambiguous stem itself — that note has
+ * to move into a namespace instead.
+ */
+export type AmbiguousLink = LinkProblem & { candidates: string[] };
 
 export type DoctorReport = {
   /** files whose indexed hash is wrong or missing (reindexed when repairing) */
   stale: string[];
   /** indexed rows whose file is gone (purged when repairing) */
   missing: string[];
-  /** `[[slug]]` matching no note */
+  /** `[[target]]` matching no note at all — a typo, or a note that is gone */
   brokenLinks: LinkProblem[];
-  /** `[[slug]]` matching several notes — none of them wins */
-  ambiguousLinks: LinkProblem[];
+  /** `[[stem]]` matching several notes — none of them wins; the paths that did */
+  ambiguousLinks: AmbiguousLink[];
   /** notes with no *resolved* link in and no link out at all */
   orphans: string[];
-  /** filename stems shared by several notes: every link to them is ambiguous */
-  duplicateStems: { slug: string; paths: string[] }[];
   /** frontmatter the parser could not use — indexed anyway, whole file as body */
   malformed: string[];
   /** every note was re-embedded: the model or dims changed, or this was a rebuild */
@@ -86,16 +95,17 @@ async function diskDrift(
 function graphReport(db: Database): Omit<DoctorReport, "stale" | "missing" | "reembedded"> {
   const unresolved = db
     .query(
-      `select n.path as "from", e.to_slug as slug,
-              (select count(*) from notes m where m.slug = e.to_slug) as matches
+      `select n.path as "from", e.to_slug as slug
        from edges e join notes n on n.id = e.from_id
        where e.to_id is null
        order by n.path, e.to_slug`,
     )
-    .all() as (LinkProblem & { matches: number })[];
-  const strip = ({ from, slug }: LinkProblem): LinkProblem => ({ from, slug });
+    .all() as LinkProblem[];
 
-  const duplicateStems: DoctorReport["duplicateStems"] = [];
+  // Stems several notes share. That is legitimate — namespaces are what they
+  // are for — so it is not itself reported; it only matters as the candidate
+  // list of a *bare* link that lands on one.
+  const shared = new Map<string, string[]>();
   const dupes = db
     .query(
       `select slug, path from notes
@@ -104,22 +114,32 @@ function graphReport(db: Database): Omit<DoctorReport, "stale" | "missing" | "re
     )
     .all() as { slug: string; path: string }[];
   for (const { slug, path } of dupes) {
-    const last = duplicateStems.at(-1);
-    if (last?.slug === slug) last.paths.push(path);
-    else duplicateStems.push({ slug, paths: [path] });
+    // stored as the link that would fix the note, not as the filename
+    const target = linkTarget(path);
+    const targets = shared.get(slug);
+    if (targets) targets.push(target);
+    else shared.set(slug, [target]);
+  }
+
+  const brokenLinks: LinkProblem[] = [];
+  const ambiguousLinks: AmbiguousLink[] = [];
+  for (const link of unresolved) {
+    // A path-qualified target matches one note or none: it is never ambiguous.
+    const candidates = link.slug.includes("/") ? undefined : shared.get(link.slug);
+    if (candidates) ambiguousLinks.push({ ...link, candidates: [...candidates] });
+    else brokenLinks.push(link);
   }
 
   const paths = (sql: string): string[] =>
     (db.query(sql).all() as { path: string }[]).map((r) => r.path);
 
   return {
-    brokenLinks: unresolved.filter((l) => l.matches === 0).map(strip),
-    ambiguousLinks: unresolved.filter((l) => l.matches > 1).map(strip),
+    brokenLinks,
+    ambiguousLinks,
     orphans: paths(`select path from notes n
        where not exists (select 1 from edges e where e.from_id = n.id)
          and not exists (select 1 from edges e where e.to_id = n.id)
        order by path`),
-    duplicateStems,
     malformed: paths(`select path from notes where malformed = 1 order by path`),
   };
 }

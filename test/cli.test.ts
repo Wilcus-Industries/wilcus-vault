@@ -45,6 +45,25 @@ test("cli: reindex, doctor and doctor --rebuild", async () => {
   expect(await cli("doctor", "--rebuild", "--vault", root)).toMatchObject({ code: 1 });
 });
 
+test("cli: doctor names the candidates that would qualify an ambiguous link", async () => {
+  const root = makeVault(GRAPH);
+  const { code, out } = await cli("doctor", "--vault", root);
+  expect(code).toBe(1);
+  expect(out).toContain("broken link:    notes/acme.md -> [[ghost]]");
+  // the line is the fix: copy one candidate into the note as written
+  expect(out).toContain("ambiguous link: notes/acme.md -> [[dup]] (one/dup, two/dup)");
+});
+
+test("cli: control characters from a note never reach the terminal raw", async () => {
+  // a link target and a filename are note-controlled strings; a bare \r or ESC
+  // in one would rewrite the line the CLI just printed
+  const root = makeVault({ "notes/evil.md": "# Evil\n\n[[gh\rostX]]\n" });
+  const { out } = await cli("doctor", "--vault", root);
+  expect(out).toContain("gh?ost?X");
+  // any control character other than the newlines the CLI itself writes
+  expect(out).not.toMatch(/[^\n\P{Cc}]/u);
+});
+
 test("cli: a clean vault exits 0; usage goes to stderr", async () => {
   const root = makeVault({ "a.md": "# A\n\n[[b]]\n", "b.md": "# B\n\n[[a]]\n" });
   expect(await cli("doctor", "--vault", root)).toMatchObject({ code: 0, err: "" });

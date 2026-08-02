@@ -45,8 +45,9 @@ vault --help                             # every command and flag
 
 `--vault` defaults to the current directory; `--` ends flag parsing, so a query
 may start with a dash. Exit code 0 on success, 1 on error — and 1 from `doctor`
-when it found problems only a human can fix (broken or ambiguous wikilinks, a
-duplicate filename stem).
+when it found links only a human can fix: broken (nothing to point at) or
+ambiguous (a bare `[[stem]]` several notes answer to — `doctor` prints the
+candidate paths, and qualifying the link with one of them is the fix).
 
 ```
 $ vault search renewal terms
@@ -70,8 +71,26 @@ truth: anything it misses — a directory rename, a pass that failed, a crash �
 
 Point Obsidian (or any editor) at the vault directory and work normally. Notes
 are ordinary markdown with YAML frontmatter and `[[wikilink]]`s, one note per
-file, subdirectories as namespaces. Filename stems must be vault-wide unique —
-that is what a wikilink resolves against, and `vault doctor` reports duplicates.
+file, subdirectories as namespaces.
+
+Links resolve the way Obsidian resolves them, namespace-aware:
+
+- `[[customers/acme]]` — a path-qualified link: the vault-relative path without
+  `.md`. Always unambiguous, whatever else the vault holds. Prefer it; it is what
+  the write gate writes for a note in a namespace (a note at the vault root has
+  no qualified form — its path without `.md` *is* its stem — so keep notes you
+  link to in namespaces);
+- `[[acme]]` — a bare stem: resolves only while exactly one note in the vault is
+  named `acme.md`. `customers/acme.md` and `vendors/acme.md` are two perfectly
+  good notes, but a bare `[[acme]]` between them means nothing, so it stays
+  unresolved rather than picking one. `vault doctor` lists it as ambiguous with
+  both candidates, written as links, so the fix is a copy-paste:
+
+```
+$ vault doctor
+ambiguous link: notes/deal.md -> [[acme]] (customers/acme, vendors/acme)
+broken link:    notes/deal.md -> [[ghots]]
+```
 
 Obsidian hides dot-directories, so `.vault/` stays out of the way; the scan skips
 it (and `.git/`, `.obsidian/`, …) for the same reason. If the vault is a git repo,

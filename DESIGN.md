@@ -49,11 +49,26 @@ repair the vault.
 - A note = one `.md` file under the vault root (subdirs = namespaces). The scan
   skips dot-directories (`.vault/`, `.git/`, `.obsidian/`, …) and does not follow
   symlinks.
-- Identity = vault-relative path; wikilink slug = filename stem. Filename stems
-  must be vault-wide unique: `[[acme]]` resolves only when exactly one stem
-  matches; zero or multiple matches leave `to_id` null and `doctor` reports the
-  broken/ambiguous link. A rename/move is a delete + create (identity is the
-  path); `doctor` reports the resulting broken edges.
+- Identity = vault-relative path. **Link resolution is namespace-aware**
+  (Obsidian-compatible), because `customers/acme.md` and `vendors/acme.md` are
+  two legitimate notes, not a collision:
+  - a **path-qualified** link, `[[customers/acme]]` — any target containing `/`
+    — matches the note whose vault-relative path minus `.md` is exactly that.
+    One note or none; never ambiguous. This is how an agent should link;
+  - a **bare stem**, `[[acme]]`, resolves only when exactly one note in the
+    vault carries that filename stem. Two or more candidates leave `to_id`
+    null — the link is *ambiguous*, never resolved by first match, shortest
+    path, or any other tiebreak that could silently mean the wrong note.
+    `doctor` names the candidates so a human or agent can qualify it.
+
+  A target is matched against indexed note paths in SQL and is **never joined
+  onto the filesystem**, so `[[../../etc/passwd]]` is not a traversal — it is a
+  string that matches no row. One consequence, recorded rather than discovered:
+  a note at the vault root has no qualified form (its path minus `.md` *is* its
+  stem), so two notes named `acme.md` at the root and in `customers/` make
+  `[[acme]]` permanently ambiguous — move the root one into a namespace.
+  A rename/move is a delete + create (identity is the path); `doctor` reports
+  the resulting broken edges.
 - Frontmatter: `type`, `created`, `updated`, optional `superseded_by`
   (**vault-relative path** of the superseding note), plus free keys. Written by
   us, editable by humans. `parseNote` never throws: a file whose frontmatter is
@@ -63,7 +78,7 @@ repair the vault.
   as its body and a `malformedFrontmatter` flag for `doctor` to report; so does
   a non-string `title`/`type`, whose value is ignored. Title = frontmatter
   `title` ?? first `# ` heading ?? filename stem.
-- Wikilinks (`[[slug]]`, `[[slug|alias]]` — slug only, deduped) and the fallback
+- Wikilinks (`[[target]]`, `[[target|alias]]` — target only, deduped) and the fallback
   heading are found by regex over the body, not a markdown parse: links and
   headings inside code fences count. Deliberate MVP simplification — a spurious
   edge is visible in `doctor`, and no note is ever lost to a parse failure.
@@ -75,8 +90,12 @@ repair the vault.
     denormalized off the parsed note so link resolution and `doctor`'s report
     are plain SQL; both are derived, like every other column here.
   - `edges(from_id, to_slug, to_id nullable, unique(from_id, to_slug))` —
-    reindexing a note deletes its edges by `from_id` and reinserts. `to_id is
-    null` ⇒ broken or ambiguous link; backlinks/orphans are trivial SQL.
+    `to_slug` is the link *as written*: a bare stem or a path (the column keeps
+    its name so an index written by an older version still opens). Reindexing a
+    note deletes its edges by `from_id` and reinserts. `to_id is null` ⇒ broken
+    or ambiguous link; backlinks/orphans are trivial SQL. Resolution is one
+    `update` over every edge — cheap, and correct when adding or removing a note
+    flips links in notes that did not themselves change.
   - `vectors` vec0 virtual table (`note_id`, `emb float[dims] distance_metric=cosine`)
     + `vector_meta(note_id, model, dims)`. A change of model **or dims** ⇒ doctor
     drops and recreates the vec0 table (dims live in its DDL) and re-embeds all
@@ -209,7 +228,12 @@ Every programmatic write goes through `vault.propose(candidate)`:
    - `create` writes a new file; `update` rewrites the target body and bumps
      `updated` in its frontmatter (a textual patch, per the rule above); `supersede`
      writes the new note, adds `superseded_by` (vault-relative path) to the old
-     note's frontmatter plus a forward wikilink; `discard` appends the candidate
+     note's frontmatter plus a **path-qualified** forward wikilink
+     (`[[customers/acme-2026]]`) — the gate knows the exact path, so a
+     namespaced successor's link cannot go ambiguous behind a note that shares
+     the stem later (a successor written to the vault root has no qualified
+     form, so its link is a bare stem and still can);
+     `discard` appends the candidate
      as a JSONL line to `.vault/discarded.log` so a wrong LLM call never silently
      loses information.
 
@@ -218,10 +242,12 @@ traversing *title* is slugified rather than refused (`../../evil` is the note
 `evil`) — a title legitimately contains `/` and `.`, and the slug is one
 `[a-z0-9-]+` segment by construction; a traversing, hidden or symlinked
 **namespace**, and a decider `target` that was not one of the notes the search
-returned, are refused outright. And a `create` whose slug is already taken —
-by a file or by another note's stem, which must be vault-wide unique — suffixes
-(`acme-2`) instead of overwriting: a shared title is not permission to lose
-someone else's note. A title that slugifies to nothing (CJK, Cyrillic, emoji)
+returned, are refused outright. And a `create` whose slug is already taken — by
+a file, or by another note's stem — suffixes (`acme-2`) instead of overwriting:
+a shared title is not permission to lose someone else's note. Stems need not be
+unique any more, but the gate keeps *its* notes' stems unique anyway, because
+adding a second `acme.md` is exactly what turns a human's existing `[[acme]]`
+ambiguous. A title that slugifies to nothing (CJK, Cyrillic, emoji)
 is named `note-<8 hex of the candidate's hash>`; a candidate the gate cannot
 place at all is appended to `.vault/discarded.log` before it throws. Losing the
 note is never one of the outcomes.
@@ -233,7 +259,16 @@ Human edits bypass the gate by definition (files are truth); the watcher +
 
 `vault doctor` — report + repair: rebuild stale index rows (hash mismatch), remove
 rows for deleted files, drop-and-re-embed on embedding model/dims change, list
-broken/ambiguous links, orphans, duplicate stems, and malformed frontmatter.
+broken links, ambiguous links, orphans, and malformed frontmatter. Broken and
+ambiguous are different problems and are reported apart: **broken** is 0
+candidates (a typo, or a note that is gone), **ambiguous** is 2+ and carries
+`candidates: string[]` — link *targets*, not filenames (`customers/acme`, no
+`.md`), so the report is the fix and not merely the complaint: paste one into
+the note as `[[customers/acme]]`. (A candidate at the vault root has no
+qualified form and reads as the ambiguous stem itself; that note has to move
+into a namespace.) A duplicate filename stem is
+*not* itself reported: two namespaces holding an `acme.md` is the point of
+namespaces, and only a bare link to them is a problem.
 `--rebuild` reindexes from scratch into a temp DB file, then atomically renames it
 over `index.db` (safe against a concurrently running watcher).
 

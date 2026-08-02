@@ -19,7 +19,8 @@ const USAGE = `vault <command> [options]
   --                  end of flags, so a search query may start with a dash
 
 Exit code 0 on success, 1 on error — and 1 from doctor when it found links
-only a human can fix (broken, ambiguous, or a duplicate filename stem).`;
+only a human can fix: broken (nothing to point at) or ambiguous (a bare
+[[stem]] several notes answer to — qualify it as [[folder/stem]]).`;
 
 export async function main(argv: string[]): Promise<number> {
   try {
@@ -114,7 +115,7 @@ async function run(argv: string[]): Promise<number> {
           ? "no matches"
           // score first so the ranking reads down the page, then the note's
           // identity, then what it is called
-          : hits.map((h) => `${h.score.toFixed(4)}  ${h.path} — ${h.title}`).join("\n"),
+          : hits.map((h) => safe(`${h.score.toFixed(4)}  ${h.path} — ${h.title}`)).join("\n"),
       );
     } finally {
       db.close();
@@ -142,7 +143,7 @@ async function run(argv: string[]): Promise<number> {
         onChange: (paths, stats) => {
           // An editor rewriting identical bytes is not news; a change is.
           if (stats.added || stats.updated || stats.removed) {
-            console.log(`${paths.join(" ")} — ${summary(stats)}`);
+            console.log(safe(`${paths.join(" ")} — ${summary(stats)}`));
           }
         },
       });
@@ -160,8 +161,7 @@ async function run(argv: string[]): Promise<number> {
   print(report);
   // Drift is repaired; links a human has to fix are not, so say so in the
   // exit code. (Orphans and malformed frontmatter are notes, not damage.)
-  const unrepaired =
-    report.brokenLinks.length + report.ambiguousLinks.length + report.duplicateStems.length;
+  const unrepaired = report.brokenLinks.length + report.ambiguousLinks.length;
   return unrepaired === 0 ? 0 : 1;
 }
 
@@ -177,17 +177,27 @@ function interrupted(): Promise<void> {
   });
 }
 
+/**
+ * Every string the CLI echoes is note-controlled — a filename, a title, a link
+ * target a human (or an LLM) wrote. A bare `\r` or an ESC sequence in one of
+ * them would rewrite the line the terminal has already drawn, so control
+ * characters print as `?`; the newlines the CLI itself writes are added after.
+ */
+const safe = (line: string): string => line.replace(/\p{Cc}/gu, "?");
+
 function print(r: DoctorReport): void {
   const lines = [
     `reindexed ${r.stale.length} stale, purged ${r.missing.length} deleted` +
       (r.reembedded ? ", re-embedded all notes (model or dims changed)" : ""),
     ...r.brokenLinks.map((l) => `broken link:    ${l.from} -> [[${l.slug}]]`),
-    ...r.ambiguousLinks.map((l) => `ambiguous link: ${l.from} -> [[${l.slug}]]`),
-    ...r.duplicateStems.map((d) => `duplicate stem: ${d.slug} (${d.paths.join(", ")})`),
+    // the candidates are the fix: qualify the link with one of these paths
+    ...r.ambiguousLinks.map(
+      (l) => `ambiguous link: ${l.from} -> [[${l.slug}]] (${l.candidates.join(", ")})`,
+    ),
     ...r.malformed.map((p) => `malformed frontmatter: ${p}`),
     ...r.orphans.map((p) => `orphan: ${p}`),
   ];
-  console.log(lines.join("\n"));
+  console.log(lines.map(safe).join("\n"));
 }
 
 if (import.meta.main) process.exit(await main(Bun.argv.slice(2)));
