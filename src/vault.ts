@@ -2,11 +2,18 @@
 // it are the implementation. Embedder and decider are injected — the vault
 // never hardcodes a provider.
 import type { Database } from "bun:sqlite";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { openDb, dbPath } from "./db";
-import { reindex as reindexVault, type IndexStats } from "./indexer";
+import {
+  isNotePath,
+  noteEntry,
+  readNote,
+  reindex as reindexVault,
+  type IndexStats,
+} from "./indexer";
 import { doctor as runDoctor, type DoctorOptions, type DoctorReport } from "./doctor";
 import {
+  confinedPath,
   propose as runGate,
   type Candidate,
   type GateOptions,
@@ -16,6 +23,7 @@ import {
 import { hybridSearch, type SearchHit, type SearchOptions } from "./search";
 import { watch as watchVault, type WatchOptions, type Watcher } from "./watch";
 import type { Embedder } from "./embed";
+import type { Note } from "./note";
 
 export type VaultOptions = {
   embedder: Embedder;
@@ -28,6 +36,19 @@ export type Vault = {
   readonly root: string;
   /** hybrid search over the index (DESIGN.md § Retrieval) */
   search(query: string, options?: SearchOptions): Promise<SearchHit[]>;
+  /**
+   * One note by its identity — the vault-relative path, `.md` and all
+   * (`ledger/q3.md`). Read from the **file**, so a stale or missing index row
+   * cannot change the answer. Null when nothing is there; throws when the path
+   * escapes the vault, or runs through a dot-directory or a symlinked one.
+   */
+  get(path: string): Promise<Note | null>;
+  /**
+   * Vault-relative paths of every note, sorted. `prefix` scopes it to one
+   * namespace and matches on segment boundaries: `ledger` and `ledger/` both
+   * match `ledger/q3.md`, neither matches `ledger-archive/q3.md`.
+   */
+  list(prefix?: string): string[];
   /**
    * The write gate: search → decide → apply with check-and-write + confinement.
    * `ctx` names the calling agent for this one call; given, its provenance is
@@ -50,6 +71,34 @@ export function open(root: string, { embedder, gate }: VaultOptions): Vault {
   return {
     root: dir,
     search: (query, options) => hybridSearch(db, embedder, query, options),
+    // Files are truth, so `get` reads the file and parses it — the index is
+    // never the thing served. Identity is the path *including* `.md`
+    // (DESIGN.md § Data model): `ledger/q3` names no note. A path that had no
+    // business being built — one that escapes the root, or runs through a
+    // dot-directory or a symlinked one — throws, like the write gate's; a path
+    // that is merely absent, or holds a directory or a symlink, is null. Async
+    // so both answers reach the caller the same way.
+    async get(rel) {
+      // The *parent* is confined, not the leaf: `noteEntry` already refuses a
+      // symlink where the note should be (it is not a note, like a directory),
+      // while a symlinked or hidden directory on the way down, and any escape,
+      // still throw — a path cannot escape through its last segment alone.
+      confinedPath(dir, dirname(rel));
+      return isNotePath(rel) && noteEntry(dir, rel) ? readNote(dir, rel) : null;
+    },
+    // Derived data is fine here: these are paths, and every one of them is
+    // rebuildable from the files. A prefix names a namespace and matches on
+    // segment boundaries — raw `startsWith` would sweep in `ledger-archive/`
+    // (DESIGN.md § Scopes and context, same rule). Superseded notes are
+    // listed: this is the note set, not the search set.
+    // ponytail: filters in JS rather than in SQL, where `like`'s wildcards
+    // would need escaping. Push it into the query if a vault ever gets big.
+    list(prefix) {
+      const under = prefix ? `${prefix.replace(/\/+$/, "")}/` : "";
+      return (db.query(`select path from notes order by path`).all() as { path: string }[])
+        .map((r) => r.path)
+        .filter((path) => path.startsWith(under));
+    },
     // async, so a missing gate is a rejected promise like every other failure
     // here rather than a synchronous throw a caller's .catch() would miss
     async propose(candidate, ctx) {

@@ -114,6 +114,8 @@ const vault = open("/path/to/vault", {
 
 await vault.reindex();
 await vault.search("acme renewal", { n: 5, cutoffs: { distanceCeiling: 0.35 } });
+await vault.get("customers/acme.md");   // one note, parsed — read from the file
+vault.list("customers");                // every note path under a namespace, sorted
 await vault.propose(
   { title: "Acme renewal 2026", type: "customer", namespace: "customers", body },
   { agent: "core/scheduler", source: "task-42" }, // optional: who is writing, per call
@@ -123,6 +125,27 @@ await vault.doctor();
 const watcher = vault.watch();     // keep the index warm while a human edits
 await watcher.close();             // resolves when the pass in flight is done
 vault.close();                     // ...so this cannot close the DB under a write
+```
+
+### Reading notes
+
+`get` is a note's identity — its vault-relative path, `.md` and all — turned
+into the parsed note: frontmatter, body, title, wikilinks, hash. It reads the
+**file**, so it is never stale, whatever the index thinks; it returns `null`
+when nothing is there, and a directory or a symlink at the path counts as
+nothing. A path that leaves the vault, or runs through `.vault/` or a symlinked
+directory, throws — that is a caller bug, not a missing note.
+
+`list` answers the cheap question from the index: which notes exist. Paths only,
+sorted, optionally under one namespace — and a namespace means whole segments,
+so `list("ledger")` never sweeps in `ledger-archive/`. Superseded notes are
+listed; `list` is the note set, not the search set.
+
+```ts
+const note = await vault.get("customers/acme.md"); // Note | null
+note?.links;                                       // ["support-rota", ...]
+vault.list();                                      // every note path, sorted
+vault.list("customers/");                          // "customers" works too
 ```
 
 ### The write gate

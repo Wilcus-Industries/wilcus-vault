@@ -133,26 +133,33 @@ export function slugify(title: string): string | null {
  * Resolve a vault-relative path and prove it is really inside the vault: no
  * `..` escape, no absolute path, no symlinked directory or file on the way
  * down. Callers pass strings that came from an LLM, a caller's namespace, or a
- * stale index — none of them are trusted to be a safe path.
+ * stale index — none of them are trusted to be a safe path. The gate's rail,
+ * and the facade's `get` reads through it too, so the paths a caller may read
+ * and the paths it may write are decided by one function; the errors say
+ * "vault", not "write gate", for that reason.
  */
 export function confinedPath(root: string, rel: string): string {
   const base = resolve(root);
   const abs = resolve(base, rel);
   if (abs !== base && !abs.startsWith(base + sep)) {
-    throw new Error(`write gate: ${rel} resolves outside the vault`);
+    throw new Error(`vault: ${rel} resolves outside the vault`);
   }
   let walk = base;
-  for (const segment of relative(base, abs).split(sep)) {
+  // The root itself is not walked (`relative` gives one empty segment when the
+  // path *is* the root): the caller named it, and the scan does not lstat it
+  // either — a vault opened through a symlinked root is still a vault.
+  for (const segment of relative(base, abs).split(sep).filter((s) => s !== "")) {
     // The scan skips dot-directories, so a note written into one could never
-    // be indexed — an invisible write is not a successful one.
+    // be indexed — an invisible write is not a successful one — and nothing in
+    // one is a note to read back either.
     if (segment.startsWith(".")) {
-      throw new Error(`write gate: ${rel} passes through a hidden directory`);
+      throw new Error(`vault: ${rel} passes through a hidden directory`);
     }
     walk = join(walk, segment);
     // A symlink is a second name for a file that may not be a note at all —
     // the scan skips them too, so the gate must not write through one either.
     if (lstatSync(walk, { throwIfNoEntry: false })?.isSymbolicLink()) {
-      throw new Error(`write gate: ${rel} passes through a symlink`);
+      throw new Error(`vault: ${rel} passes through a symlink`);
     }
   }
   return abs;
