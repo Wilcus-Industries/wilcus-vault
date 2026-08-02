@@ -490,6 +490,13 @@ test("path confinement: a traversing namespace or symlinked dir is refused", asy
 
   symlinkSync(join(v.root, "notes"), join(v.root, "linked"));
   await expect(v.propose({ ...CANDIDATE, namespace: "linked" })).rejects.toThrow(/symlink/);
+
+  // A NUL reaches `lstat` as a raw TypeError at the caller unless the rail
+  // refuses it first, like every other path it will not build.
+  await expect(v.propose({ ...CANDIDATE, namespace: "no\0pe" })).rejects.toThrow(
+    /^vault: no\?pe.*NUL byte/,
+  );
+  expect(() => confinedPath(v.root, "notes/\0.md")).toThrow(/NUL byte/);
   v.close();
 });
 

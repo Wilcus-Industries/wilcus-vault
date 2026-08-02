@@ -25,6 +25,8 @@ import {
 } from "./note";
 import { readRaw, reindex } from "./indexer";
 import { hybridSearch, type Cutoffs } from "./search";
+import { ALLOW_ALL, normalizePrefix, type Scope } from "./scope";
+import { safe } from "./term";
 import type { Embedder } from "./embed";
 
 /** A note something wants to write. `namespace` is a directory under the root. */
@@ -45,6 +47,13 @@ export type SimilarNote = {
    * and refuses to write if this no longer matches — see `propose`.
    */
   hash: string;
+  /**
+   * The calling agent may read this note but not write it (§ Scopes and
+   * context). Set only when true, and only under a scope policy: a decision
+   * that targets one anyway falls back to `create`, and `gatePrompt` marks it
+   * so the model is not asked to guess.
+   */
+  readOnly?: boolean;
 };
 
 /**
@@ -52,7 +61,8 @@ export type SimilarNote = {
  * caller (`core/scheduler`); `source` optionally records what prompted the call
  * — a conversation id, a task id, freeform. Identity travels per call rather
  * than being frozen at `open()`, because one process holds one vault handle on
- * behalf of many agents. Optional until scope policy lands (#23).
+ * behalf of many agents. Optional — unless the vault was opened with a
+ * `ScopePolicy`, which has nothing to key on without it and refuses the call.
  */
 export type VaultContext = { agent: string; source?: string };
 
@@ -139,6 +149,10 @@ export function slugify(title: string): string | null {
  * "vault", not "write gate", for that reason.
  */
 export function confinedPath(root: string, rel: string): string {
+  // No path holds a NUL, and `lstat` answers one with a raw TypeError at
+  // whoever called us — a caller's namespace reaches here, so the refusal is
+  // the vault's own error like every other bad path below.
+  if (rel.includes("\0")) throw new Error(`vault: ${safe(rel)} contains a NUL byte`);
   const base = resolve(root);
   const abs = resolve(base, rel);
   if (abs !== base && !abs.startsWith(base + sep)) {
@@ -223,10 +237,16 @@ export function gatePrompt({ candidate, similar }: DeciderInput): string {
       : similar
           .map(
             (s, i) =>
-              `[${i + 1}] path: ${s.note.path}\n    title: ${s.note.title}\n` +
+              `[${i + 1}] path: ${s.note.path}${s.readOnly ? " (read-only)" : ""}\n` +
+              `    title: ${s.note.title}\n` +
               `--- begin note ---\n${fence(s.note.body)}\n--- end note ---`,
           )
           .join("\n\n");
+  // Said only when it applies: a scope-free vault should not have the model
+  // reading a rule about markings it will never see.
+  const readOnly = similar.some((s) => s.readOnly)
+    ? "\nA note marked read-only is outside the calling agent's write scope: do not name it as a target — choose create instead.\n"
+    : "";
   return `You are the write gate of a markdown memory vault. Decide what should happen to one candidate note.
 
 CANDIDATE
@@ -244,7 +264,7 @@ Choose exactly one action:
 - supersede: an existing note is now wrong or outdated and the candidate replaces it. Give the old note's path as "target"; it will be marked superseded and linked forward.
 - create: nothing above covers this. Do not give a target.
 - discard: the candidate adds nothing that is not already written down. Do not give a target.
-
+${readOnly}
 Reply with one JSON object and nothing else — no prose, no markdown fence:
 {"action": "update" | "supersede" | "create" | "discard", "target": "<path exactly as listed above, update and supersede only>", "body": "<full markdown body, optional>"}`;
 }
@@ -264,8 +284,11 @@ Reply with one JSON object and nothing else — no prose, no markdown fence:
  * Touched files are reindexed before this returns, so the index never lags a
  * write we made ourselves.
  *
- * `ctx` is the caller's identity for this one call; given, its provenance is
- * stamped into every note the gate *authors* (§ Scopes and context).
+ * `scope` carries the caller's identity for this one call — given, its
+ * provenance is stamped into every note the gate *authors* — and what that
+ * caller may touch: the candidate's namespace is write-checked before the
+ * decider runs, only readable notes are shown to it, and a decision targeting
+ * a note the agent may not write falls back to `create` (§ Scopes and context).
  */
 export async function propose(
   db: Database,
@@ -273,7 +296,7 @@ export async function propose(
   embedder: Embedder,
   candidate: Candidate,
   { decider, cutoffs, n = 5 }: GateOptions,
-  ctx?: VaultContext,
+  scope: Scope = ALLOW_ALL,
 ): Promise<GateResult> {
   // `{}` type-checks, which would make the mandate above cosmetic: with no
   // ceiling at all the search returns the least unrelated note and the gate
@@ -284,20 +307,34 @@ export async function propose(
         "'most similar note' is only 'least unrelated note'",
     );
   }
+  const ctx = scope.ctx;
   // A blank agent is a caller that meant to identify itself and did not. It
-  // would be stamped into files as an empty string and, once scope policy
-  // keys on it (#23), match no rule — refuse it here, before any write.
+  // would be stamped into files as an empty string and match no scope rule —
+  // refuse it here, before any write.
   if (ctx !== undefined && ctx.agent.trim() === "") {
     throw new Error("write gate: ctx.agent must name the calling agent");
   }
   const base = resolve(root);
+  // Both refusals a doomed write can earn, before the decider: no model spend
+  // on a namespace the gate would not write into anyway. Confinement first, so
+  // a namespace that is not a path at all is named as that rather than as a
+  // scope decision. Scope rules end at a segment boundary, so the namespace
+  // decides the answer for every filename the gate could pick inside it.
+  confinedPath(base, candidate.namespace ?? "");
+  const namespace = normalizePrefix(candidate.namespace);
+  if (!scope.may("write", namespace)) {
+    throw new Error(
+      `write gate: ${JSON.stringify(safe(ctx?.agent ?? ""))} may not write to ` +
+        (namespace === "" ? "the vault root" : safe(namespace)),
+    );
+  }
   let applied: Applied | null = null;
   let fellBack = false;
   for (let attempt = 0; attempt < 2 && applied === null; attempt++) {
     // Re-running the gate means re-running it against *fresh* state: the edit
     // that aborted the first attempt is on disk but not yet in the index.
     if (attempt > 0) await reindex(db, base, embedder);
-    const similar = await findSimilar(db, base, embedder, candidate, cutoffs, n);
+    const similar = await findSimilar(db, base, embedder, candidate, cutoffs, n, scope);
     const decision = checkDecision(await decider({ candidate, similar }));
     if (decision.target !== undefined && !similar.some((s) => s.note.path === decision.target)) {
       // The only paths the gate will touch are ones it just read itself.
@@ -305,6 +342,10 @@ export async function propose(
         `write gate: decider targeted ${decision.target}, which was not among the similar notes`,
       );
     }
+    // A target the agent may read but not write falls back to `create` below,
+    // like one that failed check-and-write twice — and re-asking the decider
+    // would only spend another model call on the same forbidden note.
+    if (decision.target !== undefined && !scope.may("write", decision.target)) break;
     applied = await apply(db, base, candidate, decision, similar, ctx);
   }
   if (applied === null) {
@@ -321,7 +362,11 @@ export async function propose(
 
 type Applied = Omit<GateResult, "fellBack">;
 
-/** Top-k similar notes, read from disk so their hashes are current. */
+/**
+ * Top-k similar notes, read from disk so their hashes are current. The search
+ * is scoped, so an agent never has another agent's note bodies quoted back to
+ * it by the prompt; one it may read but not write is flagged read-only.
+ */
 async function findSimilar(
   db: Database,
   root: string,
@@ -329,19 +374,28 @@ async function findSimilar(
   candidate: Candidate,
   cutoffs: Cutoffs,
   n: number,
+  scope: Scope,
 ): Promise<SimilarNote[]> {
   // Same shape the indexer embeds a note with, so like is compared with like.
-  const hits = await hybridSearch(db, embedder, `${candidate.title}\n\n${candidate.body}`, {
-    n,
-    cutoffs,
-  });
+  const hits = await hybridSearch(
+    db,
+    embedder,
+    `${candidate.title}\n\n${candidate.body}`,
+    { n, cutoffs },
+    scope,
+  );
   const similar: SimilarNote[] = [];
   for (const hit of hits) {
     confinedPath(root, hit.path); // the index is derived data, not a trusted path source
     const raw = await readRaw(root, hit.path);
     if (raw === null) continue; // indexed but gone: files are truth, the row is stale
     const note = parseNote(raw, hit.path);
-    similar.push({ note, score: hit.score, hash: note.hash });
+    similar.push({
+      note,
+      score: hit.score,
+      hash: note.hash,
+      ...(!scope.may("write", hit.path) && { readOnly: true }),
+    });
   }
   return similar;
 }
