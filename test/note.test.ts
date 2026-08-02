@@ -257,6 +257,21 @@ test("a duplicate key cannot survive the patch and win by YAML last-wins", () =>
   expect(out).toContain("type: customer");
 });
 
+test("patchFrontmatter unsets a key, and unsetting one that is absent is a no-op", () => {
+  // A gate-owned key has to be removable, or it outlives the fact it records.
+  const raw = `---\ntype: customer\nvault_agent: "a"\nid: 01234 # legacy\nvault_agent: "dupe"\n---\nbody\n`;
+  expect(patchFrontmatter(raw, "vault_agent", null)).toBe(
+    "---\ntype: customer\nid: 01234 # legacy\n---\nbody\n",
+  );
+  const clean = "---\ntype: customer\n---\nbody\n";
+  expect(patchFrontmatter(clean, "vault_agent", null)).toBe(clean);
+  // no usable block to remove a key from: prepending one would be absurd
+  expect(patchFrontmatter("# Acme\n\nbody\n", "vault_agent", null)).toBe("# Acme\n\nbody\n");
+  expect(patchFrontmatter("---\r\nvault_agent: \"a\"\r\ntype: c\r\n---\r\nb\r\n", "vault_agent", null)).toBe(
+    "---\r\ntype: c\r\n---\r\nb\r\n",
+  );
+});
+
 test("patchFrontmatter sees through a BOM instead of prepending past it", () => {
   const out = patchFrontmatter("﻿---\ntype: customer\n---\nbody\n", "updated", "2026-08-01");
   expect(out).toBe(`﻿---\ntype: customer\nupdated: "2026-08-01"\n---\nbody\n`);

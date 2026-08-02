@@ -54,8 +54,9 @@ export async function doctor(
 ): Promise<DoctorReport> {
   const path = dbPath(root);
   // First, before anything touches `.vault/`: history that is still in there is
-  // one `rm -rf .vault` from being gone.
-  const migratedDiscardLog = migrateDiscardLog(root);
+  // one `rm -rf .vault` from being gone. Only on a repairing run, though — a
+  // `repair: false` call is a report, and a report does not move files.
+  const migratedDiscardLog = (repair || rebuild) && migrateDiscardLog(root);
   // Drift is measured before any repair, so the report says what was wrong.
   const drift = await withDb(path, (db) => diskDrift(db, root));
   let reembedded = rebuild; // a rebuild embeds every note from scratch
@@ -71,6 +72,11 @@ export async function doctor(
  * a rebuild or a nuke took durable history with it. Move it beside the notes,
  * once: append rather than replace, because both files may hold lines and
  * neither is disposable, then drop the old one so the next run is a no-op.
+ * ponytail: append-then-remove is not atomic — a crash in between re-appends
+ * the same lines next run (duplicated history, never lost history), and an old
+ * log we cannot read (EACCES, or a directory in its place) throws out of
+ * doctor. Both are one-shot migration paths; a temp-file swap is the upgrade if
+ * either ever actually bites.
  */
 function migrateDiscardLog(root: string): boolean {
   const old = join(root, ".vault", "discarded.log");

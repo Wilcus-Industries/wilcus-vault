@@ -4,7 +4,16 @@
 // touched mid-flight is clobbered) and path confinement (an LLM-derived string
 // never names a raw filesystem path).
 import type { Database } from "bun:sqlite";
-import { appendFileSync, existsSync, lstatSync, mkdirSync, renameSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  writeSync,
+} from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import {
   linkTarget,
@@ -268,6 +277,12 @@ export async function propose(
         "'most similar note' is only 'least unrelated note'",
     );
   }
+  // A blank agent is a caller that meant to identify itself and did not. It
+  // would be stamped into files as an empty string and, once scope policy
+  // keys on it (#23), match no rule — refuse it here, before any write.
+  if (ctx !== undefined && ctx.agent.trim() === "") {
+    throw new Error("write gate: ctx.agent must name the calling agent");
+  }
   const base = resolve(root);
   let applied: Applied | null = null;
   let fellBack = false;
@@ -349,10 +364,13 @@ async function apply(
   if (decision.action === "update") {
     // Frontmatter is the note's identity — keep it verbatim, bump `updated`
     // and record who wrote it. Both are textual patches: we did not author
-    // this note, so it is never re-serialized.
+    // this note, so it is never re-serialized. Every gate-owned key is set or
+    // *unset* to match this call exactly — a leftover `vault_source` beside a
+    // new `vault_agent` would assert a pairing that never happened.
+    const stamp = provenance(ctx);
     let patched = patchFrontmatter(raw, "updated", now());
-    for (const [key, value] of Object.entries(provenance(ctx))) {
-      patched = patchFrontmatter(patched, key, value);
+    for (const key of PROVENANCE_KEYS) {
+      patched = patchFrontmatter(patched, key, stamp[key] ?? null);
     }
     await writeAtomic(abs, replaceBody(patched, decision.body ?? candidate.body));
     return { action: "update", path: rel };
@@ -394,13 +412,20 @@ async function writeAtomic(abs: string, text: string): Promise<void> {
 }
 
 /**
- * The provenance keys for a note the gate authors or rewrites, or `{}` when the
- * caller gave no context. Namespaced (`vault_`) because `agent:` and `source:`
- * are exactly the keys a human's own frontmatter plausibly holds, and the
- * textual patcher replaces *top-level* lines — patching a human's nested
- * `source:` block would orphan its children into a parse error. Both values are
- * single-line, so `update`'s textual patch applies cleanly. `vault_agent`
- * answers "which agent last wrote this note through the gate".
+ * The frontmatter keys the gate owns. Namespaced (`vault_`) because `agent:`
+ * and `source:` are exactly the keys a human's own frontmatter plausibly holds,
+ * and the textual patcher replaces *top-level* lines — patching a human's
+ * nested `source:` block would orphan its children into a parse error. Listed
+ * rather than derived, because `update` has to clear the ones this call does
+ * not set, which means knowing them all.
+ */
+const PROVENANCE_KEYS = ["vault_agent", "vault_source"] as const;
+
+/**
+ * The provenance for a note the gate authors or rewrites, or `{}` when the
+ * caller gave no context. Both values are single-line, so `update`'s textual
+ * patch applies cleanly. `vault_agent` answers "which agent last wrote this
+ * note through the gate".
  */
 function provenance(ctx?: VaultContext): Record<string, string> {
   if (ctx === undefined) return {};
@@ -476,9 +501,20 @@ export const discardLog = (root: string): string => join(root, ".discarded.log")
  * Append a candidate to the discard log as JSONL, whole: a wrong decider call —
  * or a gate that cannot place the note — costs a line in a log, never the
  * information itself.
+ *
+ * `O_NOFOLLOW`, because this is the gate's one write to a fixed, user-visible
+ * path — every other write lands through a rename, which replaces a symlink
+ * rather than following it. A symlink dropped here would redirect whole
+ * candidate bodies out of the vault; opening one fails instead (ELOOP).
  */
 function logCandidate(root: string, candidate: Candidate, extra: Record<string, unknown>): void {
-  appendFileSync(discardLog(root), `${JSON.stringify({ at: now(), candidate, ...extra })}\n`);
+  const { O_WRONLY, O_APPEND, O_CREAT, O_NOFOLLOW } = constants;
+  const fd = openSync(discardLog(root), O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW);
+  try {
+    writeSync(fd, `${JSON.stringify({ at: now(), candidate, ...extra })}\n`);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 const now = (): string => new Date().toISOString();

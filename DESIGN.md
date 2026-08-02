@@ -227,9 +227,10 @@ stamps its provenance onto every note it authors; absent, nothing is stamped:
      whose YAML the parser cannot read is *not* a block, and gets a fresh one
      prepended, or a `superseded_by` patched into it would be a line nothing
      ever reads.
-   - `create` writes a new file; `update` rewrites the target body and bumps
-     `updated` plus the provenance keys in its frontmatter (textual patches, per
-     the rule above); `supersede`
+   - `create` writes a new file; `update` rewrites the target body, bumps
+     `updated` and sets *or clears* the provenance keys to match the call
+     (textual patches, per the rule above — the patcher takes a `null` value as
+     an unset for exactly this); `supersede`
      writes the new note, adds `superseded_by` (vault-relative path) to the old
      note's frontmatter plus a **path-qualified** forward wikilink
      (`[[customers/acme-2026]]`) — the gate knows the exact path, so a
@@ -289,7 +290,12 @@ the textual patcher replaces top-level lines (patching a human's nested
 `source:` block would orphan its children into a parse error). Both are
 single-line values, so `update`'s textual patch applies cleanly; `create` and
 `supersede` serialize them fresh on the note they author. `vault_agent`
-answers "which agent last wrote this note through the gate". Marking the
+answers "which agent last wrote this note through the gate" — so on `update`
+these keys are set to *exactly* this call's context: a key the call does not
+supply is **removed**, not left standing. A stale `vault_source` beside a fresh
+`vault_agent` would assert a pairing that never happened, and a leftover
+`vault_agent` under a context-free write would name an agent that did not make
+it. An `agent` that is empty or whitespace is refused outright. Marking the
 *old* note `superseded_by` does not restamp its provenance — the marking is
 bookkeeping, not authorship, and the superseding agent is already on the
 successor. Provenance lives in the file, like every other truth here.
@@ -416,7 +422,9 @@ namespaces, and only a bare link to them is a problem.
 over `index.db` (safe against a concurrently running watcher). Doctor also carries
 the one migration the vault has: a discard log still sitting in `.vault/` is
 appended to `<root>/.discarded.log` and removed, once, before anything else
-touches `.vault/`, and the report says so.
+touches `.vault/`, and the report says so. It runs only on a **repairing** run
+(the default, or `--rebuild`); `repair: false` is a report, and a report does
+not move files.
 
 `vault watch` — `fs.watch` (recursive) on the root, acting only on `.md` paths
 outside dot-directories, so the index's own writes under `.vault/` cannot feed

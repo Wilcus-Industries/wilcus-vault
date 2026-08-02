@@ -2,7 +2,7 @@
 // end against a real vault, plus the two safety rails — check-and-write and
 // path confinement. Fake deciders, deterministic embedder, no network.
 import { test, expect, afterAll, spyOn } from "bun:test";
-import { existsSync, readdirSync, readFileSync, symlinkSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { TokenOverlapEmbedder } from "../src/embed";
 import { parseDecision, slugify, type Decider, type DeciderInput } from "../src/gate";
@@ -230,7 +230,7 @@ test("a ctx stamps provenance on a note the gate authors", async () => {
   v.close();
 });
 
-test("update stamps provenance by patching, and the last writer replaces the line", async () => {
+test("update's provenance says exactly who made this call — set and unset", async () => {
   const v = await openVault(VAULT, async () => ({
     action: "update",
     target: "notes/acme-renewal.md",
@@ -254,6 +254,51 @@ test("update stamps provenance by patching, and the last writer replaces the lin
     vault_agent: "core/librarian",
     vault_source: "task-43",
   });
+
+  // a ctx with no source clears the last one: core/archivist beside task-43
+  // would be a pairing that never happened
+  await v.propose(CANDIDATE, { agent: "core/archivist" });
+  const cleared = fm(v.root, "notes/acme-renewal.md");
+  expect(cleared["vault_agent"]).toBe("core/archivist");
+  expect(cleared["vault_source"]).toBeUndefined();
+
+  // and no ctx stamps nothing — including nothing left over from before
+  await v.propose(CANDIDATE);
+  const bare = fm(v.root, "notes/acme-renewal.md");
+  expect(bare["vault_agent"]).toBeUndefined();
+  expect(bare["vault_source"]).toBeUndefined();
+  // the human's frontmatter survived all four writes untouched
+  expect(read(v.root, "notes/acme-renewal.md")).toContain(
+    "id: 01234 # legacy account number, must survive a gate write",
+  );
+  v.close();
+});
+
+test("a YAML-hostile agent name stays one quoted line and invents no keys", async () => {
+  const v = await openVault(VAULT, async () => ({
+    action: "update",
+    target: "notes/acme-renewal.md",
+    body: "# Acme renewal\n\nRenewal closes 2026-03-01.\n",
+  }));
+  // a value that would close the frontmatter block and open a key of its own
+  const evil = 'x\n---\ninjected: true';
+  await v.propose(CANDIDATE, { agent: evil, source: evil });
+
+  const raw = read(v.root, "notes/acme-renewal.md");
+  expect(raw.match(/^vault_agent:/gm)).toHaveLength(1);
+  expect(raw.match(/^vault_source:/gm)).toHaveLength(1);
+  const front = fm(v.root, "notes/acme-renewal.md");
+  expect(front).toMatchObject({ vault_agent: evil, vault_source: evil, type: "customer" });
+  expect(front["injected"]).toBeUndefined(); // text, not syntax
+  v.close();
+});
+
+test("a ctx that names no agent is refused before anything is written", async () => {
+  const v = await openVault(VAULT, async () => ({ action: "create" }));
+  for (const agent of ["", "  \t"]) {
+    await expect(v.propose(CANDIDATE, { agent })).rejects.toThrow(/agent/);
+  }
+  expect(existsSync(join(v.root, "notes/acme-renewal-2026.md"))).toBe(false);
   v.close();
 });
 
@@ -309,6 +354,14 @@ test("discard appends the whole candidate to <root>/.discarded.log", async () =>
   expect(existsSync(join(v.root, ".vault", "discarded.log"))).toBe(false);
   await v.doctor({ rebuild: true });
   expect(read(v.root, ".discarded.log").trim().split("\n")).toHaveLength(2);
+
+  // the log sits at a fixed path in the user-visible tree and carries whole
+  // candidate bodies: a symlink left in its place is refused, not followed
+  const elsewhere = makeVault({});
+  rmSync(join(v.root, ".discarded.log"));
+  symlinkSync(join(elsewhere, "stolen.log"), join(v.root, ".discarded.log"));
+  await expect(v.propose({ ...CANDIDATE, title: "Third thought" })).rejects.toThrow();
+  expect(existsSync(join(elsewhere, "stolen.log"))).toBe(false);
   v.close();
 });
 

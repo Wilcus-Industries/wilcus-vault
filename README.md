@@ -144,8 +144,8 @@ note. A discarded candidate — or one the gate cannot place at all — is appen
 whole to `<root>/.discarded.log`; losing the note is never an outcome. That log is
 history, not index, so it sits beside the notes rather than in the disposable
 `.vault/` — a `doctor --rebuild` or an `rm -rf .vault` leaves it alone (a log left
-in the old place is moved out by the next `vault doctor`). It holds whole candidate
-bodies, so a vault kept in git may want it in `.gitignore` too. Notes the
+in the old place is moved out by the next repairing `vault doctor`). It holds whole
+candidate bodies, so a vault kept in git may want it in `.gitignore` too. Notes the
 gate did not author are patched textually, never re-serialized, so comments,
 `01234` and `1.0` survive. Human edits bypass the gate by definition:
 `vault watch` and `vault doctor` pick them up.
@@ -162,7 +162,9 @@ identity for that one call. Given, the gate stamps `vault_agent` (and
 a `supersede`'s successor, get them serialized in; an `update` gets them patched
 in beside its `updated` bump. Marking the superseded note is bookkeeping rather
 than authorship, so its own provenance is left alone. Omit the context and
-nothing is stamped.
+nothing is stamped — on an `update` that also means the previous call's keys are
+*removed*, so `vault_agent` never names an agent that did not write the note it
+sits on.
 
 ### Embedders
 
