@@ -124,15 +124,19 @@ const vault = open("/path/to/vault", {
     // mandatory: without cutoffs "most similar" degrades into "least unrelated"
     cutoffs: { distanceCeiling: 0.35, bm25Ceiling: -1 },
   },
+  // optional: per-agent namespace rules. Omitted, every caller may do anything.
+  scopes: { "core/scheduler": [{ prefix: "", read: true, write: true }] },
 });
 
+const ctx = { agent: "core/scheduler", source: "task-42" }; // who is calling, per call
+
 await vault.reindex();
-await vault.search("acme renewal", { n: 5, cutoffs: { distanceCeiling: 0.35 } });
-await vault.get("customers/acme.md");   // one note, parsed — read from the file
-vault.list("customers");                // every note path under a namespace, sorted
+await vault.search("acme renewal", { n: 5, cutoffs: { distanceCeiling: 0.35 }, ctx });
+await vault.get("customers/acme.md", ctx);  // one note, parsed — read from the file
+vault.list("customers", ctx);               // note paths under a namespace, sorted
 await vault.propose(
   { title: "Acme renewal 2026", type: "customer", namespace: "customers", body },
-  { agent: "core/scheduler", source: "task-42" }, // optional: who is writing, per call
+  ctx, // optional — until a scope policy is in force, which needs it to decide
 );
 await vault.doctor();
 
@@ -165,6 +169,9 @@ note?.links;                                       // ["support-rota", ...]
 vault.list();                                      // every note path, sorted
 vault.list("customers/");                          // "customers" works too
 ```
+
+Both take an optional trailing `VaultContext`, which decides what they answer
+once the vault has a scope policy — see [Scopes](#scopes).
 
 ### The write gate
 
@@ -205,7 +212,60 @@ in beside its `updated` bump. Marking the superseded note is bookkeeping rather
 than authorship, so its own provenance is left alone. Omit the context and
 nothing is stamped — on an `update` that also means the previous call's keys are
 *removed*, so `vault_agent` never names an agent that did not write the note it
-sits on.
+sits on. Omitting it stops being an option once the vault has a scope policy,
+which has nothing to check the write against without it.
+
+### Scopes
+
+Several agents usually share one vault. `scopes` says who may touch what —
+namespace prefixes, per agent, for `read` and `write` independently:
+
+```ts
+const vault = open("/path/to/vault", {
+  embedder,
+  gate,
+  scopes: {
+    "core/scheduler": [{ prefix: "", read: true, write: true },
+                       { prefix: "ledger/", write: false }], // reads it, cannot rewrite it
+    "core/support":   [{ prefix: "support/", read: true, write: true },
+                       { prefix: "customers/", read: true }], // read-only next door
+  },
+});
+
+await vault.search("acme renewal", { ctx: { agent: "core/support" } });
+await vault.get("ledger/q3.md", { agent: "core/support" }); // null: not readable
+vault.list("customers", { agent: "core/support" });         // only what it may read
+await vault.propose(candidate, { agent: "core/support" });
+```
+
+- **No `scopes` means allow-all**, so a single-agent caller changes nothing.
+  With one, the vault fails closed: every call needs a `VaultContext`, an agent
+  the policy does not name is refused with a throw rather than an empty result,
+  and `{}` denies everyone.
+- A prefix matches **whole segments** — `ledger/` never matches
+  `ledger-archive/`; `""` is the root rule. For each of `read` and `write`
+  separately, the longest matching prefix that *specifies* it wins; a rule that
+  leaves one out defers to the next-shorter match, and nothing specifying it
+  means denied. `open()` refuses a policy that answers one question twice, one
+  with a subtree writable but not readable (an agent that cannot see its own
+  notes re-creates them on every propose), a rule that is not
+  `{prefix, read?, write?}` with booleans — a JSON `read: "false"` is truthy,
+  and would grant where it meant to deny — and a prefix that is not a canonical
+  path (`./ledger`, `ledger//sub`), which would match nothing and deny nothing.
+- `search` filters unreadable notes out of the over-fetched set before capping,
+  so you get *up to* N readable hits (and `expandLinks` neighbours are filtered
+  too). `get` returns null for an unreadable note, exactly like an absent one.
+  `propose` checks the candidate's namespace before your decider runs, shows the
+  decider only notes the agent may read, marks the ones it may not write
+  read-only in the prompt, and falls back to `create` if a decision targets one
+  anyway — the candidate always lands somewhere.
+- `doctor`, `reindex`, `watch` and `close` are operator operations on the whole
+  vault and take no context.
+
+Scopes are **advisory containment at the library API, not security**: any
+process with filesystem access can read or edit the notes directly. That is the
+files-are-truth contract, not a hole in it — the boundary that matters for
+hostile code is the OS, not this policy object.
 
 ### Embedders
 

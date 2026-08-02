@@ -5,6 +5,8 @@
 // does one job, ordering the survivors.
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { l2normalize, type Embedder } from "./embed";
+import { ALLOW_ALL, type Scope } from "./scope";
+import type { VaultContext } from "./gate";
 
 /** RRF constant from the literature: score = Σ 1/(60 + rank). */
 const RRF_K = 60;
@@ -60,6 +62,12 @@ export type SearchOptions = {
   cutoffs?: Cutoffs;
   /** append one-hop wikilink neighbours of the survivors, below every hit */
   expandLinks?: boolean;
+  /**
+   * Who is asking (DESIGN.md § Scopes and context). The facade resolves this
+   * against the vault's `ScopePolicy` and hands `hybridSearch` the resolved
+   * scope — required when a policy is in force, ignored when there is none.
+   */
+  ctx?: VaultContext;
 };
 
 /**
@@ -81,11 +89,19 @@ export async function hybridSearch(
   db: Database,
   embedder: Embedder,
   query: string,
-  { n = 10, cutoffs = {}, expandLinks = false }: SearchOptions = {},
+  { n = 10, cutoffs = {}, expandLinks = false, ctx }: SearchOptions = {},
+  scope?: Scope,
 ): Promise<SearchHit[]> {
   if (!Number.isInteger(n) || n < 1) {
     throw new Error(`search: n must be a positive integer, got ${n}`);
   }
+  // Only the facade holds the policy, so only the facade can turn a `ctx` into
+  // a scope. A direct caller passing one would otherwise get allow-all — the
+  // silent grant an allowlist exists to prevent.
+  if (ctx !== undefined && scope === undefined) {
+    throw new Error("search: options.ctx is resolved by the vault — call vault.search()");
+  }
+  const scoped = scope ?? ALLOW_ALL;
   assertIndexedWith(db, embedder);
 
   const match = ftsQuery(query);
@@ -94,17 +110,17 @@ export async function hybridSearch(
 
   let rows: Omit<SearchHit, "expansion">[];
   try {
-    rows = fuse(db, vector, match, n, cutoffs);
+    rows = fuse(db, vector, match, n, cutoffs, scoped);
   } catch (e) {
     // The quoting above should make an FTS5 parse error unreachable; if a
     // tokenizer or Unicode-table skew still produces one, the keyword signal
     // drops out rather than taking the whole search down with it.
     if (match === null || !/fts5/i.test(String(e))) throw e;
-    rows = fuse(db, vector, null, n, cutoffs);
+    rows = fuse(db, vector, null, n, cutoffs, scoped);
   }
 
   const direct = rows.map((r) => ({ ...r, expansion: false }));
-  return expandLinks ? [...direct, ...expand(db, direct, n)] : direct;
+  return expandLinks ? [...direct, ...expand(db, direct, n, scoped)] : direct;
 }
 
 /** One statement: both signals, their cutoffs, and the RRF fusion over them. */
@@ -114,15 +130,18 @@ function fuse(
   match: string | null,
   n: number,
   { distanceCeiling, bm25Ceiling }: Cutoffs,
+  scope: Scope,
 ): Omit<SearchHit, "expansion">[] {
   // Both sides are optional, so the SQL is assembled around the ones we have
   // and the parameters are pushed in the order they appear in it.
   const params: SQLQueryBindings[] = [];
+  const readable = scope.readSql;
   let knn = `select null as id, 0.0 as distance where 0`;
   if (vector !== null) {
     knn = `select note_id as id, distance from vectors where emb match ? and k = ?`;
     params.push(vector, OVERFETCH * n);
   }
+  params.push(...readable.params);
   let vecCutoff = "";
   if (distanceCeiling !== undefined) {
     vecCutoff = `and knn.distance <= ?`;
@@ -134,6 +153,7 @@ function fuse(
             where notes_fts match ? order by rank, rowid limit ?`;
     params.push(match, OVERFETCH * n);
   }
+  params.push(...readable.params);
   let ftsCutoff = "";
   if (bm25Ceiling !== undefined) {
     ftsCutoff = `and hits.score <= ?`;
@@ -141,21 +161,23 @@ function fuse(
   }
   params.push(n);
 
-  // Cutoffs and the supersede filter sit in the WHERE, so the rank each side
-  // contributes is a rank *among survivors* — fusion never sees the rest.
+  // Cutoffs, the supersede filter and the scope's read check sit in the WHERE,
+  // so the rank each side contributes is a rank *among survivors* — fusion
+  // never sees the rest, and a scoped agent gets up to N readable hits rather
+  // than N hits with the forbidden ones cut out afterwards.
   return db
     .query(
       `with knn as materialized (${knn}),
          vecq as (
            select knn.id as id, row_number() over (order by knn.distance, knn.id) as r
            from knn join notes n on n.id = knn.id
-           where n.superseded_by is null ${vecCutoff}
+           where n.superseded_by is null and (${readable.sql}) ${vecCutoff}
          ),
          hits as materialized (${bm25}),
          ftsq as (
            select hits.id as id, row_number() over (order by hits.score, hits.id) as r
            from hits join notes n on n.id = hits.id
-           where n.superseded_by is null ${ftsCutoff}
+           where n.superseded_by is null and (${readable.sql}) ${ftsCutoff}
          )
        select n.id as id, n.path as path, n.title as title,
               coalesce(1.0/(${RRF_K}+vecq.r), 0) + coalesce(1.0/(${RRF_K}+ftsq.r), 0) as score,
@@ -168,21 +190,27 @@ function fuse(
     .all(...params) as Omit<SearchHit, "expansion">[];
 }
 
+type Neighbour = { id: number; path: string; title: string };
+
 /**
  * Notes one wikilink away from a hit, in either direction, appended below
  * every direct hit and never mixed into the ranking — DESIGN.md § Retrieval:
  * an opt-in second pass, never an LLM graph walk. Capped at N of its own, so
  * `expandLinks` can return up to 2N.
+ *
+ * Its own enforcement point: a neighbour passes the same read check as a direct
+ * hit, or a scoped agent would read forbidden titles one wikilink away.
  */
-function expand(db: Database, hits: SearchHit[], n: number): SearchHit[] {
+function expand(db: Database, hits: SearchHit[], n: number, scope: Scope): SearchHit[] {
   if (hits.length === 0) return [];
   const ids = hits.map((h) => h.id);
   const list = ids.map(() => "?").join(",");
+  const readable = scope.readSql;
   const rows = db
     .query(
       `select n.id as id, n.path as path, n.title as title
        from notes n
-       where n.superseded_by is null
+       where n.superseded_by is null and (${readable.sql})
          and n.id not in (${list})
          and exists (
            select 1 from edges e
@@ -192,7 +220,7 @@ function expand(db: Database, hits: SearchHit[], n: number): SearchHit[] {
        order by n.path
        limit ?`,
     )
-    .all(...ids, ...ids, ...ids, n) as { id: number; path: string; title: string }[];
+    .all(...readable.params, ...ids, ...ids, ...ids, n) as Neighbour[];
   return rows.map((r) => ({ ...r, score: 0, vecRank: null, ftsRank: null, expansion: true }));
 }
 

@@ -490,7 +490,49 @@ test("path confinement: a traversing namespace or symlinked dir is refused", asy
 
   symlinkSync(join(v.root, "notes"), join(v.root, "linked"));
   await expect(v.propose({ ...CANDIDATE, namespace: "linked" })).rejects.toThrow(/symlink/);
+
+  // A NUL reaches `lstat` as a raw TypeError at the caller unless the rail
+  // refuses it first, like every other path it will not build.
+  await expect(v.propose({ ...CANDIDATE, namespace: "no\0pe" })).rejects.toThrow(
+    /^vault: no\?pe.*NUL byte/,
+  );
+  expect(() => confinedPath(v.root, "notes/\0.md")).toThrow(/NUL byte/);
   v.close();
+});
+
+test("path confinement: a namespace is canonicalized, and refused before the decider", async () => {
+  const seen: DeciderInput[] = [];
+  const v = await openVault(VAULT, async (input) => {
+    seen.push(input);
+    return { action: "create" };
+  });
+
+  // Every spelling of one namespace names one directory, and the path the
+  // caller gets back is the canonical one — it is an identity they may store,
+  // and (with scopes) the string the write check was made against.
+  const spellings = ["notes", "notes/", "notes//", "./notes", "other/../notes"];
+  for (const [i, namespace] of spellings.entries()) {
+    const r = await v.propose({ ...CANDIDATE, namespace, title: `Canonical ${i}` });
+    expect(r.path).toBe(`notes/canonical-${i}.md`);
+    expect(read(v.root, r.path!)).toContain(`title: Canonical ${i}`);
+  }
+  expect(slugify("Canonical 0")).toBe("canonical-0");
+
+  // A namespace that is not a path at all is refused *before* the decider
+  // runs: a doomed write should not cost a model call — and it is refused
+  // whatever the decider would have answered, which a `discard` used to slip
+  // past because only the create path ever built the filename.
+  const before = seen.length;
+  await expect(v.propose({ ...CANDIDATE, namespace: "../x" })).rejects.toThrow(/outside the vault/);
+  await expect(v.propose({ ...CANDIDATE, namespace: ".vault" })).rejects.toThrow(/hidden/);
+  expect(seen.length).toBe(before);
+  v.close();
+
+  const discards = await openVault(VAULT, async () => ({ action: "discard" }));
+  await expect(discards.propose({ ...CANDIDATE, namespace: "../x" })).rejects.toThrow(
+    /outside the vault/,
+  );
+  discards.close();
 });
 
 test("path confinement: the vault root is not walked, so a symlinked root opens", () => {

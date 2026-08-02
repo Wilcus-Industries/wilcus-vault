@@ -25,6 +25,8 @@ src/
   indexer.ts # scan vault dir, hash-diff, upsert notes/fts/vectors, rewrite edges
   doctor.ts  # drift report + repair + --rebuild into a temp DB, renamed into place
   search.ts  # hybrid: vec KNN + FTS5 BM25 → pre-fusion cutoffs → RRF ordering
+  scope.ts   # ScopePolicy: validate/normalize at open(), one prefix resolver for
+             # every enforcement point (and its SQL twin, for the search filters)
   gate.ts    # write gate: top-k similar → decider → update|supersede|create|discard
   watch.ts   # fs.watch + debounce + hash dirty-check → reindex changed files
   vault.ts   # Vault facade (public API), incl. the direct reads: get(path), list(prefix?)
@@ -163,9 +165,12 @@ in the ecosystem, this one):
   `ledger-archive/q3.md`. It is the note set, not the search set — superseded
   notes are listed and no cutoff applies.
 
-Neither takes a `VaultContext` yet. The type exists (#20), but a read context
-with nothing to enforce is a parameter that means nothing; it arrives on both
-with the scope read check (#23, § Scopes and context).
+Both take a `VaultContext` as an optional trailing parameter, and under a
+`ScopePolicy` it decides what they answer: `get` returns null for a note the
+agent may not read (exactly like an absent one) and `list` is filtered to the
+readable set. With no policy in force the parameter is inert — there is nothing
+to enforce — but it is refused rather than ignored when one is (§ Scopes and
+context).
 
 ## Embedding
 
@@ -243,7 +248,11 @@ half-indexed note and re-embedded on every pass.
 
 Every programmatic write goes through `vault.propose(candidate, ctx?)`, where
 `ctx` is the caller's per-call identity (§ Scopes and context) — given, the gate
-stamps its provenance onto every note it authors; absent, nothing is stamped:
+stamps its provenance onto every note it authors; absent, nothing is stamped
+(and under a `ScopePolicy` the call is refused, since there is then nothing to
+check the write against). Two refusals a doomed write earns **before** the
+decider runs, so no model call is spent on it: a namespace that fails path
+confinement, and one this agent may not write:
 
 1. hybrid-search top-k similar notes, each one re-read from disk so the hash
    captured is the *file's*, not the index's — the index is derived data. The
@@ -338,10 +347,11 @@ type VaultContext = { agent: string; source?: string };
 
 `agent` names the caller (`core/scheduler`); `source` optionally records what
 prompted the call — a conversation id, a task id, freeform. It is the second
-parameter of `propose(candidate, ctx)` — optional until a `ScopePolicy` exists
-to require it (#23); the read paths carry it as `SearchOptions.ctx` and an
-optional trailing parameter on `get`/`list` (both with #23, which is what makes
-a read context mean anything — #21 shipped them unscoped).
+parameter of `propose(candidate, ctx)`, and the read paths carry it as
+`SearchOptions.ctx` and an optional trailing parameter on `get`/`list`. It is
+optional exactly as long as no `ScopePolicy` is in force: with one, every call
+that omits it is refused, because a policy keyed on an agent has nothing to
+decide without one.
 The gate stamps provenance into the frontmatter of every note it writes:
 **`vault_agent`** and **`vault_source`** — namespaced, because `agent:` and
 `source:` are exactly the keys a human's own frontmatter plausibly holds, and
@@ -391,6 +401,22 @@ than pick a winner; it likewise refuses a subtree writable but not readable —
 a write-blind agent never sees its own notes as `similar`, so every propose
 lands as `create`: a duplicate factory, not a scope.
 
+`open()` also refuses what a policy's *type* cannot: it is operator
+configuration, so it arrives from a file, an orchestrator, another process's
+JSON, and a `read: "false"` there is **truthy** — a rule meant as a denial
+would grant. Every rule is checked to be `{prefix: string, read?: boolean,
+write?: boolean}`, and a prefix that is not the canonical form of a path
+(`./ledger`, `ledger//sub`, `ledger/../x`) is refused rather than normalized:
+stored paths are canonical, so such a prefix matches nothing, and a deny rule
+that matches nothing is a deny that never fires.
+
+Resolution itself lives in `scope.ts` — validated and normalized once at
+`open()`, then one `may(permission, path)` every enforcement point calls, plus
+the same rules compiled to a SQL `case` for the two filters that have to run
+inside the query. Two spellings of one rule, held to the same answers by the
+suite; the alternative was the prefix rule reimplemented in `vault.ts`,
+`search.ts` and `gate.ts`.
+
 Enforcement points, all inside the library so no caller re-implements them:
 
 - `search` — the scope filter runs over the **over-fetched** set (alongside
@@ -407,12 +433,21 @@ Enforcement points, all inside the library so no caller re-implements them:
   accepted: it leaks a stem's existence, never content.)
 - `propose` — the write check, twice. The candidate's target namespace is
   checked *before* the decider runs (fail fast, no model spend on a doomed
-  write). Only notes the agent may read feed the decider as `similar` — an
-  agent must not have another agent's note bodies quoted back to it by the
-  prompt — and a note readable but not writable is marked read-only in that
-  prompt; a decision that targets one anyway **falls back to `create`**, like
-  a target that failed check-and-write twice: the candidate always lands
-  somewhere, losing it is never an outcome.
+  write) — and it is checked in the **canonical** form the file will actually
+  be written at, resolved through the confinement rail once and used from
+  there on. `notes/../ledger` is inside the vault and starts with `notes/`:
+  checking the caller's spelling while writing the resolved one is a scope
+  bypass, not a cosmetic difference. Only notes the agent may read feed the
+  decider as `similar`: an agent must not have another agent's note bodies
+  quoted back to it by the prompt. The SQL filter decides that, and the gate
+  re-checks each hit in JS before reading its body off disk — that is where
+  note bodies leave the vault for a prompt, so it does not rest on one
+  filter. A note readable but not writable is marked read-only in that
+  prompt — a hint to the model, never the enforcement, since a title is
+  unfenced text and a decider can target a marked note anyway; the rail is
+  the write check on the decision's `target`, and a decision that targets one
+  **falls back to `create`**, like a target that failed check-and-write
+  twice: the candidate always lands somewhere, losing it is never an outcome.
 
 Maintenance is unscoped: `doctor`, `reindex`, `watch` and `close` are
 operator operations on the whole vault and take no context — a scoped agent
@@ -422,6 +457,14 @@ Stated plainly: **scopes are advisory containment at the library API, not
 security.** Any process with filesystem access can read or edit the files
 directly; that is the files-are-truth contract, not a hole in it. The boundary
 that matters for hostile code is the OS, not this policy object.
+
+Prefix matching is **byte-exact**, and deliberately: on Linux `Secret/` and
+`secret/` are two different namespaces holding two different notes, and
+case-folding the comparison would deny an agent a namespace it was granted.
+The consequence, recorded rather than discovered: on a case-insensitive
+filesystem (macOS, Windows) a path spelled `Secret/plans.md` reaches the same
+file a `secret/` rule denies, so the rule does not cover it. One more reason
+the sentence above is the operative one — containment, not security.
 
 ## Consolidation pass (spec — no implementation yet)
 
