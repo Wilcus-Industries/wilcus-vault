@@ -137,17 +137,42 @@ vault never hardcodes a provider. Two ship:
 
 - `TokenOverlapEmbedder` — deterministic bag-of-tokens, no network. What the CLI
   and the test suite use: it exercises the plumbing, not semantics.
-- `FetchEmbedder` — any OpenAI-compatible `POST /v1/embeddings`. Note that whole
-  note bodies leave the machine on every embed; choose the provider accordingly.
+- `FetchEmbedder` — any OpenAI-compatible `POST /v1/embeddings`. Unconfigured it
+  is a local Ollama (`all-minilm`, 384 dims, no API key), so the zero-config
+  default keeps every note on your machine.
 
 ```ts
 import { open, FetchEmbedder } from "@wilcus/vault";
 
-// each option falls back to its env var: VAULT_EMBED_API_KEY, VAULT_EMBED_ENDPOINT,
-// VAULT_EMBED_MODEL, VAULT_EMBED_DIMS. The key is never persisted, logged, or
-// echoed back in a provider's error message.
-const vault = open(root, { embedder: new FetchEmbedder({ dims: 1536 }) });
+// zero config: http://localhost:11434/v1/embeddings, all-minilm, 384 dims.
+// Run `ollama pull all-minilm` first; if nothing is listening the embed fails
+// with "no embedder configured: start Ollama ... or configure a remote
+// provider" — it never quietly falls back to a cloud API.
+const vault = open(root, { embedder: new FetchEmbedder() });
 await vault.doctor(); // first run with a new model: re-embeds everything
+```
+
+A `VAULT_EMBED_API_KEY` sitting in the environment is *not* sent to that default
+endpoint — it belongs to whichever remote provider you configured it for, and
+"whatever is listening on :11434" does not get to collect it. Configure an
+endpoint, or pass `apiKey` (a local gateway may want one), and it travels.
+
+A remote provider is supported, but only as an explicit choice — whole note
+bodies leave the machine on every embed. Each option falls back to its env var
+(`VAULT_EMBED_ENDPOINT`, `VAULT_EMBED_MODEL`, `VAULT_EMBED_DIMS`,
+`VAULT_EMBED_API_KEY`); a non-localhost endpoint requires the key, and it is
+never persisted, logged, or echoed back in a provider's error message. A remote
+endpoint must also name its `model` and `dims` — the defaults describe the local
+model, not yours, and a wrong one would be filed as if it were right.
+
+```ts
+const vault = open(root, {
+  embedder: new FetchEmbedder({
+    endpoint: "https://api.openai.com/v1/embeddings",
+    model: "text-embedding-3-small",
+    dims: 1536, // apiKey from VAULT_EMBED_API_KEY
+  }),
+});
 ```
 
 `dims` must match what the model returns — it is part of the vec0 table's schema.
