@@ -365,6 +365,39 @@ test("discard appends the whole candidate to <root>/.discarded.log", async () =>
   v.close();
 });
 
+test("a discard line records the similar set the decider saw", async () => {
+  const v = await openVault(VAULT, async () => ({ action: "discard" }));
+  await v.propose(CANDIDATE);
+
+  // The justification rides with the entry: which notes the decider judged the
+  // candidate against, at which hash and score. Staleness detection (#34)
+  // consumes this — it cannot be retrofitted onto lines logged without it.
+  const entry = JSON.parse(read(v.root, ".discarded.log").trim()) as {
+    decision: { action: string };
+    similar: { path: string; hash: string; score: number }[];
+  };
+  expect(entry.decision).toEqual({ action: "discard" });
+  const hit = entry.similar.find((s) => s.path === "notes/acme-renewal.md")!;
+  expect(hit.hash).toBe(new Bun.CryptoHasher("sha256").update(OLD_NOTE).digest("hex"));
+  expect(hit.score).toBeGreaterThan(0);
+  v.close();
+});
+
+test("a discard with nothing similar carries an empty array, not a missing key", async () => {
+  const v = await openVault(VAULT, async () => ({ action: "discard" }), {
+    distanceCeiling: 0.5,
+    bm25Ceiling: -1,
+  });
+  await v.propose({
+    title: "Zeppelin fuselage torque",
+    namespace: "notes",
+    body: "Torque values for the zeppelin fuselage struts.\n",
+  });
+  const entry = JSON.parse(read(v.root, ".discarded.log").trim()) as { similar: unknown };
+  expect(entry.similar).toEqual([]);
+  v.close();
+});
+
 test("a human edit between search and apply aborts and re-gates against fresh state", async () => {
   let calls = 0;
   let root = "";
@@ -684,9 +717,11 @@ test("a vault out of free filenames logs the candidate before giving up", async 
   const entry = JSON.parse(read(v.root, ".discarded.log").trim()) as {
     candidate: unknown;
     reason: string;
+    similar: unknown;
   };
   expect(entry.candidate).toEqual(CANDIDATE);
   expect(entry.reason).toMatch(/free filename/);
+  expect(entry.similar).toEqual([]); // every line carries the field
   v.close();
 });
 

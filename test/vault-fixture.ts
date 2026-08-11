@@ -16,7 +16,7 @@ export const stubEmbedder = (
 let held = false;
 
 /**
- * Run `fn` with exactly the `VAULT_EMBED_*` environment it asks for — the rest
+ * Run `fn` with exactly the `VAULT_EMBED_*` / `VAULT_DECIDE_*` environment it asks for — the rest
  * cleared, so a developer's own key or endpoint cannot decide a test — then put
  * the real environment back. `fn` may be async: an async one reads the
  * environment *after* it returns its promise, so the restore waits for it.
@@ -26,7 +26,15 @@ export function withEnv<T>(env: Record<string, string>, fn: () => T): T {
   // other's state and leave a test reading someone else's endpoint. Refused
   // loudly rather than debugged later as flakiness.
   if (held) throw new Error("withEnv is not re-entrant: await the outer one first");
-  const names = ["VAULT_EMBED_API_KEY", "VAULT_EMBED_ENDPOINT", "VAULT_EMBED_MODEL", "VAULT_EMBED_DIMS"];
+  const names = [
+    "VAULT_EMBED_API_KEY",
+    "VAULT_EMBED_ENDPOINT",
+    "VAULT_EMBED_MODEL",
+    "VAULT_EMBED_DIMS",
+    "VAULT_DECIDE_API_KEY",
+    "VAULT_DECIDE_ENDPOINT",
+    "VAULT_DECIDE_MODEL",
+  ];
   const prev = names.map((n) => [n, process.env[n]] as const);
   const restore = () => {
     for (const [n, v] of prev) {

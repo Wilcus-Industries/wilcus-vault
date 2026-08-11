@@ -1,5 +1,5 @@
 import { test, expect, afterAll, spyOn } from "bun:test";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { dbPath } from "../src/db";
 import { main } from "../src/cli";
@@ -90,6 +90,7 @@ test("cli: --help documents every command and exits 0", async () => {
       "search",
       "watch",
       "consolidate",
+      "discards",
       "--vault",
       "--lexical",
       "--ceiling",
@@ -148,6 +149,50 @@ test("cli: searching an unindexed vault says so rather than reporting nothing", 
     code: 0,
     out: "vault is not indexed (run vault reindex)",
   });
+});
+
+test("cli: discards list/show read the log; restore is gated on config", async () => {
+  const root = makeVault(GRAPH);
+  // an empty log is an answer, not an error
+  expect(await cli("discards", "list", "--lexical", "--vault", root)).toMatchObject({
+    code: 0,
+    out: "no discards",
+  });
+
+  const entry = {
+    at: "2026-01-01T00:00:00.000Z",
+    candidate: { title: "Dropped thought", namespace: "notes", body: "body\n" },
+    decision: { action: "discard" },
+    similar: [],
+  };
+  writeFileSync(join(root, ".discarded.log"), `${JSON.stringify(entry)}\n`);
+
+  const list = await cli("discards", "list", "--lexical", "--vault", root);
+  expect(list.code).toBe(0);
+  expect(list.out).toContain("Dropped thought");
+  expect(list.out).toContain("discard");
+
+  const show = await cli("discards", "show", "1", "--lexical", "--vault", root);
+  expect(show.code).toBe(0);
+  expect(JSON.parse(show.out)).toMatchObject({ candidate: { title: "Dropped thought" } });
+  expect((await cli("discards", "show", "9", "--lexical", "--vault", root)).code).toBe(1);
+
+  // restore needs a ceiling (like consolidate) and a configured chat model —
+  // refused with the fix named, before any database is opened
+  expect((await cli("discards", "restore", "1", "--lexical", "--vault", root)).code).toBe(1);
+  const noModel = await withEnv({}, () =>
+    cli("discards", "restore", "1", "--ceiling", "0.5", "--lexical", "--vault", root),
+  );
+  expect(noModel.code).toBe(1);
+  expect(noModel.err).toContain("VAULT_DECIDE_MODEL");
+
+  // a missing or malformed subcommand is usage, not a crash
+  expect((await cli("discards", "--lexical", "--vault", root)).code).toBe(1);
+  expect((await cli("discards", "show", "x", "--lexical", "--vault", root)).code).toBe(1);
+
+  // doctor surfaces the log so normal maintenance sees it
+  const doctored = await cli("doctor", "--lexical", "--vault", root);
+  expect(doctored.out).toContain("discard log: 1 entries (0 recent)");
 });
 
 // A remote endpoint with no key that FetchEmbedder refuses to construct at all,

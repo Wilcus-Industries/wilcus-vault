@@ -58,10 +58,10 @@ const NO_EMBEDDER =
  * URL may carry `user:password@`, and this error is printed, logged and pasted
  * into bug reports. The setting is where the reader can read it themselves.
  */
-function isLocal(endpoint: string, setting: string): boolean {
+export function isLocal(endpoint: string, setting: string, who = "FetchEmbedder"): boolean {
   const url = URL.parse(endpoint);
   if (url === null || !["http:", "https:"].includes(url.protocol) || url.hostname === "") {
-    throw new Error(`FetchEmbedder: invalid ${setting} — expected an http(s) URL with a host`);
+    throw new Error(`${who}: invalid ${setting} — expected an http(s) URL with a host`);
   }
   return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
 }

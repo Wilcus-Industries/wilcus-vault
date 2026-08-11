@@ -1,5 +1,5 @@
 import { test, expect, afterAll } from "bun:test";
-import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { openDb, dbPath } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
@@ -49,6 +49,19 @@ test("doctor separates broken links from ambiguous ones and names the candidates
   ]);
   expect(report.orphans).toEqual(["notes/lonely.md", "one/dup.md", "two/dup.md"]);
   expect(report.malformed).toEqual([]);
+});
+
+test("doctor counts the discard log: total entries, and how many are recent", async () => {
+  const root = makeVault({ "a.md": "# A\n\n[[b]]\n", "b.md": "# B\n\n[[a]]\n" });
+  // no log at all is zero, not an error
+  expect((await doctor(root, embedder)).discards).toEqual({ entries: 0, recent: 0 });
+
+  const line = (at: string) => `${JSON.stringify({ at, candidate: { title: "t", body: "b" } })}\n`;
+  writeFileSync(
+    join(root, ".discarded.log"),
+    line("2020-01-01T00:00:00.000Z") + line(new Date().toISOString()),
+  );
+  expect((await doctor(root, embedder)).discards).toEqual({ entries: 2, recent: 1 });
 });
 
 test("a qualified link is broken, never ambiguous, and duplicate stems alone are fine", async () => {

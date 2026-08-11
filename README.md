@@ -41,6 +41,9 @@ vault doctor [--rebuild] [--vault <dir>] # check and repair the index
 vault search <query> [--vault <dir>]     # hybrid search, best first
 vault watch [--vault <dir>]              # index changes as they are saved
 vault consolidate --ceiling <d>          # report near-duplicate clusters
+vault discards list                      # the discard log, newest first
+vault discards show <n>                  # one refused candidate, in full
+vault discards restore <n> --ceiling <d> # re-propose it through the gate
 vault --help                             # every command and flag
 ```
 
@@ -205,11 +208,18 @@ once the vault has a scope policy — see [Scopes](#scopes).
 
 Writes land through a temp file renamed into place, so a reader never sees half a
 note. A discarded candidate — or one the gate cannot place at all — is appended
-whole to `<root>/.discarded.log`; losing the note is never an outcome. That log is
+whole to `<root>/.discarded.log`, along with the similar set the decider saw;
+losing the note is never an outcome. That log is
 history, not index, so it sits beside the notes rather than in the disposable
 `.vault/` — a `doctor --rebuild` or an `rm -rf .vault` leaves it alone (a log left
-in the old place is moved out by the next repairing `vault doctor`). It holds whole
-candidate bodies, so a vault kept in git may want it in `.gitignore` too. Notes the
+in the old place is moved out by the next repairing `vault doctor`). It rotates at
+5 MiB (`.discarded.N.log`, nothing deleted), and its first write adds
+`.discarded.log*` to the vault's `.gitignore` so refused bodies stay out of git
+history. `vault discards` reviews it — `list`, `show <n>`, and `restore <n>`,
+which feeds the candidate back through the gate against the *current* vault
+(`restore` needs `--ceiling` and a chat model via `VAULT_DECIDE_MODEL`, plus
+`VAULT_DECIDE_ENDPOINT` / `VAULT_DECIDE_API_KEY` off the local Ollama default);
+`vault doctor` reports the entry count. Notes the
 gate did not author are patched textually, never re-serialized, so comments,
 `01234` and `1.0` survive. Human edits bypass the gate by definition:
 `vault watch` and `vault doctor` pick them up.

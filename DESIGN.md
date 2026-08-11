@@ -308,10 +308,25 @@ confinement, and one this agent may not write:
      marking is bookkeeping, not authorship;
      `discard` appends the candidate
      as a JSONL line to `<root>/.discarded.log` so a wrong LLM call never silently
-     loses information. That log is durable history, so it lives beside the notes
+     loses information — together with the `similar` set the decider saw
+     (`[{path, hash, score}]`, `[]` when none), which is the justification a
+     later staleness pass (#34) reads and cannot be retrofitted. That log is
+     durable history, so it lives beside the notes
      and not in the disposable `.vault/` index directory — a `--rebuild` or an
      `rm -rf .vault` must not take it with them. It is a dot-file, so the scan
      never indexes it, and `doctor` moves a log left in the old location once.
+     Bounded but never deleted (#33): at 5 MiB it rotates to `.discarded.N.log`,
+     and the first write to a fresh log adds `.discarded.log*` to the vault's
+     `.gitignore` — once; a line the user removed stays removed — so refused
+     note bodies never ride into git history. The read side is `discards.ts`
+     (`vault discards list | show <n> | restore <n>`, and a count in `doctor`'s
+     report): `restore` feeds the candidate back through `propose`, so
+     re-admission re-runs search+decide against *current* vault state — the
+     gate stays the only write door. The CLI's `restore` wires `fetchDecider`
+     (`decide.ts`), FetchEmbedder's chat twin: OpenAI-compatible, configured by
+     `VAULT_DECIDE_*`, endpoint defaulting to the local Ollama, model always
+     explicit — the one CLI command that runs a model, because restoring
+     without re-deciding would bypass the gate.
 
 Two consequences of the rails, recorded so they are not mistaken for slips. A
 traversing *title* is slugified rather than refused (`../../evil` is the note

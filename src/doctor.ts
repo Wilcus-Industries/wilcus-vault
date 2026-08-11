@@ -4,6 +4,7 @@ import type { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { openDb, dbPath } from "./db";
+import { countDiscards } from "./discards";
 import { discardLog } from "./gate";
 import { reindex, readNote, scanVault } from "./indexer";
 import { linkTarget } from "./note";
@@ -38,6 +39,8 @@ export type DoctorReport = {
   reembedded: boolean;
   /** a discard log left in `.vault/` was moved out to `<root>/.discarded.log` */
   migratedDiscardLog: boolean;
+  /** the discard log beside the notes: total entries, and those from the last 7 days */
+  discards: { entries: number; recent: number };
 };
 
 export type DoctorOptions = {
@@ -64,7 +67,15 @@ export async function doctor(
   else if (repair) {
     reembedded = (await withDb(path, (db) => reindex(db, root, embedder))).reembedded;
   }
-  return { ...drift, ...(await withDb(path, graphReport)), reembedded, migratedDiscardLog };
+  // Counted after the migration above, so lines it just moved out of `.vault/`
+  // are in the report that surfaces them.
+  return {
+    ...drift,
+    ...(await withDb(path, graphReport)),
+    reembedded,
+    migratedDiscardLog,
+    discards: countDiscards(root),
+  };
 }
 
 /**
@@ -123,7 +134,7 @@ async function diskDrift(
 
 function graphReport(
   db: Database,
-): Omit<DoctorReport, "stale" | "missing" | "reembedded" | "migratedDiscardLog"> {
+): Omit<DoctorReport, "stale" | "missing" | "reembedded" | "migratedDiscardLog" | "discards"> {
   const unresolved = db
     .query(
       `select n.path as "from", e.to_slug as slug
