@@ -1,5 +1,6 @@
 import { test, expect, afterAll, spyOn } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { dbPath } from "../src/db";
 import { main } from "../src/cli";
 import { makeVault, cleanupVaults, withEnv } from "./vault-fixture";
@@ -83,10 +84,42 @@ test("cli: --help documents every command and exits 0", async () => {
     const { code, out, err } = await cli(...argv);
     expect(code).toBe(0); // help was asked for; answering it is not a failure
     expect(err).toBe("");
-    for (const command of ["reindex", "doctor", "search", "watch", "--vault", "--lexical"]) {
+    for (const command of [
+      "reindex",
+      "doctor",
+      "search",
+      "watch",
+      "consolidate",
+      "--vault",
+      "--lexical",
+      "--ceiling",
+    ]) {
       expect(out).toContain(command);
     }
   }
+});
+
+test("cli: consolidate reports the clusters it found and writes nothing", async () => {
+  const twins = "# Renewal\n\nthe acme renewal closes in march\n";
+  const root = makeVault({
+    "notes/one.md": twins,
+    "notes/two.md": twins,
+    "notes/far.md": "# Zeppelin\n\ntorque values for the fuselage struts\n",
+  });
+  const { code, out, err } = await cli("consolidate", "--ceiling", "0.2", "--lexical", "--vault", root);
+  expect(code).toBe(0);
+  expect(err).toBe("");
+  expect(out).toContain("notes/one.md notes/two.md");
+  expect(out).not.toContain("notes/far.md");
+  // Report-only: merging needs an injected merger (an LLM), which the CLI has
+  // no way to wire — so nothing on disk may have moved.
+  expect(readdirSync(join(root, "notes")).sort()).toEqual(["far.md", "one.md", "two.md"]);
+  expect(readFileSync(join(root, "notes/one.md"), "utf8")).toBe(twins);
+
+  // the ceiling is mandatory here too, and it is a cosine distance
+  expect((await cli("consolidate", "--lexical", "--vault", root)).code).toBe(1);
+  expect((await cli("consolidate", "--ceiling", "9", "--lexical", "--vault", root)).code).toBe(1);
+  expect((await cli("consolidate", "--ceiling", "--lexical", "--vault", root)).code).toBe(1);
 });
 
 test("cli: search prints one readable line per hit — score, then path", async () => {

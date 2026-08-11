@@ -40,6 +40,7 @@ vault reindex [--vault <dir>]            # index new and changed notes
 vault doctor [--rebuild] [--vault <dir>] # check and repair the index
 vault search <query> [--vault <dir>]     # hybrid search, best first
 vault watch [--vault <dir>]              # index changes as they are saved
+vault consolidate --ceiling <d>          # report near-duplicate clusters
 vault --help                             # every command and flag
 ```
 
@@ -80,6 +81,21 @@ It logs the passes that changed something and stops on ctrl-c (finishing the
 pass in flight first). It is a convenience, never a source of
 truth: anything it misses — a directory rename, a pass that failed, a crash —
 `vault doctor` finds and fixes.
+
+```
+$ vault consolidate --ceiling 0.15
+indexed 0 new, 0 changed, 0 removed, 214 unchanged
+0.0412  customers/acme.md customers/acme-corp.md
+0.1180  cross-namespace  notes/pager.md support/rota.md
+```
+
+`vault consolidate` is report-only: one line per near-duplicate cluster —
+widest distance inside it, then the note paths, with the clusters that span
+namespaces flagged, because those are never merged. It reindexes first, so the
+report describes the files rather than a stale index. Merging is a library
+call — it needs a merger you inject, the same reason there is no
+`vault propose` — so this is the pass you run to find the ceiling your embedder
+calls a duplicate. See [Consolidation](#consolidation).
 
 ## Obsidian
 
@@ -214,6 +230,61 @@ nothing is stamped — on an `update` that also means the previous call's keys a
 *removed*, so `vault_agent` never names an agent that did not write the note it
 sits on. Omitting it stops being an option once the vault has a scope policy,
 which has nothing to check the write against without it.
+
+### Consolidation
+
+A vault accretes near-duplicates: the gate only sees the top-k similar notes at
+write time, and humans add notes behind its back. `consolidate` is the
+deliberate, occasional merge pass — manually triggered, never a daemon.
+
+```ts
+const vault = open("/path/to/vault", {
+  embedder,
+  consolidate: {
+    // your LLM call again; `mergePrompt` and `parseMerged` are the wiring
+    merger: async (input) => parseMerged(await askYourModel(mergePrompt(input))),
+  },
+});
+
+// dry run: what a merge pass *would* do, and it is the default
+const report = await vault.consolidate({ ceiling: 0.15 });
+report.merges[0];       // { cluster: { members, namespace, distance }, candidate }
+report.crossNamespace;  // clusters spanning namespaces — reported, never merged
+report.remaining;       // clusters the cap did not reach
+
+await vault.consolidate({ ceiling: 0.15, cap: 3, write: true, ctx });
+// merges[0] → { ..., path: "customers/acme.md", superseded: [...], unmarked: [] }
+```
+
+- **The ceiling is mandatory**, like the gate's cutoffs and for the same
+  reason: there is no universal number for "duplicate", it is a property of
+  your embedder. Find yours with `vault consolidate --ceiling <d>` before you
+  let anything write.
+- A cluster admits a note only if it is under the ceiling from **every** note
+  already in it (complete linkage). Single linkage chains A~B~C and merges A
+  with a C it does not resemble. The scan is all-pairs over the vectors table,
+  O(n²) and accepted — notes embed whole, so n is the note count.
+- Clusters that **span namespaces** are reported and never merged: namespaces
+  are boundaries, and collapsing one is a human call. Superseded notes never
+  cluster, and neither do notes the embedder had no tokens for (a CJK or
+  emoji-only note has no vector row — it stays findable through FTS).
+- **Dry-run is the default**; `write: true` is what makes a run act. A wrong
+  ceiling found in a report costs nothing. A dry run still reindexes first (so
+  discovery sees the files, not a stale index) and still calls your merger once
+  per cluster it would merge, up to the cap.
+- A write goes through the gate's own rails: the merged note is created with
+  slug confinement, collision suffixing and `ctx`'s provenance, then **each**
+  member is marked `superseded_by` it — a textual patch, check-and-write per
+  member, and a member a human edited mid-flight comes back in `unmarked`
+  rather than being clobbered. Nothing is ever deleted: the originals stay on
+  disk, marked, out of search.
+- The **cap** (default 5) counts clusters merged; the rest come back in
+  `remaining`. A pass that wants to rewrite half the vault is evidence the
+  ceiling is wrong, and the cap turns that into a short report instead of a
+  long mess.
+
+Consolidation is an operator operation like `doctor` — unscoped, whole-vault —
+so its `ctx` is provenance for the notes it writes, not a permission check.
 
 ### Scopes
 

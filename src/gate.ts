@@ -226,8 +226,11 @@ export function parseDecision(text: string): Decision {
  * Note text is data, not instruction. Anything that could pass for one of the
  * delimiters below is indented one space, so a note body cannot close its own
  * fence and address the model directly. The text still reads normally.
+ * Exported because the consolidation pass quotes note bodies into a prompt of
+ * its own, and one escaping rule is the only kind that cannot go stale.
  */
-const fence = (text: string): string => text.trim().replace(/^---[ \t]*(begin|end)/gim, " $&");
+export const fence = (text: string): string =>
+  text.trim().replace(/^---[ \t]*(begin|end)/gim, " $&");
 
 /** The prompt an LLM decider gets. `parseDecision` reads what it asks for. */
 export function gatePrompt({ candidate, similar }: DeciderInput): string {
@@ -463,23 +466,45 @@ async function apply(
   // supersede: the successor is written first, then the old note is marked and
   // linked forward to it.
   const created = await create(db, root, candidate, namespace, decision.body, ctx);
-  // Writing the successor took time, and the old note belongs to a human. If it
-  // moved in that window the successor stands and the caller is told the old
-  // note is unmarked — the alternative is overwriting an edit for bookkeeping.
-  const current = await readRaw(root, rel);
-  if (current === null || parseNote(current, rel).hash !== hit.hash) {
-    return { action: "supersede", path: created.path, unmarked: rel };
+  return {
+    action: "supersede",
+    path: created.path,
+    ...(await markSuperseded(root, { path: rel, hash: hit.hash }, created.path!)),
+  };
+}
+
+/**
+ * Retire one note in favour of another: mark it `superseded_by` and link it
+ * forward. A textual patch, never a re-serialization — we did not author this
+ * note — and marked, *not* restamped: the marking is bookkeeping, not
+ * authorship, and the agent that wrote the successor is already recorded there.
+ *
+ * Check-and-write, like every other touch: `hash` is what the caller read the
+ * note at, and writing the successor took time. If the note moved in that
+ * window it comes back `unmarked` and untouched — the successor stands, and a
+ * human's edit does not get overwritten to tidy up our own bookkeeping.
+ *
+ * Shared with the consolidation pass, which marks N members of a cluster
+ * against one merged note (DESIGN.md § Consolidation pass).
+ */
+export async function markSuperseded(
+  root: string,
+  note: { path: string; hash: string },
+  successor: string,
+): Promise<{ superseded: string } | { unmarked: string }> {
+  const abs = confinedPath(root, note.path);
+  const current = await readRaw(root, note.path);
+  if (current === null || parseNote(current, note.path).hash !== note.hash) {
+    return { unmarked: note.path };
   }
-  // Marked, not restamped: the marking is bookkeeping, not authorship, and the
-  // superseding agent is already recorded on the successor.
-  const marked = patchFrontmatter(current, "superseded_by", created.path!);
-  // The gate knows the exact path, so it links by path rather than by stem: a
+  const marked = patchFrontmatter(current, "superseded_by", successor);
+  // The caller knows the exact path, so it links by path rather than by stem: a
   // namespaced successor cannot go ambiguous later. (A successor written to the
   // vault root has no qualified form, so its link is a bare stem and *can* —
   // DESIGN.md § Data model.)
-  const link = `Superseded by [[${linkTarget(created.path!)}]].\n`;
+  const link = `Superseded by [[${linkTarget(successor)}]].\n`;
   await writeAtomic(abs, marked.endsWith("\n") ? `${marked}\n${link}` : `${marked}\n\n${link}`);
-  return { action: "supersede", path: created.path, superseded: rel };
+  return { superseded: note.path };
 }
 
 /**
@@ -516,8 +541,14 @@ function provenance(ctx?: VaultContext): Record<string, string> {
   return { vault_agent: ctx.agent, ...(ctx.source !== undefined && { vault_source: ctx.source }) };
 }
 
-/** Write a note we authored ourselves — the one place `serializeNote` is used. */
-async function create(
+/**
+ * Write a note we authored ourselves — the one place `serializeNote` is used.
+ * Exported for the consolidation pass, which writes its merged note through
+ * this same rail: slug confinement, collision suffixing, provenance stamping.
+ * `namespace` is canonical (`normalizePrefix`), and the caller has already
+ * decided the write is allowed — `create` does not scope-check.
+ */
+export async function create(
   db: Database,
   root: string,
   candidate: Candidate,

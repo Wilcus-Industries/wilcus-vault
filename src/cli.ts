@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { resolve } from "node:path";
 import { openDb, dbPath } from "./db";
+import { clusters } from "./consolidate";
 import { reindex, type IndexStats } from "./indexer";
 import { doctor, type DoctorReport } from "./doctor";
 import { FetchEmbedder, TokenOverlapEmbedder } from "./embed";
@@ -14,11 +15,19 @@ const USAGE = `vault <command> [options]
   doctor [--rebuild]  check and repair the index (--rebuild: from scratch)
   search <query>      hybrid search: one line per hit — score, path, title
   watch               index every change as it is saved, until interrupted
+  consolidate         report near-duplicate clusters (needs --ceiling)
 
   --vault <dir>       vault root (default: the current directory)
   --lexical           embed offline, without a provider (see below)
+  --ceiling <d>       cosine distance two notes must be within to cluster
   --help, -h          this text
   --                  end of flags, so a search query may start with a dash
+
+vault consolidate is report-only: one line per cluster — widest internal
+distance, then the member paths, with the ones that span namespaces flagged
+(those are never merged). Merging itself needs an injected merger, so it
+lives in the library API; this is the pass that tells you which ceiling your
+embedder calls a duplicate.
 
 Notes embed on a local Ollama unless VAULT_EMBED_* names another
 OpenAI-compatible provider: run \`ollama pull all-minilm\` once, or pass
@@ -54,12 +63,14 @@ function parseArgs(argv: string[]): {
   words: string[];
   rebuild: boolean;
   lexical: boolean;
+  ceiling: number | undefined;
   help: boolean;
 } {
   const words: string[] = [];
   let root = process.cwd();
   let rebuild = false;
   let lexical = false;
+  let ceiling: number | undefined;
   let help = false;
   let literal = false;
   for (let i = 0; i < argv.length; i++) {
@@ -74,6 +85,21 @@ function parseArgs(argv: string[]): {
       rebuild = true;
     } else if (arg === "--lexical") {
       lexical = true;
+    } else if (arg === "--ceiling") {
+      const value = argv[++i];
+      ceiling = Number(value);
+      // A missing value would swallow the next flag; a nonsense one would reach
+      // the query as NaN, where every comparison is false and the pass would
+      // report "nothing to merge" about a vault it never really looked at.
+      if (
+        value === undefined ||
+        value.startsWith("--") ||
+        !Number.isFinite(ceiling) ||
+        ceiling < 0 ||
+        ceiling > 2
+      ) {
+        throw new Error(`--ceiling needs a cosine distance in 0..2\n\n${USAGE}`);
+      }
     } else if (arg !== "--vault") {
       throw new Error(`unknown flag ${arg}\n\n${USAGE}`);
     } else {
@@ -86,13 +112,13 @@ function parseArgs(argv: string[]): {
       root = dir;
     }
   }
-  return { root, words, rebuild, lexical, help };
+  return { root, words, rebuild, lexical, ceiling, help };
 }
 
-const COMMANDS = ["reindex", "doctor", "search", "watch"] as const;
+const COMMANDS = ["reindex", "doctor", "search", "watch", "consolidate"] as const;
 
 async function run(argv: string[]): Promise<number> {
-  const { root, words, rebuild, lexical, help } = parseArgs(argv);
+  const { root, words, rebuild, lexical, ceiling, help } = parseArgs(argv);
   // Help was asked for, so answering it is a success — `vault --help | less`
   // reads it, and a script checking the exit code is not told it failed.
   if (help) {
@@ -146,6 +172,39 @@ async function run(argv: string[]): Promise<number> {
     const db = openDb(dbPath(root));
     try {
       console.log(`indexed ${summary(await reindex(db, root, embedder))}`);
+    } finally {
+      db.close();
+    }
+    return 0;
+  }
+
+  if (command === "consolidate") {
+    // Report-only, deliberately: a merge needs an injected merger (an LLM), and
+    // the CLI wires no model — the same reason there is no `vault propose`. The
+    // library API is the write path; this is the pass you run first, because the
+    // ceiling that means "duplicate" is a property of your embedder.
+    if (ceiling === undefined) throw new Error(`consolidate needs --ceiling\n\n${USAGE}`);
+    const db = openDb(dbPath(root));
+    try {
+      // Discovery reads the index, so bring it up to the files first — and say
+      // so, like `watch` does, since a first run may be doing the whole vault.
+      console.log(`indexed ${summary(await reindex(db, root, embedder))}`);
+      const found = clusters(db, ceiling);
+      console.log(
+        found.length === 0
+          ? "no clusters under that ceiling"
+          : found
+              .map((c) =>
+                // distance first so the closest duplicates read down the page,
+                // then the flag for a cluster no merge would touch, then the
+                // notes themselves
+                safe(
+                  `${c.distance.toFixed(4)}  ` +
+                    `${c.namespace === null ? "cross-namespace  " : ""}${c.members.join(" ")}`,
+                ),
+              )
+              .join("\n"),
+      );
     } finally {
       db.close();
     }

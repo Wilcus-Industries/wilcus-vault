@@ -13,6 +13,12 @@ import {
 } from "./indexer";
 import { doctor as runDoctor, type DoctorOptions, type DoctorReport } from "./doctor";
 import {
+  consolidate as runConsolidate,
+  type ConsolidateOptions,
+  type ConsolidateReport,
+  type ConsolidateRun,
+} from "./consolidate";
+import {
   confinedPath,
   propose as runGate,
   type Candidate,
@@ -30,6 +36,8 @@ export type VaultOptions = {
   embedder: Embedder;
   /** required by `propose`: the write gate needs a decider *and* explicit cutoffs */
   gate?: GateOptions;
+  /** required by `consolidate`: the merge pass needs a merger, like the gate needs a decider */
+  consolidate?: ConsolidateOptions;
   /**
    * Per-agent namespace rules (DESIGN.md § Scopes and context). **Absent means
    * allow-all**, so a single-agent caller changes nothing; present, it is an
@@ -74,6 +82,15 @@ export type Vault = {
    * where this agent may write and which notes the decider is shown.
    */
   propose(candidate: Candidate, ctx?: VaultContext): Promise<GateResult>;
+  /**
+   * The consolidation pass: find near-duplicate clusters under a mandatory
+   * distance ceiling and merge each into one note (DESIGN.md § Consolidation
+   * pass). **Dry-run unless `write: true`**, capped per run, and nothing is
+   * ever deleted. An operator operation like `doctor` — unscoped, whoever is
+   * calling — so `options.ctx` is the provenance stamped on the merged notes,
+   * not a permission check.
+   */
+  consolidate(options: ConsolidateRun): Promise<ConsolidateReport>;
   /** hash-diff the files into the index */
   reindex(): Promise<IndexStats>;
   /** report and repair index drift; `--rebuild` reindexes from scratch */
@@ -84,7 +101,10 @@ export type Vault = {
 };
 
 /** Open a vault. The index is created on demand; the files are the truth. */
-export function open(root: string, { embedder, gate, scopes }: VaultOptions): Vault {
+export function open(
+  root: string,
+  { embedder, gate, consolidate: consolidateOptions, scopes }: VaultOptions,
+): Vault {
   const dir = resolve(root);
   // Validated before anything is opened, so a contradictory policy costs no
   // database handle — and null (no policy at all) is allow-all, which every
@@ -151,6 +171,15 @@ export function open(root: string, { embedder, gate, scopes }: VaultOptions): Va
       }
       return runGate(db, dir, embedder, candidate, gate, scopeFor(policy, ctx));
     },
+    // No `scopeFor`: consolidation is an operator operation on the whole vault,
+    // like doctor. `options.ctx` travels only as the provenance of the notes it
+    // writes (DESIGN.md § Consolidation pass).
+    async consolidate(options) {
+      if (consolidateOptions === undefined) {
+        throw new Error("vault: consolidate needs a merger — open() with {consolidate: {merger}}");
+      }
+      return runConsolidate(db, dir, embedder, consolidateOptions, options);
+    },
     reindex: () => reindexVault(db, dir, embedder),
     async doctor(options) {
       const report = await runDoctor(dir, embedder, options);
@@ -179,4 +208,15 @@ export type { IndexStats } from "./indexer";
 export type { Note } from "./note";
 export { gatePrompt, parseDecision, slugify } from "./gate";
 export type { Decider, DeciderInput, Decision, SimilarNote, Action } from "./gate";
+export { clusters, mergePrompt, parseMerged } from "./consolidate";
+export type {
+  Cluster,
+  ConsolidateOptions,
+  ConsolidateReport,
+  ConsolidateRun,
+  Merge,
+  MergeInput,
+  MergedNote,
+  Merger,
+} from "./consolidate";
 export { TokenOverlapEmbedder, FetchEmbedder } from "./embed";
