@@ -516,7 +516,14 @@ the `VaultContext` the operator hands it.
 - **Dry-run is the default.** A run reports clusters and each would-be merge;
   writing takes an explicit flag. A wrong ceiling discovered in a report
   costs nothing; discovered in the files, it costs an afternoon.
-- **Per-run action cap**, counted in clusters merged (default single digits):
+- **A write run survives a bad cluster.** Once a merge has landed, a later
+  cluster's failure (merger error, no free filename) must not discard the
+  report of what landed: on a write run, per-cluster errors are collected into
+  the report's `errors` field and the run continues, and the closing reindex
+  runs regardless so the index never lags the landed writes. A dry run still
+  throws — nothing has landed that a report would need to account for.
+- **Per-run action cap**, counted in clusters acted on — merged or errored,
+  both spent their model call (default single digits):
   on hitting it the run stops and reports the remainder. A pass that wants to
   rewrite half the vault is evidence the ceiling is wrong, and the cap turns
   that evidence into a short report instead of a long mess.

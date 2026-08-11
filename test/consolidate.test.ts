@@ -261,6 +261,53 @@ test("the cap counts clusters merged and reports the remainder untouched", async
   v.close();
 });
 
+test("a write run collects per-cluster errors and the index never lags landed merges", async () => {
+  // Three pairs on three axes (as in the cap test). The merger throws on the
+  // DELTA cluster: the ALPHA merge has already landed, EPSILON still runs.
+  const files = {
+    "notes/a1.md": "# A one\n\nALPHA one.\n",
+    "notes/a2.md": "# A two\n\nALPHA two.\n",
+    "notes/d1.md": "# D one\n\nDELTA one.\n",
+    "notes/d2.md": "# D two\n\nDELTA two.\n",
+    "notes/e1.md": "# E one\n\nEPSILON one.\n",
+    "notes/e2.md": "# E two\n\nEPSILON two.\n",
+  };
+  const merger: Merger = async ({ notes }) => {
+    if (notes.some((n) => n.body.includes("DELTA"))) throw new Error("model fell over");
+    return { title: notes[0]!.title + " merged", body: notes.map((n) => n.body).join("") };
+  };
+  const v = openVault(files, merger);
+  const r = await v.consolidate({ ceiling: 0.25, write: true });
+
+  // the landed merge is reported, not discarded behind the exception
+  expect(r.merges).toHaveLength(2);
+  expect(r.merges.map((m) => m.cluster.members[0])).toEqual(["notes/a1.md", "notes/e1.md"]);
+  expect(r.errors).toHaveLength(1);
+  expect(r.errors[0]!.cluster.members).toEqual(["notes/d1.md", "notes/d2.md"]);
+  expect(r.errors[0]!.error).toContain("model fell over");
+  // the erroring cluster's members are untouched
+  for (const rel of ["notes/d1.md", "notes/d2.md"]) {
+    expect(read(v.root, rel)).toBe(files[rel as keyof typeof files]);
+  }
+  // and the closing reindex ran: the index does not lag the landed writes
+  expect((await v.search("ALPHA")).map((h) => h.path)).not.toContain("notes/a1.md");
+  expect((await v.search("EPSILON")).map((h) => h.path)).not.toContain("notes/e1.md");
+  v.close();
+
+  // an errored cluster counts against the cap: it spent its model call
+  const capped = openVault(files, merger);
+  const cr = await capped.consolidate({ ceiling: 0.25, cap: 2, write: true });
+  expect(cr.merges).toHaveLength(1);
+  expect(cr.errors).toHaveLength(1);
+  expect(cr.remaining.map((c) => c.members)).toEqual([["notes/e1.md", "notes/e2.md"]]);
+  capped.close();
+
+  // dry-run behavior is unchanged: a merger throw still propagates
+  const dry = openVault(files, merger);
+  await expect(dry.consolidate({ ceiling: 0.25 })).rejects.toThrow("model fell over");
+  dry.close();
+});
+
 test("a member edited mid-flight is reported unmarked, and the merged note stands", async () => {
   const v = openVault(NOTES, fakeMerger().merger);
   const real = Bun.write;

@@ -261,6 +261,7 @@ const report = await vault.consolidate({ ceiling: 0.15 });
 report.merges[0];       // { cluster: { members, namespace, distance }, candidate }
 report.crossNamespace;  // clusters spanning namespaces — reported, never merged
 report.remaining;       // clusters the cap did not reach
+report.errors;          // write runs: clusters whose merge threw — the run continues
 
 await vault.consolidate({ ceiling: 0.15, cap: 3, write: true, ctx });
 // merges[0] → { ..., path: "customers/acme.md", superseded: [...], unmarked: [] }
@@ -288,10 +289,15 @@ await vault.consolidate({ ceiling: 0.15, cap: 3, write: true, ctx });
   member, and a member a human edited mid-flight comes back in `unmarked`
   rather than being clobbered. Nothing is ever deleted: the originals stay on
   disk, marked, out of search.
-- The **cap** (default 5) counts clusters merged; the rest come back in
-  `remaining`. A pass that wants to rewrite half the vault is evidence the
-  ceiling is wrong, and the cap turns that into a short report instead of a
-  long mess.
+- On a **write run** a cluster whose merge throws (merger error, no free
+  filename) lands in `errors` with its message and the run continues — merges
+  that already landed are reported, not discarded behind one exception, and
+  the closing reindex still runs so the index never lags them. A dry run
+  still throws: nothing has landed that a report would need to account for.
+- The **cap** (default 5) counts clusters acted on — merged or errored; the
+  rest come back in `remaining`. A pass that wants to rewrite half the vault
+  is evidence the ceiling is wrong, and the cap turns that into a short
+  report instead of a long mess.
 
 Consolidation is an operator operation like `doctor` — unscoped, whole-vault —
 so its `ctx` is provenance for the notes it writes, not a permission check.
