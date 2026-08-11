@@ -95,6 +95,14 @@ export type ConsolidateReport = {
   crossNamespace: Cluster[];
   /** clusters left over once the cap was reached, or whose members moved under us */
   remaining: Cluster[];
+  /**
+   * Clusters whose merge threw mid-pass on a **write** run (merger error, no
+   * free filename): collected here so the merges that already landed are still
+   * reported instead of discarded behind one exception. Always empty on a dry
+   * run — there a throw propagates, because nothing has landed that a report
+   * would need to account for.
+   */
+  errors: { cluster: Cluster; error: string }[];
 };
 
 /** Single digits, per DESIGN.md: a pass that rewrites half the vault is a wrong ceiling. */
@@ -276,46 +284,55 @@ export async function consolidate(
   const crossNamespace = found.filter((c) => c.namespace === null);
   const merges: Merge[] = [];
   const remaining: Cluster[] = [];
+  const errors: ConsolidateReport["errors"] = [];
   let wrote = false;
   for (const cluster of found.filter((c) => c.namespace !== null)) {
-    // The cap counts clusters *acted on*: the rest are a short report, not a
-    // half-finished rewrite.
-    if (merges.length >= cap) {
+    // The cap counts clusters *acted on* — errored ones included, they spent
+    // their model call: the rest are a short report, not a half-finished rewrite.
+    if (merges.length + errors.length >= cap) {
       remaining.push(cluster);
       continue;
     }
-    const notes: Note[] = [];
-    for (const path of cluster.members) {
-      confinedPath(base, path); // the index is derived data, not a trusted path source
-      // Re-read from disk, like everything the vault shows a model — and the
-      // hash each note is read at is what its marking is checked against.
-      const raw = await readRaw(base, path);
-      if (raw === null) break; // indexed but gone: files are truth, the row is stale
-      notes.push(parseNote(raw, path));
+    try {
+      const notes: Note[] = [];
+      for (const path of cluster.members) {
+        confinedPath(base, path); // the index is derived data, not a trusted path source
+        // Re-read from disk, like everything the vault shows a model — and the
+        // hash each note is read at is what its marking is checked against.
+        const raw = await readRaw(base, path);
+        if (raw === null) break; // indexed but gone: files are truth, the row is stale
+        notes.push(parseNote(raw, path));
+      }
+      // A member vanished under us, so this is no longer the cluster the merger
+      // would be asked about. Reported, not guessed at.
+      if (notes.length !== cluster.members.length) {
+        remaining.push(cluster);
+        continue;
+      }
+      const candidate = checkMerged(await merger({ notes }));
+      if (!write) {
+        merges.push({ cluster, candidate });
+        continue;
+      }
+      const created = await create(db, base, candidate, cluster.namespace!, undefined, ctx);
+      wrote = true; // the file exists from here on, whatever the marking does
+      const superseded: string[] = [];
+      const unmarked: string[] = [];
+      for (const note of notes) {
+        const marked = await markSuperseded(base, note, created.path!);
+        if ("superseded" in marked) superseded.push(marked.superseded);
+        else unmarked.push(marked.unmarked);
+      }
+      merges.push({ cluster, candidate, path: created.path, superseded, unmarked });
+    } catch (e) {
+      // On a dry run nothing has landed, so a throw stays a throw. On a write
+      // run one bad cluster must not discard the report of the merges that
+      // already landed, nor skip the closing reindex below.
+      if (!write) throw e;
+      errors.push({ cluster, error: e instanceof Error ? e.message : String(e) });
     }
-    // A member vanished under us, so this is no longer the cluster the merger
-    // would be asked about. Reported, not guessed at.
-    if (notes.length !== cluster.members.length) {
-      remaining.push(cluster);
-      continue;
-    }
-    const candidate = checkMerged(await merger({ notes }));
-    if (!write) {
-      merges.push({ cluster, candidate });
-      continue;
-    }
-    const created = await create(db, base, candidate, cluster.namespace!, undefined, ctx);
-    const superseded: string[] = [];
-    const unmarked: string[] = [];
-    for (const note of notes) {
-      const marked = await markSuperseded(base, note, created.path!);
-      if ("superseded" in marked) superseded.push(marked.superseded);
-      else unmarked.push(marked.unmarked);
-    }
-    wrote = true;
-    merges.push({ cluster, candidate, path: created.path, superseded, unmarked });
   }
   // The index never lags a write we made ourselves.
   if (wrote) await reindex(db, base, embedder);
-  return { dryRun: !write, merges, crossNamespace, remaining };
+  return { dryRun: !write, merges, crossNamespace, remaining, errors };
 }
