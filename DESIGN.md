@@ -556,8 +556,8 @@ nobody is waiting for them, and doctor knows where they are.
 ## Testing / evals
 
 `bun test` runs everything; done-check: `bun run check` (= `bun test && tsc
---noEmit`). No CI is configured — the check is enforced by the agent workflow
-(every PR runs it before merge). Deterministic-first evals (spec §8): retrieval
+--noEmit`). CI (`.github/workflows/check.yml`) runs the check on every PR and
+push to main; the agent workflow also runs it before merge. Deterministic-first evals (spec §8): retrieval
 (exact identifier hits via FTS, overlap paraphrase via vector path, fusion beats
 either alone on a seeded vault), write-gate behaviors per action incl. the
 mid-flight-edit abort, doctor idempotence (delete DB → rebuild → same results),
