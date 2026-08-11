@@ -245,20 +245,27 @@ export function patchFrontmatter(raw: string, key: string, value: string | null)
 const ISO_TIMESTAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/;
 
 /**
- * Rewrite every bare `[[stem]]` / `[[stem|alias]]` link to the path-qualified
- * `target`, leaving every other byte alone. The scan is the parser's own link
- * regex, so what this rewrites and what `parseNote` counts as an edge cannot
- * disagree — which also means links inside code fences are rewritten, the
- * parser's documented MVP simplification. Alias text travels verbatim. Used by
- * the indexer when a stem collision is created (DESIGN.md § Data model).
+ * Rewrite every bare `[[stem]]` / `[[stem|alias]]` link in `raw`'s body to the
+ * path-qualified `target`, leaving every other byte — the frontmatter block,
+ * CRLF endings, a BOM — untouched: this edits files the vault did not author.
+ * The scan is the parser's own link regex over the same body region `parseNote`
+ * reads (`frontmatterBlock` decides both), so what this rewrites and what
+ * counts as an edge cannot disagree — which also means links inside code fences
+ * are rewritten, the parser's documented MVP simplification. Alias text travels
+ * verbatim. Used by the indexer when a stem collision is created (DESIGN.md
+ * § Data model).
  */
-export function qualifyLinks(body: string, stem: string, target: string): string {
-  return body.replace(/\[\[([^\[\]\n]{1,256})\]\]/g, (whole, inner: string) => {
+export function qualifyLinks(raw: string, stem: string, target: string): string {
+  const start = frontmatterBlock(raw)?.bodyStart ?? 0;
+  // The link regex never spans a line, so a CRLF file's `\r`s all sit outside
+  // any match and survive; the frontmatter's bytes are not scanned at all.
+  const body = raw.slice(start).replace(/\[\[([^\[\]\n]{1,256})\]\]/g, (whole, inner: string) => {
     const pipe = inner.indexOf("|");
     const link = (pipe === -1 ? inner : inner.slice(0, pipe)).trim();
     if (link !== stem) return whole;
     return `[[${target}${pipe === -1 ? "" : inner.slice(pipe)}]]`;
   });
+  return raw.slice(0, start) + body;
 }
 
 /** Replace the body, keeping the frontmatter block byte-identical. */

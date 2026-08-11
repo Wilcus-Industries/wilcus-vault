@@ -3,7 +3,7 @@
 import type { Database } from "bun:sqlite";
 import { lstatSync, readdirSync, type Stats } from "node:fs";
 import { join, relative } from "node:path";
-import { linkTarget, parseNote, qualifyLinks, replaceBody, type Note } from "./note";
+import { linkTarget, parseNote, qualifyLinks, type Note } from "./note";
 import { confinedPath, writeAtomic } from "./gate";
 import { resetVectors, vectorsStale } from "./db";
 import { l2normalize, type Embedder } from "./embed";
@@ -324,17 +324,18 @@ export async function indexPaths(
       const abs = confinedPath(root, path); // the index is derived data, not a trusted path source
       const raw = await readRaw(root, path);
       if (raw === null) continue; // indexed but gone: files are truth, the row is stale
-      const note = parseNote(raw, path);
       // Check-and-write: the file must still be what the index read it at — a
       // human's mid-flight edit is skipped, never clobbered, like supersede's
       // `unmarked`.
-      if (note.hash !== hash) {
+      if (parseNote(raw, path).hash !== hash) {
         entry.skipped.push(path);
         continue;
       }
-      const body = qualifyLinks(note.body, stem, target);
-      if (body === note.body) continue; // the edge came from frontmatter-adjacent text it cannot reach
-      await writeAtomic(abs, replaceBody(raw, body));
+      // In-place over the raw text (body region only): every byte this rewrite
+      // does not mean — frontmatter, CRLF, a BOM — survives verbatim.
+      const out = qualifyLinks(raw, stem, target);
+      if (out === raw) continue; // nothing the parser calls a link actually matched
+      await writeAtomic(abs, out);
       entry.rewritten.push(path);
       rewritten.push(path);
     }

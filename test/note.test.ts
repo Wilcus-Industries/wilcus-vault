@@ -326,3 +326,20 @@ test("qualifyLinks rewrites bare links to one stem, aliases kept, everything els
   const untouched = "no links here, [[other]] only\n";
   expect(qualifyLinks(untouched, "acme", "customers/acme")).toBe(untouched);
 });
+
+test("qualifyLinks edits raw text in place: frontmatter, CRLF and BOM survive untouched", () => {
+  // only the parser's body region is scanned — a decoy in frontmatter is YAML,
+  // not a link, and `parseNote` would never edge it either
+  const raw = '---\nnote: "[[acme]] is not a link here"\n---\nbody [[acme]]\n';
+  expect(qualifyLinks(raw, "acme", "customers/acme")).toBe(
+    '---\nnote: "[[acme]] is not a link here"\n---\nbody [[customers/acme]]\n',
+  );
+  // a CRLF file keeps every carriage return; a BOM stays where it was
+  expect(qualifyLinks("﻿---\r\ntype: x\r\n---\r\nsee [[acme]]\r\nplain\r\n", "acme", "customers/acme")).toBe(
+    "﻿---\r\ntype: x\r\n---\r\nsee [[customers/acme]]\r\nplain\r\n",
+  );
+  // malformed frontmatter is body, exactly as parseNote reads it
+  expect(qualifyLinks("---\ntype: [unclosed\n---\n[[acme]]\n", "acme", "customers/acme")).toBe(
+    "---\ntype: [unclosed\n---\n[[customers/acme]]\n",
+  );
+});
