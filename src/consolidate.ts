@@ -152,14 +152,21 @@ export function clusters(db: Database, ceiling: number): Cluster[] {
       // `normalizePrefix` form `create` writes into: `notes/`, or `""` at the
       // root. Members that do not share one span namespaces.
       const dirs = members.map((p) => p.slice(0, p.lastIndexOf("/") + 1));
+      // Every internal pair is in `under` — that is what complete linkage
+      // means — so the widest of them is the cluster's own distance. A running
+      // max, not a spread: n·(n-1)/2 arguments would hit the engine's argument
+      // limit on a cluster a legal wide ceiling can produce.
+      let distance = 0;
+      for (let i = 0; i < members.length; i++) {
+        for (let j = i + 1; j < members.length; j++) {
+          const d = under.get(key(members[i]!, members[j]!))!;
+          if (d > distance) distance = d;
+        }
+      }
       return {
         members,
         namespace: dirs.every((d) => d === dirs[0]) ? dirs[0]! : null,
-        // Every internal pair is in `under` — that is what complete linkage
-        // means — so the widest of them is the cluster's own distance.
-        distance: Math.max(
-          ...members.flatMap((x, i) => members.slice(i + 1).map((y) => under.get(key(x, y))!)),
-        ),
+        distance,
       };
     })
     .sort((x, y) => x.distance - y.distance || x.members[0]!.localeCompare(y.members[0]!));
