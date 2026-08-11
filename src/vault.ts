@@ -220,3 +220,7 @@ export type {
   Merger,
 } from "./consolidate";
 export { TokenOverlapEmbedder, FetchEmbedder } from "./embed";
+export { listDiscards, getDiscard, restoreDiscard, countDiscards } from "./discards";
+export type { DiscardEntry, DiscardedSimilar } from "./discards";
+export { fetchDecider } from "./decide";
+export type { FetchDeciderOptions } from "./decide";

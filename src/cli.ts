@@ -2,10 +2,13 @@
 import { resolve } from "node:path";
 import { openDb, dbPath } from "./db";
 import { clusters } from "./consolidate";
+import { fetchDecider } from "./decide";
+import { getDiscard, listDiscards, restoreDiscard } from "./discards";
 import { reindex, type IndexStats } from "./indexer";
 import { doctor, type DoctorReport } from "./doctor";
 import { FetchEmbedder, TokenOverlapEmbedder } from "./embed";
 import { hybridSearch } from "./search";
+import { open } from "./vault";
 import { watch } from "./watch";
 import { printable, safe } from "./term";
 
@@ -16,6 +19,9 @@ const USAGE = `vault <command> [options]
   search <query>      hybrid search: one line per hit — score, path, title
   watch               index every change as it is saved, until interrupted
   consolidate         report near-duplicate clusters (needs --ceiling)
+  discards list       the discard log, newest first — one line per entry
+  discards show <n>   one entry in full, as JSON
+  discards restore <n>  re-propose entry n through the write gate
 
   --vault <dir>       vault root (default: the current directory)
   --lexical           embed offline, without a provider (see below)
@@ -28,6 +34,16 @@ distance, then the member paths, with the ones that span namespaces flagged
 (those are never merged). Merging itself needs an injected merger, so it
 lives in the library API; this is the pass that tells you which ceiling your
 embedder calls a duplicate.
+
+vault discards reviews <root>/.discarded.log — every candidate the write
+gate refused, kept whole. Entries are numbered newest-first across the
+size-rotated .discarded.N.log files, so a rotation can renumber between a
+list and a restore: show <n> before restoring. restore feeds the candidate
+back through the gate against the current vault, which needs --ceiling and
+a chat model: set VAULT_DECIDE_MODEL (and VAULT_DECIDE_ENDPOINT /
+VAULT_DECIDE_API_KEY for a provider that is not the local Ollama). The
+log's first write adds .discarded.log* to the vault's .gitignore, once,
+so refused note bodies never ride into git history.
 
 Notes embed on a local Ollama unless VAULT_EMBED_* names another
 OpenAI-compatible provider: run \`ollama pull all-minilm\` once, or pass
@@ -115,7 +131,7 @@ function parseArgs(argv: string[]): {
   return { root, words, rebuild, lexical, ceiling, help };
 }
 
-const COMMANDS = ["reindex", "doctor", "search", "watch", "consolidate"] as const;
+const COMMANDS = ["reindex", "doctor", "search", "watch", "consolidate", "discards"] as const;
 
 async function run(argv: string[]): Promise<number> {
   const { root, words, rebuild, lexical, ceiling, help } = parseArgs(argv);
@@ -211,6 +227,54 @@ async function run(argv: string[]): Promise<number> {
     return 0;
   }
 
+  if (command === "discards") {
+    const [sub, arg] = rest;
+    if (sub === "list") {
+      const { entries, malformed } = listDiscards(root);
+      const lines = entries.map((e) =>
+        // number first (it is what show/restore take), then when, then what,
+        // then why it is in this log at all
+        safe(`[${e.n}] ${e.at}  ${e.candidate.title} — ${e.decision?.action ?? e.reason ?? "?"}`),
+      );
+      // said, not silently skipped: a truncated history reading as complete is
+      // how a discarded note gets forgotten twice
+      if (malformed > 0) lines.push(`(${malformed} unreadable line${malformed === 1 ? "" : "s"} skipped)`);
+      console.log(lines.length === 0 ? "no discards" : lines.join("\n"));
+      return 0;
+    }
+    const n = Number(arg);
+    if ((sub !== "show" && sub !== "restore") || !Number.isInteger(n) || n < 1) {
+      throw new Error(`discards needs list, show <n> or restore <n>\n\n${USAGE}`);
+    }
+    if (sub === "show") {
+      const entry = getDiscard(root, n);
+      if (entry === null) throw new Error(`discards: no entry ${n} — run vault discards list`);
+      // JSON escaping keeps note-controlled control characters off the terminal
+      console.log(JSON.stringify(entry, null, 2));
+      return 0;
+    }
+    // restore: back through the gate — the only write door — against current
+    // vault state. The ceiling is mandatory for the same reason propose's
+    // cutoffs are: without one, "most similar" is only "least unrelated".
+    if (ceiling === undefined) throw new Error(`discards restore needs --ceiling\n\n${USAGE}`);
+    // Both constructed before the database is touched, so a missing
+    // VAULT_DECIDE_MODEL is one sentence, not a half-opened restore.
+    const decider = fetchDecider();
+    const v = open(root, { embedder, gate: { decider, cutoffs: { distanceCeiling: ceiling } } });
+    try {
+      // The gate searches the index, so bring it up to the files first — and
+      // say so, like consolidate does.
+      console.log(`indexed ${summary(await v.reindex())}`);
+      const r = await restoreDiscard(v, n);
+      console.log(
+        safe(`${r.action}${r.path === undefined ? "" : `  ${r.path}`}${r.fellBack ? " (fell back)" : ""}`),
+      );
+    } finally {
+      v.close();
+    }
+    return 0;
+  }
+
   if (command === "watch") {
     const db = openDb(dbPath(root));
     try {
@@ -260,6 +324,11 @@ function print(r: DoctorReport): void {
     `reindexed ${r.stale.length} stale, purged ${r.missing.length} deleted` +
       (r.reembedded ? ", re-embedded all notes (model or dims changed)" : ""),
     ...(r.migratedDiscardLog ? ["moved .vault/discarded.log -> .discarded.log"] : []),
+    // surfaced by normal maintenance, so the log is not write-only memory; an
+    // empty one earns no line
+    ...(r.discards.entries > 0
+      ? [`discard log: ${r.discards.entries} entries (${r.discards.recent} recent)`]
+      : []),
     ...r.brokenLinks.map((l) => `broken link:    ${l.from} -> [[${l.slug}]]`),
     // the candidates are the fix: qualify the link with one of these paths
     ...r.ambiguousLinks.map(

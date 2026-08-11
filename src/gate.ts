@@ -11,6 +11,8 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
+  readFileSync,
   renameSync,
   writeSync,
 } from "node:fs";
@@ -434,7 +436,14 @@ async function apply(
   ctx?: VaultContext,
 ): Promise<Applied | null> {
   if (decision.action === "discard") {
-    logCandidate(root, candidate, { decision });
+    // The justification rides with the entry: which notes the decider judged
+    // this candidate against, at which hash and score. Written now because it
+    // cannot be retrofitted onto lines logged without it — staleness detection
+    // (#34) consumes it later.
+    logCandidate(root, candidate, {
+      decision,
+      similar: similar.map(({ note, hash, score }) => ({ path: note.path, hash, score })),
+    });
     return { action: "discard" };
   }
   if (decision.action === "create") {
@@ -609,7 +618,9 @@ function freePath(
   }
   // Nowhere to put it is still not a reason to drop it on the floor.
   const reason = `write gate: no free filename for ${JSON.stringify(candidate.title)}`;
-  logCandidate(root, candidate, { reason });
+  // similar is [] here not because nothing was similar but because this line is
+  // a placement failure, not a decision — the field stays uniform either way.
+  logCandidate(root, candidate, { reason, similar: [] });
   throw new Error(reason);
 }
 
@@ -623,6 +634,14 @@ function freePath(
 export const discardLog = (root: string): string => join(root, ".discarded.log");
 
 /**
+ * Rotation cap (#33): bounded growth, nothing deleted. At this size the live
+ * log moves aside to `.discarded.<n>.log` and a fresh one starts; the read
+ * side (`discards.ts`) numbers entries across all of them.
+ * ponytail: a constant. An env knob or an option if a vault ever needs one.
+ */
+export const DISCARD_LOG_CAP = 5 * 1024 * 1024;
+
+/**
  * Append a candidate to the discard log as JSONL, whole: a wrong decider call —
  * or a gate that cannot place the note — costs a line in a log, never the
  * information itself.
@@ -631,14 +650,78 @@ export const discardLog = (root: string): string => join(root, ".discarded.log")
  * path — every other write lands through a rename, which replaces a symlink
  * rather than following it. A symlink dropped here would redirect whole
  * candidate bodies out of the vault; opening one fails instead (ELOOP).
+ *
+ * Exported for the discards tests, which are what `cap` is a parameter for —
+ * production callers never pass one.
  */
-function logCandidate(root: string, candidate: Candidate, extra: Record<string, unknown>): void {
+export function logCandidate(
+  root: string,
+  candidate: Candidate,
+  extra: Record<string, unknown>,
+  cap = DISCARD_LOG_CAP,
+): void {
+  const path = discardLog(root);
+  // lstat, not stat: a symlink's own (tiny) size never trips a rotation, so a
+  // planted link still reaches the O_NOFOLLOW refusal below instead of being
+  // quietly renamed into history as if it were the log.
+  if ((lstatSync(path, { throwIfNoEntry: false })?.size ?? -1) >= cap) {
+    // Rotate to the next free suffix — .1 is the oldest, nothing is deleted or
+    // shifted, and old entries stay exactly where a reader last saw them.
+    let n = 0;
+    for (const f of readdirSync(root)) {
+      const m = /^\.discarded\.(\d+)\.log$/.exec(f);
+      if (m !== null) n = Math.max(n, Number(m[1]));
+    }
+    renameSync(path, join(root, `.discarded.${n + 1}.log`));
+  }
+  // First write to a fresh log (including the one a rotation just started):
+  // make sure a committed vault does not carry refused note bodies into git
+  // history. Only then — a user who strips the line while the log exists has
+  // decided, and drift-repairing their .gitignore is not this function's call.
+  if (!existsSync(path)) ensureGitignore(root);
   const { O_WRONLY, O_APPEND, O_CREAT, O_NOFOLLOW } = constants;
-  const fd = openSync(discardLog(root), O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW);
+  const fd = openSync(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW);
   try {
     writeSync(fd, `${JSON.stringify({ at: now(), candidate, ...extra })}\n`);
   } finally {
     closeSync(fd);
+  }
+}
+
+/** The one pattern that covers the live log and every rotation of it. */
+const IGNORE_LINE = ".discarded.log*";
+
+/**
+ * Ensure `<root>/.gitignore` covers the discard log. Append-only and
+ * line-checked, so it lands exactly once and never rewrites what a human keeps
+ * in that file. The same `O_NOFOLLOW` rail as the log itself: this is the
+ * gate's other fixed-path write, and a symlink here would redirect it.
+ */
+function ensureGitignore(root: string): void {
+  const { O_RDONLY, O_WRONLY, O_APPEND, O_CREAT, O_NOFOLLOW } = constants;
+  const path = join(root, ".gitignore");
+  let current = "";
+  let fd = -1;
+  try {
+    fd = openSync(path, O_RDONLY | O_NOFOLLOW);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  if (fd >= 0) {
+    try {
+      current = readFileSync(fd, "utf8");
+    } finally {
+      closeSync(fd);
+    }
+  }
+  if (current.split("\n").some((line) => line.trim() === IGNORE_LINE)) return;
+  const out = openSync(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW);
+  try {
+    // A file someone left without a trailing newline must not fuse its last
+    // line with ours into a pattern neither of us wrote.
+    writeSync(out, `${current === "" || current.endsWith("\n") ? "" : "\n"}${IGNORE_LINE}\n`);
+  } finally {
+    closeSync(out);
   }
 }
 
