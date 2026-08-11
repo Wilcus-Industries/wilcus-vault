@@ -2,7 +2,7 @@
 // write-side rails it leans on: size rotation, the auto-gitignore, and the
 // CLI-only FetchDecider. Fake deciders and injected fetch, no network.
 import { test, expect, afterAll } from "bun:test";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { TokenOverlapEmbedder } from "../src/embed";
 import { fetchDecider } from "../src/decide";
@@ -119,6 +119,21 @@ test("a malformed log line is counted and skipped, never fatal", () => {
   const { entries, malformed } = listDiscards(root);
   expect(entries.map((e) => e.candidate.title)).toEqual(["good"]);
   expect(malformed).toBe(2);
+});
+
+test("a symlink planted among the log files is refused, never read through", () => {
+  // The write side refuses a symlinked log (O_NOFOLLOW); the read side must
+  // match, or `discards list` becomes a way to print any readable file — and
+  // `restore` a way to propose its content into the vault.
+  const root = makeVault({});
+  logCandidate(root, { title: "real", body: "b\n" }, { similar: [] });
+  const elsewhere = makeVault({});
+  writeFileSync(
+    join(elsewhere, "secrets.log"),
+    `${JSON.stringify({ at: "2026-01-01T00:00:00.000Z", candidate: { title: "stolen", body: "s" } })}\n`,
+  );
+  symlinkSync(join(elsewhere, "secrets.log"), join(root, ".discarded.1.log"));
+  expect(() => listDiscards(root)).toThrow(/symlink/);
 });
 
 test("countDiscards splits total from recent", () => {

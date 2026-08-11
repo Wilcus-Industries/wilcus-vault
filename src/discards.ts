@@ -4,7 +4,7 @@
 // index, no cache.
 // ponytail: a full parse per call, bounded by the 5 MiB rotation cap per file.
 // Stream it if a vault ever accumulates enough rotations for this to show up.
-import { readdirSync, readFileSync } from "node:fs";
+import { closeSync, constants, openSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { discardLog, type Candidate, type Decision, type GateResult, type VaultContext } from "./gate";
 
@@ -47,14 +47,29 @@ export function listDiscards(root: string): { entries: DiscardEntry[]; malformed
   const parsed: Omit<DiscardEntry, "n">[] = [];
   let malformed = 0;
   for (const file of logFiles(root)) {
-    let text: string;
+    // O_NOFOLLOW, matching the write side: these are fixed, user-visible
+    // paths, and reading through a planted symlink would turn `list` into a
+    // printer for any readable file — and `restore` into a door for its
+    // content. Refused loudly (ELOOP), not skipped: a symlink here is a
+    // signal, and silently thinner history would hide it.
+    let fd: number;
     try {
-      text = readFileSync(file, "utf8");
+      fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
     } catch (e) {
       // The live log may simply not exist yet; a rotated file came from
       // readdir a moment ago, but files-are-truth means disk wins either way.
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") continue;
+      if (code === "ELOOP") {
+        throw new Error(`discards: ${file} is a symlink — the log is read in place, never through a link`);
+      }
       throw e;
+    }
+    let text: string;
+    try {
+      text = readFileSync(fd, "utf8");
+    } finally {
+      closeSync(fd);
     }
     for (const line of text.split("\n")) {
       if (line.trim() === "") continue;
