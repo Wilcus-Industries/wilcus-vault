@@ -1,6 +1,6 @@
 import { test, expect, afterAll } from "bun:test";
 import type { Database } from "bun:sqlite";
-import { mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { openDb, dbPath } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
@@ -96,7 +96,14 @@ test("a pass with nothing changed writes nothing", async () => {
   // the watcher's entry point: an editor saving identical bytes must not
   // dirty the database
   const stats = await indexPaths(db, root, embedder, scanVault(root));
-  expect(stats).toEqual({ added: 0, updated: 0, removed: 0, unchanged: 3, reembedded: false });
+  expect(stats).toEqual({
+    added: 0,
+    updated: 0,
+    removed: 0,
+    unchanged: 3,
+    reembedded: false,
+    qualified: [],
+  });
   expect(changes(db)).toBe(before);
   db.close();
 });
@@ -372,6 +379,124 @@ test("an embedder returning the wrong shape fails with a clear error", async () 
   await expect(reindex(db, root, narrow)).rejects.toThrow(/narrow-v1.*width 8.*32/s);
   const short = stubEmbedder("short-v1", 32, async () => []);
   await expect(reindex(db, root, short)).rejects.toThrow(/short-v1.*0 vectors for 3/s);
+  db.close();
+});
+
+// A vault where `customers/acme.md` is the only `acme` and two notes link it bare.
+const COLLISION = {
+  "customers/acme.md": "# Acme the customer\n",
+  "hub.md": "# Hub\n\nsee [[acme]] for the account\n",
+  "notes/deal.md": "# Deal\n\nclosing [[acme|Acme Corp]] this week\n",
+};
+
+const readFile = (root: string, rel: string): string => readFileSync(join(root, rel), "utf8");
+
+test("a new stem collision auto-qualifies every bare link to the incumbent", async () => {
+  const root = makeVault(COLLISION);
+  const db = open(root);
+  // cold first index: every note is new, structurally no incumbent, no rewrite
+  const cold = await reindex(db, root, embedder);
+  expect(cold.qualified).toEqual([]);
+  expect(readFile(root, "hub.md")).toBe(COLLISION["hub.md"]);
+
+  // the collision: a second acme appears
+  writeNote(root, "vendors/acme.md", "# Acme the vendor\n");
+  const stats = await indexPaths(db, root, embedder, ["vendors/acme.md"]);
+  expect(stats.qualified).toEqual([
+    {
+      stem: "acme",
+      target: "customers/acme",
+      rewritten: ["hub.md", "notes/deal.md"],
+      skipped: [],
+    },
+  ]);
+  // textual body edits: link qualified, alias kept, everything else verbatim
+  expect(readFile(root, "hub.md")).toBe("# Hub\n\nsee [[customers/acme]] for the account\n");
+  expect(readFile(root, "notes/deal.md")).toBe(
+    "# Deal\n\nclosing [[customers/acme|Acme Corp]] this week\n",
+  );
+  // the rewritten notes were re-entered through indexPaths: edges point at the
+  // incumbent by path and nothing is ambiguous
+  expect(
+    db.query(
+      "select n.path from edges e join notes n on n.id = e.to_id where e.to_slug = 'customers/acme' order by n.path",
+    ).all(),
+  ).toEqual([{ path: "customers/acme.md" }, { path: "customers/acme.md" }]);
+  expect((await doctor(root, embedder)).ambiguousLinks).toEqual([]);
+
+  // idempotent: the next pass has nothing to qualify and dirties nothing
+  const before = changes(db);
+  const again = await indexPaths(db, root, embedder, scanVault(root));
+  expect(again.qualified).toEqual([]);
+  expect(changes(db)).toBe(before);
+  db.close();
+});
+
+test("both colliding notes new in the same pass: no incumbent, no rewrite", async () => {
+  const root = makeVault({ "hub.md": "# Hub\n\n[[acme]]\n" });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  writeNote(root, "customers/acme.md", "# Acme one\n");
+  writeNote(root, "vendors/acme.md", "# Acme two\n");
+  const stats = await indexPaths(db, root, embedder, ["customers/acme.md", "vendors/acme.md"]);
+  // picking a winner would be the "first match" resolution DESIGN.md forbids
+  expect(stats.qualified).toEqual([]);
+  expect(readFile(root, "hub.md")).toBe("# Hub\n\n[[acme]]\n");
+  expect((await doctor(root, embedder)).ambiguousLinks).toHaveLength(1);
+  db.close();
+});
+
+test("a rename is not a collision", async () => {
+  const root = makeVault({ "a/acme.md": "# Acme\n", "hub.md": "# Hub\n\n[[acme]]\n" });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  rmSync(join(root, "a", "acme.md"));
+  writeNote(root, "b/acme.md", "# Acme\n");
+  const stats = await indexPaths(db, root, embedder, ["a/acme.md", "b/acme.md"]);
+  expect(stats.qualified).toEqual([]);
+  expect(readFile(root, "hub.md")).toBe("# Hub\n\n[[acme]]\n");
+  db.close();
+});
+
+test("an incumbent at the vault root has no qualified form: reported, not rewritten", async () => {
+  const root = makeVault({ "acme.md": "# Acme\n", "hub.md": "# Hub\n\n[[acme]]\n" });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  writeNote(root, "vendors/acme.md", "# Acme two\n");
+  const stats = await indexPaths(db, root, embedder, ["vendors/acme.md"]);
+  expect(stats.qualified).toEqual([
+    { stem: "acme", target: null, rewritten: [], skipped: ["hub.md"] },
+  ]);
+  expect(readFile(root, "hub.md")).toBe("# Hub\n\n[[acme]]\n");
+  db.close();
+});
+
+test("a linking note edited mid-flight is skipped, never clobbered", async () => {
+  const root = makeVault(COLLISION);
+  const db = open(root);
+  await reindex(db, root, embedder);
+  // hub.md changes on disk but this pass does not carry it, so its indexed
+  // hash is stale — the rewrite's check-and-write must refuse it
+  writeNote(root, "hub.md", "# Hub\n\nsee [[acme]], hand-edited\n");
+  writeNote(root, "vendors/acme.md", "# Acme the vendor\n");
+  const stats = await indexPaths(db, root, embedder, ["vendors/acme.md"]);
+  expect(stats.qualified).toEqual([
+    { stem: "acme", target: "customers/acme", rewritten: ["notes/deal.md"], skipped: ["hub.md"] },
+  ]);
+  expect(readFile(root, "hub.md")).toBe("# Hub\n\nsee [[acme]], hand-edited\n");
+  db.close();
+});
+
+test("the qualify cap bounds rewrites per collision and reports the remainder", async () => {
+  const root = makeVault(COLLISION);
+  const db = open(root);
+  await reindex(db, root, embedder);
+  writeNote(root, "vendors/acme.md", "# Acme the vendor\n");
+  const stats = await indexPaths(db, root, embedder, ["vendors/acme.md"], 1);
+  expect(stats.qualified).toEqual([
+    { stem: "acme", target: "customers/acme", rewritten: ["hub.md"], skipped: ["notes/deal.md"] },
+  ]);
+  expect(readFile(root, "notes/deal.md")).toBe(COLLISION["notes/deal.md"]);
   db.close();
 });
 

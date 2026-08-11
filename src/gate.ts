@@ -521,9 +521,10 @@ export async function markSuperseded(
  * a half-written note, a crash never truncates one, and — since rename replaces
  * a symlink instead of following it — nothing can be swapped in between
  * `confinedPath` and the write. The temp name is not `.md`, so a crashed write
- * leaves nothing the scan would index.
+ * leaves nothing the scan would index. Exported for the indexer's collision
+ * auto-qualify pass, which rewrites linking notes through this same rail.
  */
-async function writeAtomic(abs: string, text: string): Promise<void> {
+export async function writeAtomic(abs: string, text: string): Promise<void> {
   const tmp = `${abs}.tmp-${process.pid}-${Bun.randomUUIDv7().slice(-8)}`;
   await Bun.write(tmp, text);
   renameSync(tmp, abs);

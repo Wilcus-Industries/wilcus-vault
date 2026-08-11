@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { parseNote, patchFrontmatter, replaceBody, serializeNote } from "../src/note";
+import { parseNote, patchFrontmatter, qualifyLinks, replaceBody, serializeNote } from "../src/note";
 
 const sha256 = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex");
 
@@ -306,4 +306,40 @@ test("replaceBody swaps the body and keeps the frontmatter block verbatim", () =
   // no usable block: the whole file is the body, exactly as parseNote sees it
   expect(replaceBody("# Acme\n\nold\n", "new\n")).toBe("new\n");
   expect(replaceBody("---\ntype: [unclosed\n---\nold\n", "new\n")).toBe("new\n");
+});
+
+test("qualifyLinks rewrites bare links to one stem, aliases kept, everything else verbatim", () => {
+  const body =
+    "See [[acme]] and [[acme|Acme Corp]] and [[ acme ]].\n" +
+    "Not these: [[acmena]], [[customers/acme]], [[other]], plain acme.\n" +
+    "```\ncode fence: [[acme]]\n```\n";
+  expect(qualifyLinks(body, "acme", "customers/acme")).toBe(
+    "See [[customers/acme]] and [[customers/acme|Acme Corp]] and [[customers/acme]].\n" +
+      "Not these: [[acmena]], [[customers/acme]], [[other]], plain acme.\n" +
+      // the parser counts fenced links as edges, so the rewrite matches it —
+      // the documented MVP simplification
+      "```\ncode fence: [[customers/acme]]\n```\n",
+  );
+  // an alias holding a pipe travels whole
+  expect(qualifyLinks("[[acme|a|b]]", "acme", "customers/acme")).toBe("[[customers/acme|a|b]]");
+  // nothing to do leaves the body byte-identical
+  const untouched = "no links here, [[other]] only\n";
+  expect(qualifyLinks(untouched, "acme", "customers/acme")).toBe(untouched);
+});
+
+test("qualifyLinks edits raw text in place: frontmatter, CRLF and BOM survive untouched", () => {
+  // only the parser's body region is scanned — a decoy in frontmatter is YAML,
+  // not a link, and `parseNote` would never edge it either
+  const raw = '---\nnote: "[[acme]] is not a link here"\n---\nbody [[acme]]\n';
+  expect(qualifyLinks(raw, "acme", "customers/acme")).toBe(
+    '---\nnote: "[[acme]] is not a link here"\n---\nbody [[customers/acme]]\n',
+  );
+  // a CRLF file keeps every carriage return; a BOM stays where it was
+  expect(qualifyLinks("﻿---\r\ntype: x\r\n---\r\nsee [[acme]]\r\nplain\r\n", "acme", "customers/acme")).toBe(
+    "﻿---\r\ntype: x\r\n---\r\nsee [[customers/acme]]\r\nplain\r\n",
+  );
+  // malformed frontmatter is body, exactly as parseNote reads it
+  expect(qualifyLinks("---\ntype: [unclosed\n---\n[[acme]]\n", "acme", "customers/acme")).toBe(
+    "---\ntype: [unclosed\n---\n[[customers/acme]]\n",
+  );
 });

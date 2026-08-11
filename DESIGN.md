@@ -75,6 +75,27 @@ repair the vault.
   `[[acme]]` permanently ambiguous — move the root one into a namespace.
   A rename/move is a delete + create (identity is the path); `doctor` reports
   the resulting broken edges.
+- **Auto-qualify on a new stem collision** (#29). At the moment an index pass
+  *creates* a collision — a newly indexed note's stem matches exactly one note
+  the index already knew about (a rename is not a collision: the old row is
+  gone in the same pass) — every bare `[[stem]]` link in the vault still
+  unambiguously means that incumbent, and only this moment can know it: once
+  both are indexed, nothing records which was first. `indexPaths` rewrites
+  those links to the incumbent's path-qualified form, mechanically, no LLM —
+  detection happens before the write transaction, no file I/O happens inside
+  it (a rollback cannot unwrite a file), and the rewrites land after commit as
+  textual body edits (`qualifyLinks`) under the gate's check-and-write rails,
+  capped (default 500 per collision), then re-entered through `indexPaths`
+  (bounded: the rewritten notes are not new, so no further detection). Between
+  the commit and that re-entry those edges briefly read `to_id = null` — an
+  accepted window. The outcome rides on `IndexStats.qualified`; the CLI prints
+  it and the watcher logs it. The invariant is **never guesses**, not *never
+  ambiguous*: a root incumbent (no qualified form), both notes new in the same
+  pass (no incumbent — picking one would be the forbidden first-match
+  resolution), a linker edited mid-flight (hash mismatch, never clobbered) and
+  the cap's remainder are all reported and left to `doctor`'s ambiguous
+  report. `doctor --rebuild` and any cold first index see every note as new,
+  so they are structurally no-ops here.
 - Frontmatter: `type`, `created`, `updated`, optional `superseded_by`
   (**vault-relative path** of the superseding note), plus free keys. Written by
   us, editable by humans. `parseNote` never throws: a file whose frontmatter is
