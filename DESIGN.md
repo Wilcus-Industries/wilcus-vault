@@ -466,7 +466,7 @@ filesystem (macOS, Windows) a path spelled `Secret/plans.md` reaches the same
 file a `secret/` rule denies, so the rule does not cover it. One more reason
 the sentence above is the operative one — containment, not security.
 
-## Consolidation pass (spec — no implementation yet)
+## Consolidation pass
 
 Vaults accrete near-duplicates: the gate only sees top-k similar at write
 time, and humans add notes behind its back. Consolidation is the deliberate,
@@ -586,4 +586,6 @@ Post-MVP (#18): 6. this design — scopes + consolidation spec (#19);
 `<root>/.discarded.log` (#20) — the log is durable history and must survive a
 `.vault/` nuke or `--rebuild`; it carries full candidate bodies, so an
 operator who commits their vault may want it in `.gitignore`; 8. `get`/`list`
-(#21); 9. CLI real embedder (#22); 10. scope enforcement (#23).
+(#21); 9. CLI real embedder (#22); 10. scope enforcement (#23);
+11. the consolidation pass (#31) — `vault consolidate` reports clusters, the
+library API is the write path (a merger is injected, like a decider).
