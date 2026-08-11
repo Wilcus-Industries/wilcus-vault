@@ -309,7 +309,20 @@ async function run(argv: string[]): Promise<number> {
 
 const summary = (s: IndexStats): string =>
   `${s.added} new, ${s.updated} changed, ${s.removed} removed, ${s.unchanged} unchanged` +
-  (s.reembedded ? " (re-embedded: model or dims changed)" : "");
+  (s.reembedded ? " (re-embedded: model or dims changed)" : "") +
+  // a stem collision this pass auto-qualified (or could not). Single-line and
+  // `safe`d here: the stem and target are filenames, not our text, and the
+  // watcher wraps whole lines in `safe`, which turns a newline into `?`.
+  s.qualified
+    .map((q) =>
+      safe(
+        q.target === null
+          ? `; [[${q.stem}]] went ambiguous (root incumbent — ${q.skipped.length} linking note${q.skipped.length === 1 ? "" : "s"} left for doctor)`
+          : `; [[${q.stem}]] qualified to [[${q.target}]] in ${q.rewritten.length} note${q.rewritten.length === 1 ? "" : "s"}` +
+              (q.skipped.length > 0 ? ` (${q.skipped.length} skipped — see doctor)` : ""),
+      ),
+    )
+    .join("");
 
 /** `vault watch` runs until it is stopped; this is what "until" means. */
 function interrupted(): Promise<void> {

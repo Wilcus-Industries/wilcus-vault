@@ -244,6 +244,23 @@ export function patchFrontmatter(raw: string, key: string, value: string | null)
 /** `2026-08-01T09:41:00.000Z` — what `new Date().toISOString()` produces. */
 const ISO_TIMESTAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/;
 
+/**
+ * Rewrite every bare `[[stem]]` / `[[stem|alias]]` link to the path-qualified
+ * `target`, leaving every other byte alone. The scan is the parser's own link
+ * regex, so what this rewrites and what `parseNote` counts as an edge cannot
+ * disagree — which also means links inside code fences are rewritten, the
+ * parser's documented MVP simplification. Alias text travels verbatim. Used by
+ * the indexer when a stem collision is created (DESIGN.md § Data model).
+ */
+export function qualifyLinks(body: string, stem: string, target: string): string {
+  return body.replace(/\[\[([^\[\]\n]{1,256})\]\]/g, (whole, inner: string) => {
+    const pipe = inner.indexOf("|");
+    const link = (pipe === -1 ? inner : inner.slice(0, pipe)).trim();
+    if (link !== stem) return whole;
+    return `[[${target}${pipe === -1 ? "" : inner.slice(pipe)}]]`;
+  });
+}
+
 /** Replace the body, keeping the frontmatter block byte-identical. */
 export function replaceBody(raw: string, body: string): string {
   const at = frontmatterBlock(raw);

@@ -125,6 +125,16 @@ ambiguous link: notes/deal.md -> [[acme]] (customers/acme, vendors/acme)
 broken link:    notes/deal.md -> [[ghots]]
 ```
 
+Most bare links never get that far: at the moment a second `acme.md` is first
+indexed, every existing bare `[[acme]]` still unambiguously means the note that
+was already there, so the pass rewrites them to its path-qualified form
+(`[[acme|alias]]` keeps its alias) and says so. Only that moment can know the
+incumbent — afterwards nothing records which note came first. The rule is
+*never guesses*, not *never ambiguous*: an incumbent at the vault root (no
+qualified form), both notes appearing in one pass (no incumbent), or a linking
+note edited mid-rewrite are left alone and fall through to `doctor`'s
+ambiguous report above.
+
 Obsidian hides dot-directories, so `.vault/` stays out of the way; the scan skips
 it (and `.git/`, `.obsidian/`, …) for the same reason. If the vault is a git repo,
 add `.vault/` to its `.gitignore` — the index is a build artifact, not content.

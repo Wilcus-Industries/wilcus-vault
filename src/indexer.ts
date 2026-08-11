@@ -3,9 +3,30 @@
 import type { Database } from "bun:sqlite";
 import { lstatSync, readdirSync, type Stats } from "node:fs";
 import { join, relative } from "node:path";
-import { parseNote, type Note } from "./note";
+import { linkTarget, parseNote, qualifyLinks, replaceBody, type Note } from "./note";
+import { confinedPath, writeAtomic } from "./gate";
 import { resetVectors, vectorsStale } from "./db";
 import { l2normalize, type Embedder } from "./embed";
+
+/**
+ * One stem collision's auto-qualify outcome (DESIGN.md § Data model): the bare
+ * `[[stem]]` links that still unambiguously meant the incumbent, rewritten to
+ * its path-qualified form. `target` is null when the incumbent sits at the
+ * vault root — it has no qualified form, so nothing is rewritten and every
+ * linker is reported. `skipped` also carries linkers edited mid-flight (hash
+ * mismatch — never clobbered) and the remainder past the cap; all of them fall
+ * back to doctor's ambiguous report. The invariant is *never guesses*, not
+ * *never ambiguous*.
+ */
+export type Qualified = {
+  stem: string;
+  /** the incumbent's path-qualified link target, or null for a root incumbent */
+  target: string | null;
+  /** linking notes whose bare links were rewritten */
+  rewritten: string[];
+  /** linking notes left alone: root incumbent, edited mid-flight, or over the cap */
+  skipped: string[];
+};
 
 export type IndexStats = {
   added: number;
@@ -14,6 +35,8 @@ export type IndexStats = {
   unchanged: number;
   /** the embedding model or dims changed, so every note was re-embedded */
   reembedded: boolean;
+  /** stem collisions this pass created, and the bare links qualified for them */
+  qualified: Qualified[];
 };
 
 /**
@@ -112,22 +135,35 @@ export async function reindex(
  * watched vault and a rebuilt one cannot end up with different rows.
  * ponytail: reads the whole `notes` table even for one path (three columns of a
  * hand-written vault). Restrict it to the paths asked for if that ever shows up.
+ *
+ * When this pass *creates* a stem collision — a newly indexed note's stem
+ * matches exactly one note the index already knew about — every bare
+ * `[[stem]]` link in the vault still unambiguously means that incumbent, and
+ * only this moment can know it: once both notes are indexed, nothing records
+ * which was first. Those links are rewritten to the incumbent's path-qualified
+ * form after the write transaction commits (no file I/O inside it — a rollback
+ * cannot unwrite a file), check-and-write gated, capped at `qualifyCap` per
+ * collision, and reported in `stats.qualified`. The rewritten paths re-enter
+ * this function once; their stems do not change, so no further collisions and
+ * no recursion.
  */
 export async function indexPaths(
   db: Database,
   root: string,
   embedder: Embedder,
   rels: Iterable<string>,
+  qualifyCap = QUALIFY_CAP,
 ): Promise<IndexStats> {
   // Only asked here, never acted on: the vectors this invalidates are the ones
   // the vault searches with until the replacements exist, and `embed` below is
   // a network call that fails for ordinary reasons. The drop happens in the
   // write transaction, with the new vectors in hand.
   const reembedded = vectorsStale(db, embedder);
-  const rows = db.query(`select id, path, hash from notes`).all() as {
+  const rows = db.query(`select id, path, hash, slug from notes`).all() as {
     id: number;
     path: string;
     hash: string;
+    slug: string;
   }[];
   const indexed = new Map(rows.map((r) => [r.path, r]));
   const embedded = new Set(
@@ -164,6 +200,20 @@ export async function indexPaths(
       continue;
     }
     dirty.push({ note, mtime: Math.floor(entry?.mtimeMs ?? 0), id: row?.id });
+  }
+
+  // Detect, before the write transaction, from the snapshot above: a new note
+  // (`id === undefined`) whose stem exactly one pre-existing note still holds —
+  // "still": a row in `gone` is a rename or deletion, not an incumbent. Zero
+  // holders is no collision; two or more means the stem was already ambiguous
+  // and there is nothing left to protect. Deduped per stem: two newcomers
+  // colliding with the same incumbent are one rewrite.
+  const goneSet = new Set(gone);
+  const collisions = new Map<string, string>(); // stem → incumbent path
+  for (const d of dirty) {
+    if (d.id !== undefined) continue;
+    const holders = rows.filter((r) => r.slug === d.note.slug && !goneSet.has(r.id));
+    if (holders.length === 1) collisions.set(d.note.slug, holders[0]!.path);
   }
 
   const vectors = dirty.length
@@ -245,14 +295,72 @@ export async function indexPaths(
     if (dirty.length || gone.length) resolveEdges(db);
   })();
 
+  // Rewrite after commit: the moment both notes are indexed is the only one
+  // that knows which was the incumbent, and the only file writes `indexPaths`
+  // makes. Between the commit above and the re-entry below, the qualified
+  // edges briefly read `to_id = null` — the documented window.
+  const qualified: Qualified[] = [];
+  const rewritten: string[] = [];
+  // A bare link *inside* a colliding newcomer has no settled meaning — it was
+  // written when its own note was the collision — so it is left to doctor.
+  const newPaths = new Set(dirty.filter((d) => d.id === undefined).map((d) => d.note.path));
+  for (const [stem, incumbent] of collisions) {
+    // A root incumbent's path minus `.md` *is* the bare stem: no qualified
+    // form, so its linkers are reported, never rewritten (DESIGN.md § Layout).
+    const target = incumbent.includes("/") ? linkTarget(incumbent) : null;
+    const linkers = db
+      .query(
+        `select n.path, n.hash from edges e join notes n on n.id = e.from_id
+         where e.to_slug = ? order by n.path`,
+      )
+      .all(stem) as { path: string; hash: string }[];
+    const entry: Qualified = { stem, target, rewritten: [], skipped: [] };
+    for (const { path, hash } of linkers) {
+      if (newPaths.has(path)) continue;
+      if (target === null || entry.rewritten.length >= qualifyCap) {
+        entry.skipped.push(path);
+        continue;
+      }
+      const abs = confinedPath(root, path); // the index is derived data, not a trusted path source
+      const raw = await readRaw(root, path);
+      if (raw === null) continue; // indexed but gone: files are truth, the row is stale
+      const note = parseNote(raw, path);
+      // Check-and-write: the file must still be what the index read it at — a
+      // human's mid-flight edit is skipped, never clobbered, like supersede's
+      // `unmarked`.
+      if (note.hash !== hash) {
+        entry.skipped.push(path);
+        continue;
+      }
+      const body = qualifyLinks(note.body, stem, target);
+      if (body === note.body) continue; // the edge came from frontmatter-adjacent text it cannot reach
+      await writeAtomic(abs, replaceBody(raw, body));
+      entry.rewritten.push(path);
+      rewritten.push(path);
+    }
+    qualified.push(entry);
+  }
+  // Re-enter on just the rewritten paths so the index never lags a write we
+  // made ourselves. Bounded structurally: none of them is new to the index, so
+  // the pass detects no collision and recurses no further.
+  if (rewritten.length > 0) await indexPaths(db, root, embedder, rewritten);
+
   return {
     added: dirty.filter((d) => d.id === undefined).length,
     updated: dirty.filter((d) => d.id !== undefined).length,
     removed: gone.length,
     unchanged,
     reembedded,
+    qualified,
   };
 }
+
+/**
+ * Rewrites per collision before the remainder is reported instead (#29): the
+ * rewrite is deterministic, so this is a generous fuse against a pathological
+ * vault, not a tuning knob. Injectable via `indexPaths` for the tests.
+ */
+export const QUALIFY_CAP = 500;
 
 /** Drop every derived row for a note whose file is gone. */
 export function purgeNote(db: Database, id: number): void {
