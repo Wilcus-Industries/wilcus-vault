@@ -322,7 +322,9 @@ const summary = (s: IndexStats): string =>
               (q.skipped.length > 0 ? ` (${q.skipped.length} skipped — see doctor)` : ""),
       ),
     )
-    .join("");
+    .join("") +
+  // rows for the rewritten notes lag their files until the next pass
+  (s.indexError !== undefined ? safe(`; re-index of rewritten notes failed: ${s.indexError}`) : "");
 
 /** `vault watch` runs until it is stopped; this is what "until" means. */
 function interrupted(): Promise<void> {

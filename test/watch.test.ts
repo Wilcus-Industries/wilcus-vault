@@ -304,6 +304,27 @@ test("a model swap under the watcher re-embeds the whole vault, not just the tou
   db.close();
 });
 
+test("a model swap does not lose the qualify report", async () => {
+  const root = makeVault({ "customers/acme.md": "# Acme\n", "hub.md": "# Hub\n\n[[acme]]\n" });
+  const db = open(root);
+  await reindex(db, root, embedder); // 32 dims
+
+  // the same pass both creates a stem collision and detects the dims change:
+  // the follow-up whole-vault reindex must not replace the qualify report,
+  // because files were rewritten and the report is the only place that says so
+  let reported: { reembedded: boolean; qualified: { stem: string }[] } | undefined;
+  const wider = new TokenOverlapEmbedder(64);
+  const w = watch(db, root, wider, { debounceMs: 1, onChange: (_paths, stats) => (reported = stats) });
+  writeNote(root, "vendors/acme.md", "# Acme two\n");
+  w.touch("vendors/acme.md");
+  await w.idle();
+
+  expect(reported?.reembedded).toBe(true);
+  expect(reported?.qualified.map((q) => q.stem)).toEqual(["acme"]);
+  await w.close();
+  db.close();
+});
+
 test("close stops the watcher: later events are dropped", async () => {
   const root = makeVault(FIXTURE);
   const db = open(root);

@@ -1,6 +1,6 @@
 import { test, expect, afterAll } from "bun:test";
 import type { Database } from "bun:sqlite";
-import { mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { openDb, dbPath } from "../src/db";
 import { TokenOverlapEmbedder } from "../src/embed";
@@ -410,6 +410,8 @@ test("a new stem collision auto-qualifies every bare link to the incumbent", asy
       skipped: [],
     },
   ]);
+  // the re-entry's pass is part of this one: the notes it rewrote count as updated
+  expect(stats.updated).toBe(2);
   // textual body edits: link qualified, alias kept, everything else verbatim
   expect(readFile(root, "hub.md")).toBe("# Hub\n\nsee [[customers/acme]] for the account\n");
   expect(readFile(root, "notes/deal.md")).toBe(
@@ -497,6 +499,106 @@ test("the qualify cap bounds rewrites per collision and reports the remainder", 
     { stem: "acme", target: "customers/acme", rewritten: ["hub.md"], skipped: ["notes/deal.md"] },
   ]);
   expect(readFile(root, "notes/deal.md")).toBe(COLLISION["notes/deal.md"]);
+  db.close();
+});
+
+test("an incumbent whose path cannot survive a wikilink round trip is reported, never rewritten", async () => {
+  // `[` and `]` are legal filename characters; spliced into `[[...]]` they
+  // destroy the link (`[[[archive]/acme]]` parses as no edge at all).
+  const root = makeVault({ "[archive]/acme.md": "# Acme\n", "hub.md": "# Hub\n\n[[acme]]\n" });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  writeNote(root, "vendors/acme.md", "# Acme two\n");
+  const stats = await indexPaths(db, root, embedder, ["vendors/acme.md"]);
+  expect(stats.qualified).toEqual([
+    { stem: "acme", target: null, rewritten: [], skipped: ["hub.md"] },
+  ]);
+  expect(readFile(root, "hub.md")).toBe("# Hub\n\n[[acme]]\n");
+  db.close();
+});
+
+test("an incumbent whose file is gone is no collision: the index is not truth", async () => {
+  // A move seen by the watcher in two passes: the create arrives first, the
+  // delete has not been indexed yet. Rewriting to the stale row's path would
+  // break every bare link vault-wide on the next pass.
+  const root = makeVault({ "a/acme.md": "# Acme\n", "hub.md": "# Hub\n\n[[acme]]\n" });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  rmSync(join(root, "a", "acme.md"));
+  writeNote(root, "b/acme.md", "# Acme\n");
+  const stats = await indexPaths(db, root, embedder, ["b/acme.md"]);
+  expect(stats.qualified).toEqual([]);
+  expect(readFile(root, "hub.md")).toBe("# Hub\n\n[[acme]]\n");
+  db.close();
+});
+
+test("an unwritable linking note is skipped and reported, never fatal", async () => {
+  const root = makeVault({ "customers/acme.md": "# Acme\n", "ro/hub.md": "# Hub\n\n[[acme]]\n" });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  writeNote(root, "vendors/acme.md", "# Acme two\n");
+  chmodSync(join(root, "ro"), 0o555);
+  try {
+    // one unwritable linker must not throw away the whole pass's stats
+    const stats = await indexPaths(db, root, embedder, ["vendors/acme.md"]);
+    expect(stats.qualified).toEqual([
+      { stem: "acme", target: "customers/acme", rewritten: [], skipped: ["ro/hub.md"] },
+    ]);
+  } finally {
+    chmodSync(join(root, "ro"), 0o755);
+  }
+  expect(readFile(root, "ro/hub.md")).toBe("# Hub\n\n[[acme]]\n");
+  db.close();
+});
+
+test("every linker is accounted for: vanished and new-in-pass linkers land in skipped", async () => {
+  const root = makeVault(COLLISION);
+  const db = open(root);
+  await reindex(db, root, embedder);
+  // hub.md vanishes without its deletion being indexed, and a brand-new note
+  // links the stem bare in the same pass as the collision
+  rmSync(join(root, "hub.md"));
+  writeNote(root, "vendors/acme.md", "# Acme the vendor\n");
+  writeNote(root, "notes/new.md", "# New\n\n[[acme]]\n");
+  const stats = await indexPaths(db, root, embedder, ["vendors/acme.md", "notes/new.md"]);
+  expect(stats.qualified).toEqual([
+    {
+      stem: "acme",
+      target: "customers/acme",
+      rewritten: ["notes/deal.md"],
+      skipped: ["hub.md", "notes/new.md"],
+    },
+  ]);
+  // the new note's own bare link has no settled meaning — left for doctor
+  expect(readFile(root, "notes/new.md")).toBe("# New\n\n[[acme]]\n");
+  db.close();
+});
+
+test("a collision with no bare linkers earns no report entry", async () => {
+  const root = makeVault({ "customers/acme.md": "# Acme\n" });
+  const db = open(root);
+  await reindex(db, root, embedder);
+  writeNote(root, "vendors/acme.md", "# Acme two\n");
+  const stats = await indexPaths(db, root, embedder, ["vendors/acme.md"]);
+  expect(stats.qualified).toEqual([]);
+  db.close();
+});
+
+test("a re-entry failure after rewrites is reported in the stats, not thrown", async () => {
+  // The embedder dies exactly when it sees the rewritten text — the files have
+  // already changed, so the caller must still get the stats saying which ones.
+  const flaky = stubEmbedder("flaky-v1", 8, async (texts) => {
+    if (texts.some((t) => t.includes("[[customers/acme]]"))) throw new Error("embed endpoint down");
+    return texts.map(() => new Float32Array(8).fill(1));
+  });
+  const root = makeVault(COLLISION);
+  const db = open(root);
+  await reindex(db, root, flaky);
+  writeNote(root, "vendors/acme.md", "# Acme the vendor\n");
+  const stats = await indexPaths(db, root, flaky, ["vendors/acme.md"]);
+  expect(stats.qualified[0]!.rewritten).toEqual(["hub.md", "notes/deal.md"]);
+  expect(stats.indexError).toContain("embed endpoint down");
+  expect(readFile(root, "hub.md")).toBe("# Hub\n\nsee [[customers/acme]] for the account\n");
   db.close();
 });
 

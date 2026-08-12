@@ -85,8 +85,13 @@ export function watch(
           // re-embedded with the new one, the rest of the vault is re-embedded
           // here rather than left half-indexed. Report *that* pass — it is the
           // one that says what happened — but keep the flag, which the second
-          // `ensureVectors` no longer has a reason to raise.
-          if (stats.reembedded) stats = { ...(await reindex(db, root, embedder)), reembedded: true };
+          // `ensureVectors` no longer has a reason to raise, and carry the
+          // first pass's qualify report: files were rewritten, and this is the
+          // only place that says so.
+          if (stats.reembedded) {
+            const full = await reindex(db, root, embedder);
+            stats = { ...full, reembedded: true, qualified: [...stats.qualified, ...full.qualified] };
+          }
           onChange?.(paths, stats);
         } catch (e) {
           // A malformed note, a provider blip, a locked database: report it and

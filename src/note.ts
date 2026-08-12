@@ -42,6 +42,23 @@ export type Note = {
  */
 export const linkTarget = (rel: string): string => rel.slice(0, -".md".length);
 
+/**
+ * Can this link target survive a round trip through `[[…]]`? A `[`, `]` or `|`
+ * is legal in a filename but destroys or misdirects the link when spliced into
+ * one (`[[[archive]/acme]]` parses as no edge at all; `[[my|dir/acme]]` parses
+ * as link `my` with an alias). A rewrite that cannot round-trip is never made.
+ */
+export const isWritableTarget = (target: string): boolean => !/[\[\]|\r\n]/.test(target);
+
+// The one wikilink scanner: `parseNote` finds edges with it and `qualifyLinks`
+// rewrites with it, so what counts as a link and what gets rewritten cannot
+// disagree. Single-line and length-capped: a stray `[[` must not pair with a
+// `]]` pages later and invent an edge.
+const WIKILINK = /\[\[([^\[\]\n]{1,256})\]\]/g;
+
+/** A match's link target: the text before any `|alias`, trimmed. */
+const linkOf = (inner: string): string => inner.split("|")[0]!.trim();
+
 /** Split a leading `---` block off the top of the file. */
 function splitFrontmatter(text: string): {
   yaml: string | null;
@@ -128,16 +145,11 @@ export function parseNote(raw: string, relPath: string): Note {
   }
 
   // ponytail: regex scan, no markdown parse — wikilinks and headings inside code
-  // fences are counted (documented MVP simplification); parse structure if it bites.
-  // Single-line and length-capped: a stray `[[` must not pair with a `]]` pages
-  // later and invent an edge. `/` is ordinary content here — a path-qualified
-  // target travels whole and is resolved as SQL, never as a filesystem path.
+  // fences are counted (documented MVP simplification); parse structure if it
+  // bites. `/` is ordinary content here — a path-qualified target travels whole
+  // and is resolved as SQL, never as a filesystem path.
   const links = [
-    ...new Set(
-      Array.from(body.matchAll(/\[\[([^\[\]\n]{1,256})\]\]/g), (m) =>
-        m[1]!.split("|")[0]!.trim(),
-      ),
-    ),
+    ...new Set(Array.from(body.matchAll(WIKILINK), (m) => linkOf(m[1]!))),
   ].filter((s) => s !== "");
 
   return {
@@ -259,10 +271,9 @@ export function qualifyLinks(raw: string, stem: string, target: string): string 
   const start = frontmatterBlock(raw)?.bodyStart ?? 0;
   // The link regex never spans a line, so a CRLF file's `\r`s all sit outside
   // any match and survive; the frontmatter's bytes are not scanned at all.
-  const body = raw.slice(start).replace(/\[\[([^\[\]\n]{1,256})\]\]/g, (whole, inner: string) => {
+  const body = raw.slice(start).replace(WIKILINK, (whole, inner: string) => {
+    if (linkOf(inner) !== stem) return whole;
     const pipe = inner.indexOf("|");
-    const link = (pipe === -1 ? inner : inner.slice(0, pipe)).trim();
-    if (link !== stem) return whole;
     return `[[${target}${pipe === -1 ? "" : inner.slice(pipe)}]]`;
   });
   return raw.slice(0, start) + body;

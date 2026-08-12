@@ -204,7 +204,7 @@ export type { SearchHit, SearchOptions, Cutoffs } from "./search";
 export type { Embedder } from "./embed";
 export type { DoctorReport, DoctorOptions } from "./doctor";
 export type { WatchOptions, Watcher } from "./watch";
-export type { IndexStats } from "./indexer";
+export type { IndexStats, Qualified } from "./indexer";
 export type { Note } from "./note";
 export { gatePrompt, parseDecision, slugify } from "./gate";
 export type { Decider, DeciderInput, Decision, SimilarNote, Action } from "./gate";
