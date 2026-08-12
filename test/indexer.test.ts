@@ -515,6 +515,20 @@ test("an incumbent whose path cannot survive a wikilink round trip is reported, 
   ]);
   expect(readFile(root, "hub.md")).toBe("# Hub\n\n[[acme]]\n");
   db.close();
+
+  // whitespace is the other thing the parser does to a target — it trims — so
+  // a leading-space directory cannot round-trip either: `[[ archive/acme]]`
+  // parses back as `archive/acme`, a different (possibly existing) note
+  const root2 = makeVault({ " archive/acme.md": "# Acme\n", "hub.md": "# Hub\n\n[[acme]]\n" });
+  const db2 = open(root2);
+  await reindex(db2, root2, embedder);
+  writeNote(root2, "vendors/acme.md", "# Acme two\n");
+  const stats2 = await indexPaths(db2, root2, embedder, ["vendors/acme.md"]);
+  expect(stats2.qualified).toEqual([
+    { stem: "acme", target: null, rewritten: [], skipped: ["hub.md"] },
+  ]);
+  expect(readFile(root2, "hub.md")).toBe("# Hub\n\n[[acme]]\n");
+  db2.close();
 });
 
 test("an incumbent whose file is gone is no collision: the index is not truth", async () => {

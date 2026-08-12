@@ -12,12 +12,10 @@ import { printable } from "./term";
 /**
  * One stem collision's auto-qualify outcome (DESIGN.md § Data model): the bare
  * `[[stem]]` links that still unambiguously meant the incumbent, rewritten to
- * its path-qualified form. `target` is null when the incumbent sits at the
- * vault root — it has no qualified form, so nothing is rewritten and every
- * linker is reported. `skipped` also carries linkers edited mid-flight (hash
- * mismatch — never clobbered) and the remainder past the cap; all of them fall
- * back to doctor's ambiguous report. The invariant is *never guesses*, not
- * *never ambiguous*.
+ * its path-qualified form. When the incumbent has no writable qualified form
+ * (`target` null), nothing is rewritten and every linker lands in `skipped`;
+ * the two arrays together account for every linker. The invariant is *never
+ * guesses*, not *never ambiguous*.
  */
 export type Qualified = {
   stem: string;
@@ -229,10 +227,12 @@ export async function indexPaths(
   for (const d of dirty) {
     if (d.id !== undefined) continue;
     const holders = rows.filter((r) => r.slug === d.note.slug && !goneSet.has(r.id));
+    if (holders.length !== 1) continue;
+    confinedPath(root, holders[0]!.path); // the index is derived data, not a trusted path source
     // The incumbent's file must still exist: its row alone is not truth. A move
     // the watcher sees in two passes (create first, delete later) would
     // otherwise rewrite every bare link to a path about to be purged.
-    if (holders.length === 1 && noteEntry(root, holders[0]!.path) !== null) {
+    if (noteEntry(root, holders[0]!.path) !== null) {
       collisions.set(d.note.slug, holders[0]!.path);
     }
   }
@@ -322,6 +322,7 @@ export async function indexPaths(
   // edges briefly read `to_id = null` — the documented window.
   const qualified: Qualified[] = [];
   const rewritten: string[] = [];
+  let indexError: string | undefined;
   // A bare link inside a note new to this same pass has no settled meaning —
   // nothing records which acme it was written against — so it is left to doctor.
   const newPaths = new Set(dirty.filter((d) => d.id === undefined).map((d) => d.note.path));
@@ -371,8 +372,9 @@ export async function indexPaths(
           continue;
         }
         await writeAtomic(abs, out);
-      } catch {
+      } catch (e) {
         entry.skipped.push(path);
+        indexError ??= printable(e); // a skip has a cause; say the first one
         continue;
       }
       entry.rewritten.push(path);
@@ -386,20 +388,22 @@ export async function indexPaths(
   // the pass detects no collision and recurses no further. A failure here is
   // reported, not thrown — the files above have already changed, and the stats
   // are the only record of which.
-  let indexError: string | undefined;
-  let reentered = 0;
   if (rewritten.length > 0) {
     try {
-      reentered = (await indexPaths(db, root, embedder, rewritten)).updated;
+      await indexPaths(db, root, embedder, rewritten);
     } catch (e) {
-      indexError = printable(e);
+      indexError ??= printable(e);
     }
   }
 
+  // The re-entry's pass is part of this one: the notes it rewrote count as
+  // updated too — distinct paths, since a note can be both dirty in this pass
+  // and rewritten by it.
+  const updated = new Set(dirty.filter((d) => d.id !== undefined).map((d) => d.note.path));
+  for (const path of rewritten) updated.add(path);
   return {
     added: dirty.filter((d) => d.id === undefined).length,
-    // the re-entry's pass is part of this one: the notes it rewrote count too
-    updated: dirty.filter((d) => d.id !== undefined).length + reentered,
+    updated: updated.size,
     removed: gone.length,
     unchanged,
     reembedded,

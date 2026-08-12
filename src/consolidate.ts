@@ -293,6 +293,15 @@ export async function consolidate(
   await reindex(db, base, embedder);
 
   const found = clusters(db, ceiling);
+  // Confinement up front, before anything is written: a member path that
+  // escapes the vault root is a tampered or corrupt index, and that aborts the
+  // run loudly — never after merges have landed, where the throw would discard
+  // their report and skip the closing reindex.
+  for (const cluster of found) {
+    for (const path of cluster.members) {
+      confinedPath(base, path); // the index is derived data, not a trusted path source
+    }
+  }
   const crossNamespace = found.filter((c) => c.namespace === null);
   const merges: Merge[] = [];
   const remaining: Cluster[] = [];
@@ -302,17 +311,13 @@ export async function consolidate(
   // merged or errored after the call. An error before the call (an unreadable
   // member) spent nothing and burns no slot: otherwise ≥cap broken clusters
   // would starve every real one, run after run.
+  // ponytail: pre-call errors are unbounded — a chmod'd subtree yields one
+  // entry per cluster per run. Bound them if a thousand-entry report shows up.
   let acted = 0;
   for (const cluster of found.filter((c) => c.namespace !== null)) {
     if (acted >= cap) {
       remaining.push(cluster);
       continue;
-    }
-    // Outside the try on purpose: a member path that fails confinement is a
-    // row that escaped the vault root — a tampered or corrupt index — and that
-    // aborts the run loudly rather than shrinking to one string in `errors`.
-    for (const path of cluster.members) {
-      confinedPath(base, path); // the index is derived data, not a trusted path source
     }
     let created: string | undefined;
     try {

@@ -46,9 +46,12 @@ export const linkTarget = (rel: string): string => rel.slice(0, -".md".length);
  * Can this link target survive a round trip through `[[…]]`? A `[`, `]` or `|`
  * is legal in a filename but destroys or misdirects the link when spliced into
  * one (`[[[archive]/acme]]` parses as no edge at all; `[[my|dir/acme]]` parses
- * as link `my` with an alias). A rewrite that cannot round-trip is never made.
+ * as link `my` with an alias), and `linkOf` trims, so leading or trailing
+ * whitespace does not survive either (`[[ archive/acme]]` reads back as a
+ * different note's path). A rewrite that cannot round-trip is never made.
  */
-export const isWritableTarget = (target: string): boolean => !/[\[\]|\r\n]/.test(target);
+export const isWritableTarget = (target: string): boolean =>
+  !/[\[\]\r\n]/.test(target) && linkOf(target) === target;
 
 // The one wikilink scanner: `parseNote` finds edges with it and `qualifyLinks`
 // rewrites with it, so what counts as a link and what gets rewritten cannot

@@ -329,24 +329,32 @@ test("a failing closing reindex is reported, never a throw that discards the lan
 });
 
 test("a member path escaping the vault aborts the run loudly: a tampered index is not a cluster error", async () => {
-  const root = makeVault({});
+  // A healthy in-vault cluster (identical DELTA pair, distance 0) sorts ahead
+  // of the escaping one (ALPHA–BETA, 0.10): the abort must land before *any*
+  // merge does, or the report and the closing reindex are discarded with it.
+  const root = makeVault({
+    "notes/d1.md": "# D one\n\nDELTA one.\n",
+    "notes/d2.md": "# D two\n\nDELTA two.\n",
+  });
   const evil = makeVault({
-    "a1.md": "# A one\n\nALPHA one.\n",
-    "a2.md": "# A two\n\nALPHA two.\n",
+    "z1.md": "# Z one\n\nALPHA marks it.\n",
+    "z2.md": "# Z two\n\nBETA marks it.\n",
   });
   const v = open(root, { embedder, consolidate: fakeMerger() });
   // Plant index rows whose paths point outside the vault — what a tampered or
   // corrupt index looks like to the pass.
   const db = openDb(dbPath(root));
-  const rels = ["a1.md", "a2.md"].map((f) => relative(root, join(evil, f)).replaceAll("\\", "/"));
+  const rels = ["z1.md", "z2.md"].map((f) => relative(root, join(evil, f)).replaceAll("\\", "/"));
   await indexPaths(db, root, embedder, rels);
   db.close();
 
   await expect(v.consolidate({ ceiling: 0.25, write: true })).rejects.toThrow(
     /resolves outside the vault/,
   );
-  // nothing was merged behind the abort
+  // nothing was merged behind the abort — not even the healthy cluster
   expect(existsSync(join(evil, "merged-note.md"))).toBe(false);
+  expect(existsSync(join(root, "notes/merged-note.md"))).toBe(false);
+  expect(readFileSync(join(root, "notes/d1.md"), "utf8")).not.toContain("superseded_by");
   v.close();
 });
 
