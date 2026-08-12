@@ -317,12 +317,14 @@ const summary = (s: IndexStats): string =>
     .map((q) =>
       safe(
         q.target === null
-          ? `; [[${q.stem}]] went ambiguous (root incumbent — ${q.skipped.length} linking note${q.skipped.length === 1 ? "" : "s"} left for doctor)`
+          ? `; [[${q.stem}]] went ambiguous (no qualified form — ${q.skipped.length} linking note${q.skipped.length === 1 ? "" : "s"} left for doctor)`
           : `; [[${q.stem}]] qualified to [[${q.target}]] in ${q.rewritten.length} note${q.rewritten.length === 1 ? "" : "s"}` +
               (q.skipped.length > 0 ? ` (${q.skipped.length} skipped — see doctor)` : ""),
       ),
     )
-    .join("");
+    .join("") +
+  // rows for the rewritten notes lag their files until the next pass
+  (s.indexError !== undefined ? safe(`; re-index of rewritten notes failed: ${s.indexError}`) : "");
 
 /** `vault watch` runs until it is stopped; this is what "until" means. */
 function interrupted(): Promise<void> {

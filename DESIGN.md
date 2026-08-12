@@ -90,12 +90,19 @@ repair the vault.
   the commit and that re-entry those edges briefly read `to_id = null` — an
   accepted window. The outcome rides on `IndexStats.qualified`; the CLI prints
   it and the watcher logs it. The invariant is **never guesses**, not *never
-  ambiguous*: a root incumbent (no qualified form), both notes new in the same
-  pass (no incumbent — picking one would be the forbidden first-match
-  resolution), a linker edited mid-flight (hash mismatch, never clobbered) and
-  the cap's remainder are all reported and left to `doctor`'s ambiguous
-  report. `doctor --rebuild` and any cold first index see every note as new,
-  so they are structurally no-ops here.
+  ambiguous*: a root incumbent (no qualified form), an incumbent whose path
+  cannot survive a wikilink round trip (`[`, `]` or `|` in a directory name
+  would destroy the links it rewrites), an incumbent whose *file* is gone (the
+  row alone is not truth — a move the watcher sees in two passes is a rename,
+  not a collision), both notes new in the same pass (no incumbent — picking
+  one would be the forbidden first-match resolution), a linker edited
+  mid-flight (hash mismatch, never clobbered), a linker unreadable or
+  unwritable, and the cap's remainder are all reported and left to `doctor`'s
+  ambiguous report — `rewritten` + `skipped` account for every linker. A
+  failure in the post-rewrite re-entry rides on `IndexStats.indexError`
+  instead of throwing (the files have already changed; the next pass recovers
+  the rows). `doctor --rebuild` and any cold first index see every note as
+  new, so they are structurally no-ops here.
 - Frontmatter: `type`, `created`, `updated`, optional `superseded_by`
   (**vault-relative path** of the superseding note), plus free keys. Written by
   us, editable by humans. `parseNote` never throws: a file whose frontmatter is
@@ -540,14 +547,22 @@ the `VaultContext` the operator hands it.
 - **A write run survives a bad cluster.** Once a merge has landed, a later
   cluster's failure (merger error, no free filename) must not discard the
   report of what landed: on a write run, per-cluster errors are collected into
-  the report's `errors` field and the run continues, and the closing reindex
-  runs regardless so the index never lags the landed writes. A dry run still
-  throws — nothing has landed that a report would need to account for.
-- **Per-run action cap**, counted in clusters acted on — merged or errored,
-  both spent their model call (default single digits):
-  on hitting it the run stops and reports the remainder. A pass that wants to
-  rewrite half the vault is evidence the ceiling is wrong, and the cap turns
-  that evidence into a short report instead of a long mess.
+  the report's `errors` field (scrubbed via `printable`; when the merged note
+  was created before the throw, the entry carries its `path` — the file is
+  live in search and nothing else names it) and the run continues, and the
+  closing reindex runs regardless so the index never lags the landed writes —
+  and when the reindex itself fails, that rides on the report's `indexError`
+  instead of discarding it. A dry run still throws — nothing has landed that a
+  report would need to account for. One failure stays loud even on a write
+  run: a member path failing confinement is a tampered index, not a cluster
+  error, and aborts the run.
+- **Per-run action cap**, counted in clusters whose merger *ran* — merged or
+  errored after the call, both spent their model call (default single digits);
+  an error before the call (an unreadable member) burns no slot, or broken
+  clusters would starve real ones run after run. On hitting it the run stops
+  and reports the remainder. A pass that wants to rewrite half the vault is
+  evidence the ceiling is wrong, and the cap turns that evidence into a short
+  report instead of a long mess.
 
 ## Doctor / watcher
 

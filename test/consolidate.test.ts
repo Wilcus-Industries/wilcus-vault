@@ -4,8 +4,10 @@
 // over N members. Fake mergers, exact-vector embedder, no network.
 import { test, expect, afterAll, spyOn } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { checkMerged } from "../src/consolidate";
+import { dbPath, openDb } from "../src/db";
+import { indexPaths } from "../src/indexer";
 import { parseNote } from "../src/note";
 import {
   mergePrompt,
@@ -306,6 +308,137 @@ test("a write run collects per-cluster errors and the index never lags landed me
   const dry = openVault(files, merger);
   await expect(dry.consolidate({ ceiling: 0.25 })).rejects.toThrow("model fell over");
   dry.close();
+});
+
+test("a failing closing reindex is reported, never a throw that discards the landed merges", async () => {
+  // The embedder works for the opening reindex and dies on the closing one — a
+  // network hiccup after the merge landed must not cost the operator the report.
+  let calls = 0;
+  const flaky = stubEmbedder("marker-v1", 3, async (texts) => {
+    if (++calls >= 2) throw new Error("embedding endpoint fell over");
+    return embedder.embed(texts);
+  });
+  const files = { "notes/a1.md": "# A one\n\nALPHA one.\n", "notes/a2.md": "# A two\n\nALPHA two.\n" };
+  const v = open(makeVault(files), { embedder: flaky, consolidate: fakeMerger() });
+  const r = await v.consolidate({ ceiling: 0.25, write: true });
+
+  expect(r.merges).toHaveLength(1);
+  expect(r.merges[0]!.superseded).toEqual(["notes/a1.md", "notes/a2.md"]);
+  expect(r.indexError).toContain("embedding endpoint fell over");
+  v.close();
+});
+
+test("a member path escaping the vault aborts the run loudly: a tampered index is not a cluster error", async () => {
+  // A healthy in-vault cluster (identical DELTA pair, distance 0) sorts ahead
+  // of the escaping one (ALPHA–BETA, 0.10): the abort must land before *any*
+  // merge does, or the report and the closing reindex are discarded with it.
+  const root = makeVault({
+    "notes/d1.md": "# D one\n\nDELTA one.\n",
+    "notes/d2.md": "# D two\n\nDELTA two.\n",
+  });
+  const evil = makeVault({
+    "z1.md": "# Z one\n\nALPHA marks it.\n",
+    "z2.md": "# Z two\n\nBETA marks it.\n",
+  });
+  const v = open(root, { embedder, consolidate: fakeMerger() });
+  // Plant index rows whose paths point outside the vault — what a tampered or
+  // corrupt index looks like to the pass.
+  const db = openDb(dbPath(root));
+  const rels = ["z1.md", "z2.md"].map((f) => relative(root, join(evil, f)).replaceAll("\\", "/"));
+  await indexPaths(db, root, embedder, rels);
+  db.close();
+
+  await expect(v.consolidate({ ceiling: 0.25, write: true })).rejects.toThrow(
+    /resolves outside the vault/,
+  );
+  // nothing was merged behind the abort — not even the healthy cluster
+  expect(existsSync(join(evil, "merged-note.md"))).toBe(false);
+  expect(existsSync(join(root, "notes/merged-note.md"))).toBe(false);
+  expect(readFileSync(join(root, "notes/d1.md"), "utf8")).not.toContain("superseded_by");
+  v.close();
+});
+
+test("an error before the model call does not burn a cap slot", async () => {
+  const files = {
+    "notes/a1.md": "# A one\n\nALPHA one.\n",
+    "notes/a2.md": "# A two\n\nALPHA two.\n",
+    "notes/d1.md": "# D one\n\nDELTA one.\n",
+    "notes/d2.md": "# D two\n\nDELTA two.\n",
+  };
+  const fake = fakeMerger();
+  const v = openVault(files, fake.merger);
+  // the ALPHA cluster sorts first and its member turns unreadable between the
+  // opening reindex (its 1st read) and the cluster loop (its 2nd) — no model call
+  const realFile = Bun.file;
+  let a1Reads = 0;
+  const file = spyOn(Bun, "file");
+  file.mockImplementation(((path: string) => {
+    if (String(path).endsWith("notes/a1.md") && ++a1Reads === 2) {
+      return {
+        text: async () => {
+          throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+        },
+      };
+    }
+    return realFile(path);
+  }) as never);
+  let r;
+  try {
+    r = await v.consolidate({ ceiling: 0.25, cap: 1, write: true });
+  } finally {
+    file.mockRestore();
+  }
+  // the unreadable cluster is an error, and the DELTA cluster still got the
+  // run's one model call instead of being pushed to remaining
+  expect(r.errors).toHaveLength(1);
+  expect(r.errors[0]!.cluster.members).toEqual(["notes/a1.md", "notes/a2.md"]);
+  expect(r.merges).toHaveLength(1);
+  expect(r.merges[0]!.cluster.members).toEqual(["notes/d1.md", "notes/d2.md"]);
+  expect(r.remaining).toEqual([]);
+  v.close();
+});
+
+test("a reported error is scrubbed of control characters", async () => {
+  const merger: Merger = async () => {
+    throw new Error("model \x1b[2J fell over");
+  };
+  const v = openVault(
+    { "notes/a1.md": "# A one\n\nALPHA one.\n", "notes/a2.md": "# A two\n\nALPHA two.\n" },
+    merger,
+  );
+  const r = await v.consolidate({ ceiling: 0.25, write: true });
+  // merger output travels out as report data a consumer will print
+  expect(r.errors[0]!.error).toBe("model ?[2J fell over");
+  v.close();
+});
+
+test("a throw after create still reports the merged note's path, and the reindex covers it", async () => {
+  const v = openVault(
+    { "notes/a1.md": "# A one\n\nALPHA one.\n", "notes/a2.md": "# A two\n\nALPHA two.\n" },
+    fakeMerger().merger,
+  );
+  const real = Bun.write;
+  const write = spyOn(Bun, "write");
+  write.mockImplementation((async (path: string, data: string) => {
+    // the merged note lands, then marking the first member hits a full disk
+    if (path.includes("a1.md")) throw new Error("disk full");
+    return real(path, data);
+  }) as never);
+  let r;
+  try {
+    r = await v.consolidate({ ceiling: 0.25, write: true });
+  } finally {
+    write.mockRestore();
+  }
+
+  expect(r.merges).toEqual([]);
+  expect(r.errors).toHaveLength(1);
+  expect(r.errors[0]!.error).toContain("disk full");
+  // the operator learns which file the pass created before it threw…
+  expect(r.errors[0]!.path).toBe("notes/merged-note.md");
+  // …and the closing reindex covered it: the orphan is live in search, not invisible
+  expect((await v.search("ALPHA")).map((h) => h.path)).toContain("notes/merged-note.md");
+  v.close();
 });
 
 test("a member edited mid-flight is reported unmarked, and the merged note stands", async () => {

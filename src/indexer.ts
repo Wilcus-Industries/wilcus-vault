@@ -3,28 +3,35 @@
 import type { Database } from "bun:sqlite";
 import { lstatSync, readdirSync, type Stats } from "node:fs";
 import { join, relative } from "node:path";
-import { linkTarget, parseNote, qualifyLinks, type Note } from "./note";
+import { isWritableTarget, linkTarget, parseNote, qualifyLinks, type Note } from "./note";
 import { confinedPath, writeAtomic } from "./gate";
 import { resetVectors, vectorsStale } from "./db";
 import { l2normalize, type Embedder } from "./embed";
+import { printable } from "./term";
 
 /**
  * One stem collision's auto-qualify outcome (DESIGN.md § Data model): the bare
  * `[[stem]]` links that still unambiguously meant the incumbent, rewritten to
- * its path-qualified form. `target` is null when the incumbent sits at the
- * vault root — it has no qualified form, so nothing is rewritten and every
- * linker is reported. `skipped` also carries linkers edited mid-flight (hash
- * mismatch — never clobbered) and the remainder past the cap; all of them fall
- * back to doctor's ambiguous report. The invariant is *never guesses*, not
- * *never ambiguous*.
+ * its path-qualified form. When the incumbent has no writable qualified form
+ * (`target` null), nothing is rewritten and every linker lands in `skipped`;
+ * the two arrays together account for every linker. The invariant is *never
+ * guesses*, not *never ambiguous*.
  */
 export type Qualified = {
   stem: string;
-  /** the incumbent's path-qualified link target, or null for a root incumbent */
+  /**
+   * The incumbent's path-qualified link target — or null when it has none: a
+   * root incumbent (its path minus `.md` *is* the bare stem), or a path a
+   * wikilink cannot carry (`[`, `]` or `|` in a directory name).
+   */
   target: string | null;
   /** linking notes whose bare links were rewritten */
   rewritten: string[];
-  /** linking notes left alone: root incumbent, edited mid-flight, or over the cap */
+  /**
+   * Every other linking note — the two arrays are a full account: no target,
+   * edited mid-flight, new in this same pass, unreadable or unwritable, or
+   * over the cap. All of them fall back to doctor's ambiguous report.
+   */
   skipped: string[];
 };
 
@@ -37,6 +44,13 @@ export type IndexStats = {
   reembedded: boolean;
   /** stem collisions this pass created, and the bare links qualified for them */
   qualified: Qualified[];
+  /**
+   * The post-rewrite re-entry failed after this pass already rewrote linking
+   * notes: their rows lag the files until the next pass (files are truth — a
+   * later reindex or doctor recovers them). Reported rather than thrown,
+   * because a throw here would discard the stats saying which files changed.
+   */
+  indexError?: string;
 };
 
 /**
@@ -213,7 +227,14 @@ export async function indexPaths(
   for (const d of dirty) {
     if (d.id !== undefined) continue;
     const holders = rows.filter((r) => r.slug === d.note.slug && !goneSet.has(r.id));
-    if (holders.length === 1) collisions.set(d.note.slug, holders[0]!.path);
+    if (holders.length !== 1) continue;
+    confinedPath(root, holders[0]!.path); // the index is derived data, not a trusted path source
+    // The incumbent's file must still exist: its row alone is not truth. A move
+    // the watcher sees in two passes (create first, delete later) would
+    // otherwise rewrite every bare link to a path about to be purged.
+    if (noteEntry(root, holders[0]!.path) !== null) {
+      collisions.set(d.note.slug, holders[0]!.path);
+    }
   }
 
   const vectors = dirty.length
@@ -301,13 +322,18 @@ export async function indexPaths(
   // edges briefly read `to_id = null` — the documented window.
   const qualified: Qualified[] = [];
   const rewritten: string[] = [];
-  // A bare link *inside* a colliding newcomer has no settled meaning — it was
-  // written when its own note was the collision — so it is left to doctor.
+  let indexError: string | undefined;
+  // A bare link inside a note new to this same pass has no settled meaning —
+  // nothing records which acme it was written against — so it is left to doctor.
   const newPaths = new Set(dirty.filter((d) => d.id === undefined).map((d) => d.note.path));
   for (const [stem, incumbent] of collisions) {
-    // A root incumbent's path minus `.md` *is* the bare stem: no qualified
-    // form, so its linkers are reported, never rewritten (DESIGN.md § Layout).
-    const target = incumbent.includes("/") ? linkTarget(incumbent) : null;
+    // No qualified form, so linkers are reported, never rewritten: a root
+    // incumbent's path minus `.md` *is* the bare stem (DESIGN.md § Layout), and
+    // a path a wikilink cannot carry would destroy the link it rewrites.
+    const target =
+      incumbent.includes("/") && isWritableTarget(linkTarget(incumbent))
+        ? linkTarget(incumbent)
+        : null;
     const linkers = db
       .query(
         `select n.path, n.hash from edges e join notes n on n.id = e.from_id
@@ -316,43 +342,73 @@ export async function indexPaths(
       .all(stem) as { path: string; hash: string }[];
     const entry: Qualified = { stem, target, rewritten: [], skipped: [] };
     for (const { path, hash } of linkers) {
-      if (newPaths.has(path)) continue;
-      if (target === null || entry.rewritten.length >= qualifyCap) {
+      if (target === null || newPaths.has(path) || entry.rewritten.length >= qualifyCap) {
         entry.skipped.push(path);
         continue;
       }
       const abs = confinedPath(root, path); // the index is derived data, not a trusted path source
-      const raw = await readRaw(root, path);
-      if (raw === null) continue; // indexed but gone: files are truth, the row is stale
-      // Check-and-write: the file must still be what the index read it at — a
-      // human's mid-flight edit is skipped, never clobbered, like supersede's
-      // `unmarked`.
-      if (parseNote(raw, path).hash !== hash) {
+      // One unreadable or unwritable linker is skipped, not fatal: the pass has
+      // already committed (and may have rewritten other files), so its stats
+      // must still come back. `confinedPath` stays outside the net — a path
+      // escaping the vault is a tampered index, not a per-file hiccup.
+      try {
+        const raw = await readRaw(root, path);
+        if (raw === null) {
+          entry.skipped.push(path); // indexed but gone: files are truth, the row is stale
+          continue;
+        }
+        // Check-and-write: the file must still be what the index read it at — a
+        // human's mid-flight edit is skipped, never clobbered, like supersede's
+        // `unmarked`.
+        if (parseNote(raw, path).hash !== hash) {
+          entry.skipped.push(path);
+          continue;
+        }
+        // In-place over the raw text (body region only): every byte this rewrite
+        // does not mean — frontmatter, CRLF, a BOM — survives verbatim.
+        const out = qualifyLinks(raw, stem, target);
+        if (out === raw) {
+          entry.skipped.push(path); // nothing the parser calls a link actually matched
+          continue;
+        }
+        await writeAtomic(abs, out);
+      } catch (e) {
         entry.skipped.push(path);
+        indexError ??= printable(e); // a skip has a cause; say the first one
         continue;
       }
-      // In-place over the raw text (body region only): every byte this rewrite
-      // does not mean — frontmatter, CRLF, a BOM — survives verbatim.
-      const out = qualifyLinks(raw, stem, target);
-      if (out === raw) continue; // nothing the parser calls a link actually matched
-      await writeAtomic(abs, out);
       entry.rewritten.push(path);
       rewritten.push(path);
     }
-    qualified.push(entry);
+    // A collision nothing links bare is a non-event; no entry for it.
+    if (linkers.length > 0) qualified.push(entry);
   }
   // Re-enter on just the rewritten paths so the index never lags a write we
   // made ourselves. Bounded structurally: none of them is new to the index, so
-  // the pass detects no collision and recurses no further.
-  if (rewritten.length > 0) await indexPaths(db, root, embedder, rewritten);
+  // the pass detects no collision and recurses no further. A failure here is
+  // reported, not thrown — the files above have already changed, and the stats
+  // are the only record of which.
+  if (rewritten.length > 0) {
+    try {
+      await indexPaths(db, root, embedder, rewritten);
+    } catch (e) {
+      indexError ??= printable(e);
+    }
+  }
 
+  // The re-entry's pass is part of this one: the notes it rewrote count as
+  // updated too — distinct paths, since a note can be both dirty in this pass
+  // and rewritten by it.
+  const updated = new Set(dirty.filter((d) => d.id !== undefined).map((d) => d.note.path));
+  for (const path of rewritten) updated.add(path);
   return {
     added: dirty.filter((d) => d.id === undefined).length,
-    updated: dirty.filter((d) => d.id !== undefined).length,
+    updated: updated.size,
     removed: gone.length,
     unchanged,
     reembedded,
     qualified,
+    ...(indexError !== undefined && { indexError }),
   };
 }
 

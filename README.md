@@ -131,9 +131,11 @@ was already there, so the pass rewrites them to its path-qualified form
 (`[[acme|alias]]` keeps its alias) and says so. Only that moment can know the
 incumbent — afterwards nothing records which note came first. The rule is
 *never guesses*, not *never ambiguous*: an incumbent at the vault root (no
-qualified form), both notes appearing in one pass (no incumbent), or a linking
-note edited mid-rewrite are left alone and fall through to `doctor`'s
-ambiguous report above.
+qualified form), one whose path a wikilink cannot carry (`[`, `]` or `|` in a
+directory name), one whose file is already gone (a move, not a collision),
+both notes appearing in one pass (no incumbent), or a linking note edited
+mid-rewrite are left alone and fall through to `doctor`'s ambiguous report
+above.
 
 Obsidian hides dot-directories, so `.vault/` stays out of the way; the scan skips
 it (and `.git/`, `.obsidian/`, …) for the same reason. If the vault is a git repo,
@@ -300,12 +302,16 @@ await vault.consolidate({ ceiling: 0.15, cap: 3, write: true, ctx });
   rather than being clobbered. Nothing is ever deleted: the originals stay on
   disk, marked, out of search.
 - On a **write run** a cluster whose merge throws (merger error, no free
-  filename) lands in `errors` with its message and the run continues — merges
+  filename) lands in `errors` with its message — and with the merged note's
+  `path` when it was created before the throw — and the run continues: merges
   that already landed are reported, not discarded behind one exception, and
-  the closing reindex still runs so the index never lags them. A dry run
-  still throws: nothing has landed that a report would need to account for.
-- The **cap** (default 5) counts clusters acted on — merged or errored; the
-  rest come back in `remaining`. A pass that wants to rewrite half the vault
+  the closing reindex still runs so the index never lags them (a reindex
+  failure comes back in `indexError` rather than throwing the report away). A
+  dry run still throws: nothing has landed that a report would need to
+  account for.
+- The **cap** (default 5) counts clusters whose merger ran — merged or errored
+  after the call; an error before it burns no slot — and the rest come back in
+  `remaining`. A pass that wants to rewrite half the vault
   is evidence the ceiling is wrong, and the cap turns that into a short
   report instead of a long mess.
 

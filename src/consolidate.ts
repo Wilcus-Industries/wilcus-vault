@@ -10,6 +10,7 @@ import { resolve } from "node:path";
 import { confinedPath, create, markSuperseded, fence, type VaultContext } from "./gate";
 import { readRaw, reindex } from "./indexer";
 import { parseNote, type Note } from "./note";
+import { printable } from "./term";
 import type { Embedder } from "./embed";
 
 /** The one note a cluster becomes. Shaped like a `Candidate` minus its
@@ -98,11 +99,22 @@ export type ConsolidateReport = {
   /**
    * Clusters whose merge threw mid-pass on a **write** run (merger error, no
    * free filename): collected here so the merges that already landed are still
-   * reported instead of discarded behind one exception. Always empty on a dry
-   * run — there a throw propagates, because nothing has landed that a report
-   * would need to account for.
+   * reported instead of discarded behind one exception. `path` is the merged
+   * note when the throw landed after `create` wrote it — the file exists and is
+   * live in search, and without this the report would never name it. Always
+   * empty on a dry run — there a throw propagates, because nothing has landed
+   * that a report would need to account for. A member path failing confinement
+   * still throws even on a write run: that is a tampered index, not a cluster
+   * error.
    */
-  errors: { cluster: Cluster; error: string }[];
+  errors: { cluster: Cluster; error: string; path?: string }[];
+  /**
+   * The closing reindex failed after ≥1 merge landed: the index lags the files
+   * until the next pass (files are truth — a later reindex or doctor recovers
+   * it). Reported rather than thrown, because a throw here would discard the
+   * report of everything that landed.
+   */
+  indexError?: string;
 };
 
 /** Single digits, per DESIGN.md: a pass that rewrites half the vault is a wrong ceiling. */
@@ -281,22 +293,36 @@ export async function consolidate(
   await reindex(db, base, embedder);
 
   const found = clusters(db, ceiling);
+  // Confinement up front, before anything is written: a member path that
+  // escapes the vault root is a tampered or corrupt index, and that aborts the
+  // run loudly — never after merges have landed, where the throw would discard
+  // their report and skip the closing reindex.
+  for (const cluster of found) {
+    for (const path of cluster.members) {
+      confinedPath(base, path); // the index is derived data, not a trusted path source
+    }
+  }
   const crossNamespace = found.filter((c) => c.namespace === null);
   const merges: Merge[] = [];
   const remaining: Cluster[] = [];
   const errors: ConsolidateReport["errors"] = [];
   let wrote = false;
+  // The cap rations model calls, so it counts clusters whose merger *ran* —
+  // merged or errored after the call. An error before the call (an unreadable
+  // member) spent nothing and burns no slot: otherwise ≥cap broken clusters
+  // would starve every real one, run after run.
+  // ponytail: pre-call errors are unbounded — a chmod'd subtree yields one
+  // entry per cluster per run. Bound them if a thousand-entry report shows up.
+  let acted = 0;
   for (const cluster of found.filter((c) => c.namespace !== null)) {
-    // The cap counts clusters *acted on* — errored ones included, they spent
-    // their model call: the rest are a short report, not a half-finished rewrite.
-    if (merges.length + errors.length >= cap) {
+    if (acted >= cap) {
       remaining.push(cluster);
       continue;
     }
+    let created: string | undefined;
     try {
       const notes: Note[] = [];
       for (const path of cluster.members) {
-        confinedPath(base, path); // the index is derived data, not a trusted path source
         // Re-read from disk, like everything the vault shows a model — and the
         // hash each note is read at is what its marking is checked against.
         const raw = await readRaw(base, path);
@@ -309,30 +335,49 @@ export async function consolidate(
         remaining.push(cluster);
         continue;
       }
+      acted++;
       const candidate = checkMerged(await merger({ notes }));
       if (!write) {
         merges.push({ cluster, candidate });
         continue;
       }
-      const created = await create(db, base, candidate, cluster.namespace!, undefined, ctx);
+      created = (await create(db, base, candidate, cluster.namespace!, undefined, ctx)).path;
       wrote = true; // the file exists from here on, whatever the marking does
       const superseded: string[] = [];
       const unmarked: string[] = [];
       for (const note of notes) {
-        const marked = await markSuperseded(base, note, created.path!);
+        const marked = await markSuperseded(base, note, created!);
         if ("superseded" in marked) superseded.push(marked.superseded);
         else unmarked.push(marked.unmarked);
       }
-      merges.push({ cluster, candidate, path: created.path, superseded, unmarked });
+      merges.push({ cluster, candidate, path: created, superseded, unmarked });
     } catch (e) {
       // On a dry run nothing has landed, so a throw stays a throw. On a write
       // run one bad cluster must not discard the report of the merges that
-      // already landed, nor skip the closing reindex below.
+      // already landed, nor skip the closing reindex below. The merged note's
+      // path travels on the entry when `create` got that far: the file is live
+      // in search after the reindex, and this is the only place that names it.
       if (!write) throw e;
-      errors.push({ cluster, error: e instanceof Error ? e.message : String(e) });
+      errors.push({ cluster, error: printable(e), ...(created !== undefined && { path: created }) });
     }
   }
-  // The index never lags a write we made ourselves.
-  if (wrote) await reindex(db, base, embedder);
-  return { dryRun: !write, merges, crossNamespace, remaining, errors };
+  // The index never lags a write we made ourselves — and when the reindex
+  // itself fails (the embedder is a network call), that must not discard the
+  // report of everything that landed: reported, recovered by the next pass.
+  let indexError: string | undefined;
+  if (wrote) {
+    try {
+      await reindex(db, base, embedder);
+    } catch (e) {
+      indexError = printable(e);
+    }
+  }
+  return {
+    dryRun: !write,
+    merges,
+    crossNamespace,
+    remaining,
+    errors,
+    ...(indexError !== undefined && { indexError }),
+  };
 }
