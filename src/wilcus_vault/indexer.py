@@ -61,10 +61,15 @@ def is_note_path(rel: str) -> bool:
 
 def note_entry(root: str | Path, rel: str) -> os.stat_result | None:
     """The lstat of a path that really holds a note, or None. Only a regular file
-    is a note: a path that is gone, a directory, or a symlink holds none."""
+    is a note: a path that is gone, a directory, or a symlink holds none.
+
+    Any OSError is that same answer — a segment that is a file not a directory,
+    a name too long for the filesystem, a directory we may not read — so a
+    caller asking "is there a note here" never has to catch errno itself.
+    """
     try:
         entry = os.lstat(Path(root) / rel)
-    except FileNotFoundError:
+    except OSError:
         return None
     return entry if stat.S_ISREG(entry.st_mode) else None
 

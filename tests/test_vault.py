@@ -204,3 +204,13 @@ async def test_list_is_the_note_set_superseded_notes_are_listed(
         }
     )
     assert v.list() == ["a.md", "b.md"]
+
+
+async def test_get_a_path_that_cannot_hold_a_note_is_none_never_an_oserror(
+    open_vault: OpenVault,
+) -> None:
+    """Only FileNotFoundError used to mean "no note", so every other way the
+    filesystem says "nothing here" escaped as a raw OSError."""
+    v = await open_vault()
+    assert await v.get("ledger/q4.md/nested.md") is None  # ENOTDIR: a file used as a directory
+    assert await v.get("ledger/" + "x" * 300 + ".md") is None  # ENAMETOOLONG

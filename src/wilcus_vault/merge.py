@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 
 from .decision import fence
 from .note import Note
-from .term import VaultError
+from .term import VaultError, safe
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,7 @@ def parse_merged(text: str) -> MergedNote:
 
 def merge_prompt(input: MergeInput) -> str:
     listed = "\n\n".join(
-        f"[{i + 1}] path: {n.path}\n    title: {n.title}\n"
+        f"[{i + 1}] path: {safe(n.path)}\n    title: {safe(n.title)}\n"
         f"--- begin note ---\n{fence(n.body)}\n--- end note ---"
         for i, n in enumerate(input.notes)
     )

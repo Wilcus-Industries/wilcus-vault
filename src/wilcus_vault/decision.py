@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 from .note import Note
-from .term import VaultError
+from .term import VaultError, safe
 
 Action = Literal["update", "supersede", "create", "discard"]
 ACTIONS: tuple[Action, ...] = ("update", "supersede", "create", "discard")
@@ -106,7 +106,11 @@ def parse_decision(text: str) -> Decision:
 
 def fence(text: str) -> str:
     """Note text is data, not instruction: indent anything that could pass for one
-    of the prompt's delimiters so a note cannot close its own fence."""
+    of the prompt's delimiters so a note cannot close its own fence.
+
+    Titles and paths are not fenced but `safe`d: they occupy one line of the
+    prompt each, so a newline in one would forge a listing entry outright.
+    """
     return re.sub(r"^---[ \t]*(begin|end)", r" \g<0>", text.strip(), flags=re.I | re.M)
 
 
@@ -117,8 +121,8 @@ def gate_prompt(input: DeciderInput) -> str:
         notes = "(none — the vault has nothing similar)"
     else:
         notes = "\n\n".join(
-            f"[{i + 1}] path: {s.note.path}{' (read-only)' if s.read_only else ''}\n"
-            f"    title: {s.note.title}\n"
+            f"[{i + 1}] path: {safe(s.note.path)}{' (read-only)' if s.read_only else ''}\n"
+            f"    title: {safe(s.note.title)}\n"
             f"--- begin note ---\n{fence(s.note.body)}\n--- end note ---"
             for i, s in enumerate(similar)
         )
@@ -132,8 +136,8 @@ def gate_prompt(input: DeciderInput) -> str:
     return f"""You are the write gate of a markdown memory vault. Decide what should happen to one candidate note.
 
 CANDIDATE
-title: {candidate.title}
-type: {candidate.type if candidate.type is not None else "(none)"}
+title: {safe(candidate.title)}
+type: {safe(candidate.type) if candidate.type is not None else "(none)"}
 --- begin candidate ---
 {fence(candidate.body)}
 --- end candidate ---

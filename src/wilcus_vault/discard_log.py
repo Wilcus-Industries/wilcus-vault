@@ -67,12 +67,12 @@ def log_candidate(
     # A fresh log (including one a rotation just started) gets gitignored once.
     # A user who later strips the line has decided; it is not re-added.
     if not path.exists():
-        _ensure_gitignore(root)
+        ensure_gitignore(root)
     line = {"at": now(), "candidate": candidate.to_json(), **extra}
     append_nofollow(path, json.dumps(line) + "\n")
 
 
-def _ensure_gitignore(root: Path) -> None:
+def ensure_gitignore(root: Path) -> None:
     """Add the discard-log pattern to `.gitignore` exactly once, appending only."""
     path = root / ".gitignore"
     current = read_nofollow(path) or ""
