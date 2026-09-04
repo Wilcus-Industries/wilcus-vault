@@ -1,4 +1,4 @@
-# @wilcus/vault
+# wilcus-vault
 
 Files-are-truth markdown memory vault for AI agents: atomic notes, wikilink graph,
 hybrid semantic + keyword search (sqlite-vec + FTS5 + reciprocal rank fusion), and a
@@ -21,17 +21,20 @@ derived and rebuildable, and no code path may treat it as authoritative. So:
 
 ## Install
 
-Bun 1.3+ (this uses `bun:sqlite`, `Bun.YAML` and `Bun.CryptoHasher` — there is no
-Node build). Not published to npm yet:
+Python 3.12+ and [uv](https://docs.astral.sh/uv/). The system SQLite must be
+3.39 or newer (`FULL OUTER JOIN`) and the Python's `sqlite3` must allow
+`enable_load_extension` — most Linux distro builds do; a macOS system Python may
+not, so use a uv-managed or Homebrew one there. Not published to PyPI yet:
 
 ```
 git clone https://github.com/CrazyWillBear/wilcus-vault && cd wilcus-vault
-bun install
-bun run src/cli.ts --help
+uv sync
+uv run vault --help
 ```
 
-For a `vault` on your PATH, `bun link` in the clone. As a library, depend on the
-directory (`bun add file:../wilcus-vault`) and import from `@wilcus/vault`.
+`uv tool install .` puts a `vault` on your PATH. As a library, depend on the
+directory (`uv add ../wilcus-vault`) and `from wilcus_vault import open,
+FetchEmbedder`.
 
 ## CLI
 
@@ -78,7 +81,7 @@ embedder, and it cannot know yours (under `--lexical` no fixed one is meaningful
 at all) — so it shows the ranking and lets you judge it. Library callers pass
 their own (`cutoffs`), and the write gate must.
 
-`vault watch` reindexes once, then follows `fs.watch` (recursive) with a ~250ms
+`vault watch` reindexes once, then follows `watchfiles` (recursive) with a ~250ms
 per-path debounce, re-embedding only notes whose content hash actually changed.
 It logs the passes that changed something and stops on ctrl-c (finishing the
 pass in flight first). It is a convenience, never a source of
@@ -144,46 +147,61 @@ Run `vault watch` alongside your editing session to keep search current.
 
 ## Library
 
-```ts
-import { open, gatePrompt, parseDecision, TokenOverlapEmbedder } from "@wilcus/vault";
+```python
+from wilcus_vault import (
+    Candidate,
+    Cutoffs,
+    GateOptions,
+    SearchOptions,
+    TokenOverlapEmbedder,
+    VaultContext,
+    gate_prompt,
+    open,
+    parse_decision,
+)
 
-const vault = open("/path/to/vault", {
-  embedder: new TokenOverlapEmbedder(),
-  gate: {
-    // your LLM call; `gatePrompt` and `parseDecision` are the wiring, not the model
-    decider: async (input) => parseDecision(await askYourModel(gatePrompt(input))),
-    // mandatory: without cutoffs "most similar" degrades into "least unrelated"
-    cutoffs: { distanceCeiling: 0.35, bm25Ceiling: -1 },
-  },
-  // optional: per-agent namespace rules. Omitted, every caller may do anything.
-  scopes: { "core/scheduler": [{ prefix: "", read: true, write: true }] },
-});
 
-const ctx = { agent: "core/scheduler", source: "task-42" }; // who is calling, per call
+# your LLM call; `gate_prompt` and `parse_decision` are the wiring, not the model
+async def decider(input):
+    return parse_decision(await ask_your_model(gate_prompt(input)))
 
-await vault.reindex();
-await vault.search("acme renewal", { n: 5, cutoffs: { distanceCeiling: 0.35 }, ctx });
-await vault.get("customers/acme.md", ctx);  // one note, parsed — read from the file
-vault.list("customers", ctx);               // note paths under a namespace, sorted
+
+vault = open(
+    "/path/to/vault",
+    TokenOverlapEmbedder(),
+    # mandatory: without cutoffs "most similar" degrades into "least unrelated"
+    gate=GateOptions(decider=decider, cutoffs=Cutoffs(distance_ceiling=0.35, bm25_ceiling=-1)),
+    # optional: per-agent namespace rules. Omitted, every caller may do anything.
+    scopes={"core/scheduler": [{"prefix": "", "read": True, "write": True}]},
+)
+
+ctx = VaultContext(agent="core/scheduler", source="task-42")  # who is calling, per call
+
+await vault.reindex()
+await vault.search(
+    "acme renewal", SearchOptions(n=5, cutoffs=Cutoffs(distance_ceiling=0.35), ctx=ctx)
+)
+await vault.get("customers/acme.md", ctx)  # one note, parsed — read from the file
+vault.list("customers", ctx)  # note paths under a namespace, sorted
 await vault.propose(
-  { title: "Acme renewal 2026", type: "customer", namespace: "customers", body },
-  ctx, // optional — until a scope policy is in force, which needs it to decide
-);
-await vault.doctor();
+    Candidate(title="Acme renewal 2026", type="customer", namespace="customers", body=body),
+    ctx,  # optional — until a scope policy is in force, which needs it to decide
+)
+await vault.doctor()
 
-const watcher = vault.watch();     // keep the index warm while a human edits
-await watcher.close();             // resolves when the pass in flight is done
-vault.close();                     // ...so this cannot close the DB under a write
+watcher = vault.watch()  # keep the index warm while a human edits (needs a running loop)
+await watcher.close()  # completes when the pass in flight is done
+vault.close()  # ...so this cannot close the DB under a write
 ```
 
 ### Reading notes
 
 `get` is a note's identity — its vault-relative path, `.md` and all — turned
 into the parsed note: frontmatter, body, title, wikilinks, hash. It reads the
-**file**, so it is never stale, whatever the index thinks; it returns `null`
+**file**, so it is never stale, whatever the index thinks; it returns `None`
 when nothing is there, and a directory or a symlink at the path counts as
 nothing. A path that leaves the vault, or runs through `.vault/` or a symlinked
-directory, throws — that is a caller bug, not a missing note.
+directory, raises — that is a caller bug, not a missing note.
 
 Spell the path however your code built it — `./customers/acme.md`, a doubled
 slash, an absolute path inside the vault — and `note.path` still comes back as
@@ -194,11 +212,11 @@ sorted, optionally under one namespace — and a namespace means whole segments,
 so `list("ledger")` never sweeps in `ledger-archive/`. Superseded notes are
 listed; `list` is the note set, not the search set.
 
-```ts
-const note = await vault.get("customers/acme.md"); // Note | null
-note?.links;                                       // ["support-rota", ...]
-vault.list();                                      // every note path, sorted
-vault.list("customers/");                          // "customers" works too
+```python
+note = await vault.get("customers/acme.md")  # Note | None
+note.links  # ["support-rota", ...]
+vault.list()  # every note path, sorted
+vault.list("customers/")  # "customers" works too
 ```
 
 Both take an optional trailing `VaultContext`, which decides what they answer
@@ -236,13 +254,13 @@ gate did not author are patched textually, never re-serialized, so comments,
 `01234` and `1.0` survive. Human edits bypass the gate by definition:
 `vault watch` and `vault doctor` pick them up.
 
-```ts
-const result = await vault.propose(candidate, { agent: "core/scheduler" });
-// { action: "supersede", path: "customers/acme-renewal-2026.md",
-//   superseded: "customers/acme.md", fellBack: false }
+```python
+result = await vault.propose(candidate, VaultContext(agent="core/scheduler"))
+# GateResult(action="supersede", path="customers/acme-renewal-2026.md",
+#            superseded="customers/acme.md", unmarked=None, fell_back=False)
 ```
 
-The second argument is a `VaultContext` — `{ agent, source? }`, the caller's
+The second argument is a `VaultContext` — `agent` plus an optional `source`, the caller's
 identity for that one call. Given, the gate stamps `vault_agent` (and
 `vault_source`) into the frontmatter of every note it *authors*: a `create`, and
 a `supersede`'s successor, get them serialized in; an `update` gets them patched
@@ -259,24 +277,26 @@ A vault accretes near-duplicates: the gate only sees the top-k similar notes at
 write time, and humans add notes behind its back. `consolidate` is the
 deliberate, occasional merge pass — manually triggered, never a daemon.
 
-```ts
-const vault = open("/path/to/vault", {
-  embedder,
-  consolidate: {
-    // your LLM call again; `mergePrompt` and `parseMerged` are the wiring
-    merger: async (input) => parseMerged(await askYourModel(mergePrompt(input))),
-  },
-});
+```python
+from wilcus_vault import ConsolidateOptions, ConsolidateRun, merge_prompt, parse_merged
 
-// dry run: what a merge pass *would* do, and it is the default
-const report = await vault.consolidate({ ceiling: 0.15 });
-report.merges[0];       // { cluster: { members, namespace, distance }, candidate }
-report.crossNamespace;  // clusters spanning namespaces — reported, never merged
-report.remaining;       // clusters the cap did not reach
-report.errors;          // write runs: clusters whose merge threw — the run continues
 
-await vault.consolidate({ ceiling: 0.15, cap: 3, write: true, ctx });
-// merges[0] → { ..., path: "customers/acme.md", superseded: [...], unmarked: [] }
+# your LLM call again; `merge_prompt` and `parse_merged` are the wiring
+async def merger(input):
+    return parse_merged(await ask_your_model(merge_prompt(input)))
+
+
+vault = open("/path/to/vault", embedder, consolidate=ConsolidateOptions(merger=merger))
+
+# dry run: what a merge pass *would* do, and it is the default
+report = await vault.consolidate(ConsolidateRun(ceiling=0.15))
+report.merges[0]  # Merge(cluster=Cluster(members, namespace, distance), candidate)
+report.cross_namespace  # clusters spanning namespaces — reported, never merged
+report.remaining  # clusters the cap did not reach
+report.errors  # write runs: clusters whose merge raised — the run continues
+
+await vault.consolidate(ConsolidateRun(ceiling=0.15, cap=3, write=True, ctx=ctx))
+# merges[0] → Merge(..., path="customers/acme.md", superseded=[...], unmarked=[])
 ```
 
 - **The ceiling is mandatory**, like the gate's cutoffs and for the same
@@ -291,7 +311,7 @@ await vault.consolidate({ ceiling: 0.15, cap: 3, write: true, ctx });
   are boundaries, and collapsing one is a human call. Superseded notes never
   cluster, and neither do notes the embedder had no tokens for (a CJK or
   emoji-only note has no vector row — it stays findable through FTS).
-- **Dry-run is the default**; `write: true` is what makes a run act. A wrong
+- **Dry-run is the default**; `write=True` is what makes a run act. A wrong
   ceiling found in a report costs nothing. A dry run still reindexes first (so
   discovery sees the files, not a stale index) and still calls your merger once
   per cluster it would merge, up to the cap.
@@ -301,13 +321,13 @@ await vault.consolidate({ ceiling: 0.15, cap: 3, write: true, ctx });
   member, and a member a human edited mid-flight comes back in `unmarked`
   rather than being clobbered. Nothing is ever deleted: the originals stay on
   disk, marked, out of search.
-- On a **write run** a cluster whose merge throws (merger error, no free
+- On a **write run** a cluster whose merge raises (merger error, no free
   filename) lands in `errors` with its message — and with the merged note's
-  `path` when it was created before the throw — and the run continues: merges
+  `path` when it was created before the raise — and the run continues: merges
   that already landed are reported, not discarded behind one exception, and
   the closing reindex still runs so the index never lags them (a reindex
-  failure comes back in `indexError` rather than throwing the report away). A
-  dry run still throws: nothing has landed that a report would need to
+  failure comes back in `index_error` rather than discarding the report). A
+  dry run still raises: nothing has landed that a report would need to
   account for.
 - The **cap** (default 5) counts clusters whose merger ran — merged or errored
   after the call; an error before it burns no slot — and the rest come back in
@@ -323,27 +343,33 @@ so its `ctx` is provenance for the notes it writes, not a permission check.
 Several agents usually share one vault. `scopes` says who may touch what —
 namespace prefixes, per agent, for `read` and `write` independently:
 
-```ts
-const vault = open("/path/to/vault", {
-  embedder,
-  gate,
-  scopes: {
-    "core/scheduler": [{ prefix: "", read: true, write: true },
-                       { prefix: "ledger/", write: false }], // reads it, cannot rewrite it
-    "core/support":   [{ prefix: "support/", read: true, write: true },
-                       { prefix: "customers/", read: true }], // read-only next door
-  },
-});
+```python
+vault = open(
+    "/path/to/vault",
+    embedder,
+    gate=gate,
+    scopes={
+        "core/scheduler": [
+            {"prefix": "", "read": True, "write": True},
+            {"prefix": "ledger/", "write": False},
+        ],  # reads it, cannot rewrite it
+        "core/support": [
+            {"prefix": "support/", "read": True, "write": True},
+            {"prefix": "customers/", "read": True},
+        ],  # read-only next door
+    },
+)
 
-await vault.search("acme renewal", { ctx: { agent: "core/support" } });
-await vault.get("ledger/q3.md", { agent: "core/support" }); // null: not readable
-vault.list("customers", { agent: "core/support" });         // only what it may read
-await vault.propose(candidate, { agent: "core/support" });
+support = VaultContext(agent="core/support")
+await vault.search("acme renewal", SearchOptions(ctx=support))
+await vault.get("ledger/q3.md", support)  # None: not readable
+vault.list("customers", support)  # only what it may read
+await vault.propose(candidate, support)
 ```
 
 - **No `scopes` means allow-all**, so a single-agent caller changes nothing.
   With one, the vault fails closed: every call needs a `VaultContext`, an agent
-  the policy does not name is refused with a throw rather than an empty result,
+  the policy does not name is refused with a `VaultError` rather than an empty result,
   and `{}` denies everyone.
 - A prefix matches **whole segments** — `ledger/` never matches
   `ledger-archive/`; `""` is the root rule. For each of `read` and `write`
@@ -352,12 +378,12 @@ await vault.propose(candidate, { agent: "core/support" });
   means denied. `open()` refuses a policy that answers one question twice, one
   with a subtree writable but not readable (an agent that cannot see its own
   notes re-creates them on every propose), a rule that is not
-  `{prefix, read?, write?}` with booleans — a JSON `read: "false"` is truthy,
+  `{prefix, read?, write?}` with booleans — a JSON `"read": "false"` is truthy,
   and would grant where it meant to deny — and a prefix that is not a canonical
   path (`./ledger`, `ledger//sub`), which would match nothing and deny nothing.
 - `search` filters unreadable notes out of the over-fetched set before capping,
-  so you get *up to* N readable hits (and `expandLinks` neighbours are filtered
-  too). `get` returns null for an unreadable note, exactly like an absent one.
+  so you get *up to* N readable hits (and `expand_links` neighbours are filtered
+  too). `get` returns None for an unreadable note, exactly like an absent one.
   `propose` checks the candidate's namespace before your decider runs, shows the
   decider only notes the agent may read, marks the ones it may not write
   read-only in the prompt, and falls back to `create` if a decision targets one
@@ -372,7 +398,7 @@ hostile code is the OS, not this policy object.
 
 ### Embedders
 
-An `Embedder` is `{ model, dims, embed(texts) }` and is always injected — the
+An `Embedder` is anything with `model`, `dims` and `async embed(texts)` and is always injected — the
 vault never hardcodes a provider. Two ship:
 
 - `FetchEmbedder` — any OpenAI-compatible `POST /v1/embeddings`. Unconfigured it
@@ -381,21 +407,21 @@ vault never hardcodes a provider. Two ship:
 - `TokenOverlapEmbedder` — deterministic bag-of-tokens, no network. What the test
   suite and `vault --lexical` use: it exercises the plumbing, not semantics.
 
-```ts
-import { open, FetchEmbedder } from "@wilcus/vault";
+```python
+from wilcus_vault import FetchEmbedder, open
 
-// zero config: http://localhost:11434/v1/embeddings, all-minilm, 384 dims.
-// Run `ollama pull all-minilm` first; if nothing is listening the embed fails
-// with "no embedder configured: start Ollama ... or configure a remote
-// provider" — it never quietly falls back to a cloud API.
-const vault = open(root, { embedder: new FetchEmbedder() });
-await vault.doctor(); // first run with a new model: re-embeds everything
+# zero config: http://localhost:11434/v1/embeddings, all-minilm, 384 dims.
+# Run `ollama pull all-minilm` first; if nothing is listening the embed fails
+# with "no embedder configured: start Ollama ... or configure a remote
+# provider" — it never quietly falls back to a cloud API.
+vault = open(root, FetchEmbedder())
+await vault.doctor()  # first run with a new model: re-embeds everything
 ```
 
 A `VAULT_EMBED_API_KEY` sitting in the environment is *not* sent to that default
 endpoint — it belongs to whichever remote provider you configured it for, and
 "whatever is listening on :11434" does not get to collect it. Configure an
-endpoint, or pass `apiKey` (a local gateway may want one), and it travels.
+endpoint, or pass `api_key` (a local gateway may want one), and it travels.
 
 A remote provider is supported, but only as an explicit choice — whole note
 bodies leave the machine on every embed. Each option falls back to its env var
@@ -405,14 +431,15 @@ never persisted, logged, or echoed back in a provider's error message. A remote
 endpoint must also name its `model` and `dims` — the defaults describe the local
 model, not yours, and a wrong one would be filed as if it were right.
 
-```ts
-const vault = open(root, {
-  embedder: new FetchEmbedder({
-    endpoint: "https://api.openai.com/v1/embeddings",
-    model: "text-embedding-3-small",
-    dims: 1536, // apiKey from VAULT_EMBED_API_KEY
-  }),
-});
+```python
+vault = open(
+    root,
+    FetchEmbedder(
+        endpoint="https://api.openai.com/v1/embeddings",
+        model="text-embedding-3-small",
+        dims=1536,  # api_key from VAULT_EMBED_API_KEY; timeout=30.0 seconds by default
+    ),
+)
 ```
 
 `dims` must match what the model returns — it is part of the vec0 table's schema.
@@ -424,5 +451,11 @@ chunking.
 ## Development
 
 ```
-bun run check     # bun test && tsc --noEmit — green before any PR
+uv sync              # once; dev tools included
+./scripts/check.sh   # ruff check, ruff format --check, mypy strict, pytest — green before any PR
 ```
+
+Tests run on `TokenOverlapEmbedder`, so CI needs no Ollama; fixture vaults land
+under `tmp-test/` (gitignored). The CLI's chat decider is `fetch_decider(model=...,
+endpoint=..., api_key=...)`, configured by `VAULT_DECIDE_*`; library callers wire
+their own `async def` — see [The write gate](#the-write-gate).

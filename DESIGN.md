@@ -1,53 +1,89 @@
-# @wilcus/vault — design
+# wilcus-vault — design
 
 Files-are-truth memory vault per the wilcus-agents SPEC (§ @wilcus/vault). Markdown
 notes on disk are the source of truth; SQLite holds only derived, disposable index
 data. Standalone: zero wilcus deps, MIT.
 
-Verified in bootstrap research (test/hybrid-smoke.test.ts): sqlite-vec
-0.1.7-alpha.2 (pinned exact — pre-1.0 alpha native extension; re-evaluate the pin
-when 0.2/1.0 lands or if a KNN correctness bug appears) loads under `bun:sqlite`
-on Linux via `sqliteVec.load(db)`; FTS5 and `FULL OUTER JOIN` are available in
-Bun's bundled SQLite, so hybrid RRF fusion is one SQL statement (the smoke test
-exercises rows unique to each side of the join); `Bun.YAML` parses frontmatter —
-no YAML dependency.
+Verified in bootstrap research (`tests/test_smoke.py`): sqlite-vec
+0.1.7a2 (pinned exact — pre-1.0 alpha native extension; re-evaluate the pin
+when 0.2/1.0 lands or if a KNN correctness bug appears) loads under the stdlib
+`sqlite3` via `enable_load_extension`; FTS5 and `FULL OUTER JOIN` need the
+system SQLite ≥ 3.39, and with them hybrid RRF fusion is one SQL statement (the
+smoke test exercises rows unique to each side of the join). Frontmatter is
+parsed by PyYAML under a SafeLoader that leaves dates and timestamps as strings;
+hashes are `hashlib` sha256; provider HTTP is `urllib` on a worker thread; the
+watcher rides on `watchfiles`.
+
+Python 3.12+, stdlib first. Runtime dependencies are exactly three, each with
+its reason recorded here, and nothing joins them without one:
+
+- `sqlite-vec` — the KNN extension; the stdlib has no vector index.
+- `PyYAML` — frontmatter; the stdlib has no YAML parser.
+- `watchfiles` — recursive filesystem watching with a debounce; `asyncio` has
+  none, and polling the vault is not it.
 
 ## Layout
 
 ```
-src/
-  note.ts    # parse/serialize a note: frontmatter (Bun.YAML), wikilinks, sha256 hash,
-             # textual frontmatter patch for files we did not author
-  db.ts      # open DB (WAL, busy_timeout), load sqlite-vec, schema/migrations,
-             # vectorsStale (read-only) / resetVectors (destructive)
-  term.ts    # scrub control characters out of anything echoed to a terminal
-  embed.ts   # Embedder interface + deterministic test embedder + fetch-based API embedder
-  indexer.ts # scan vault dir, hash-diff, upsert notes/fts/vectors, rewrite edges
-  doctor.ts  # drift report + repair + --rebuild into a temp DB, renamed into place
-  search.ts  # hybrid: vec KNN + FTS5 BM25 → pre-fusion cutoffs → RRF ordering
-  scope.ts   # ScopePolicy: validate/normalize at open(), one prefix resolver for
-             # every enforcement point (and its SQL twin, for the search filters)
-  gate.ts    # write gate: top-k similar → decider → update|supersede|create|discard
-  watch.ts   # fs.watch + debounce + hash dirty-check → reindex changed files
-  vault.ts   # Vault facade (public API), incl. the direct reads: get(path), list(prefix?)
-  cli.ts     # vault doctor|reindex|search|watch — FetchEmbedder by default,
-             # --lexical for the offline (TokenOverlap) one
+src/wilcus_vault/
+  __init__.py       # the public surface; everything a caller imports lives here
+  vault.py          # Vault facade (public API), incl. the direct reads: get(path), list(prefix?)
+  note.py           # parse/serialize a note: frontmatter (PyYAML, dates as strings),
+                    # wikilinks, sha256 hash; parsing never raises
+  frontmatter.py    # textual frontmatter patch / body replace / link qualify for
+                    # files we did not author
+  db.py             # open DB (WAL, busy_timeout), load sqlite-vec, schema,
+                    # vectors_stale (read-only) / reset_vectors (destructive)
+  term.py           # scrub control characters out of anything echoed to a terminal
+  paths.py          # confined_path, slugify, write_atomic: every filename rail
+  embed.py          # Embedder protocol + the deterministic TokenOverlapEmbedder
+  fetch_embedder.py # FetchEmbedder over an OpenAI-compatible /v1/embeddings
+  http.py           # the endpoint/key rules, redaction and POST shared by both providers
+  indexer.py        # scan vault dir, hash-diff, one write path (index_paths)
+  index_rows.py     # every index row a note owns: write, purge, resolve edges
+  qualify.py        # auto-qualify bare wikilinks when a pass creates a stem collision
+  doctor.py         # drift report + repair + --rebuild into a temp DB, renamed into place
+  search.py         # hybrid: query vector + FTS terms → pre-fusion cutoffs → RRF ordering
+  search_sql.py     # the fused-ranking and link-expansion statements, SearchHit, Cutoffs
+  scope.py          # ScopePolicy: validate/normalize at open(), one prefix resolver for
+                    # every enforcement point (and its SQL twin, for the search filters)
+  decision.py       # the decider contract: Candidate, Decision, gate_prompt, parse_decision
+  decide.py         # fetch_decider: an OpenAI-compatible chat decider for the CLI
+  gate.py           # write gate: top-k similar → decider → update|supersede|create|discard
+  gate_write.py     # the notes the gate authors: create (free path) and mark_superseded
+  discard_log.py    # the discard log's write side: JSONL beside the notes, rotated
+  discards.py       # its read side: list / get / restore, and doctor's count
+  cluster.py        # complete-linkage clusters under a distance ceiling
+  merge.py          # the merger contract: MergedNote, merge_prompt, parse_merged
+  consolidate.py    # the consolidation pass over those clusters, dry-run by default
+  watch.py          # watchfiles + per-path debounce + hash dirty-check → index_paths
+  cli.py            # vault reindex|doctor|search|watch|consolidate|discards — arg parsing
+  cli_commands.py   # the subcommands that need more than a line
+  cli_usage.py      # help text and report formatting
+tests/
+  conftest.py       # make_vault / write_note / vec_of, VAULT_* env cleared per test
+  fakes.py          # stub embedder, recording transport, fixed decider
+  test_lines.py     # every source module under 200 lines, or listed with a reason
+  test_smoke.py     # the bootstrap research above, kept runnable
+  test_*.py         # one file (or a few) per module
+scripts/check.sh    # the done-check: ruff check, ruff format --check, mypy strict, pytest
+pyproject.toml      # uv project; runtime deps pinned as above
 ```
 
-`indexer.ts` has one write path, `indexPaths(paths)`: hash-diff those paths,
+`indexer.py` has one write path, `index_paths(paths)`: hash-diff those paths,
 write what changed, purge the rows whose file is gone. `reindex` passes every
 path the files *or* the index know about (so a row with no file is a deletion);
 the watcher passes the handful that just changed. A watched vault and a rebuilt
 one cannot drift apart, because only one function ever writes an index row.
 
-What is at a path is decided by an `lstat`, before it is read (`noteEntry`, one
+What is at a path is decided by an `lstat`, before it is read (`note_entry`, one
 function so the indexer and `get` cannot drift): **only a regular file is a
 note**, and a path that is gone, is a directory, or has become a symlink counts
 as a deletion. The scan applies the same rule (it skips both), so
 a path that survives only the read would be a row the scan never lists again —
 `doctor` would report it missing forever while a repair happily re-read it,
 indexing a symlink's target from *outside* the vault. A directory would be worse
-than wrong: `EISDIR` out of `reindex` and `doctor` alike, with no way left to
+than wrong: `IsADirectoryError` out of `reindex` and `doctor` alike, with no way left to
 repair the vault.
 
 ## Data model
@@ -80,12 +116,12 @@ repair the vault.
   the index already knew about (a rename is not a collision: the old row is
   gone in the same pass) — every bare `[[stem]]` link in the vault still
   unambiguously means that incumbent, and only this moment can know it: once
-  both are indexed, nothing records which was first. `indexPaths` rewrites
+  both are indexed, nothing records which was first. `index_paths` rewrites
   those links to the incumbent's path-qualified form, mechanically, no LLM —
   detection happens before the write transaction, no file I/O happens inside
   it (a rollback cannot unwrite a file), and the rewrites land after commit as
-  textual body edits (`qualifyLinks`) under the gate's check-and-write rails,
-  capped (default 500 per collision), then re-entered through `indexPaths`
+  textual body edits (`qualify_links`) under the gate's check-and-write rails,
+  capped (default 500 per collision), then re-entered through `index_paths`
   (bounded: the rewritten notes are not new, so no further detection). Between
   the commit and that re-entry those edges briefly read `to_id = null` — an
   accepted window. The outcome rides on `IndexStats.qualified`; the CLI prints
@@ -99,17 +135,17 @@ repair the vault.
   mid-flight (hash mismatch, never clobbered), a linker unreadable or
   unwritable, and the cap's remainder are all reported and left to `doctor`'s
   ambiguous report — `rewritten` + `skipped` account for every linker. A
-  failure in the post-rewrite re-entry rides on `IndexStats.indexError`
-  instead of throwing (the files have already changed; the next pass recovers
+  failure in the post-rewrite re-entry rides on `IndexStats.index_error`
+  instead of raising (the files have already changed; the next pass recovers
   the rows). `doctor --rebuild` and any cold first index see every note as
   new, so they are structurally no-ops here.
 - Frontmatter: `type`, `created`, `updated`, optional `superseded_by`
   (**vault-relative path** of the superseding note), plus free keys. Written by
-  us, editable by humans. `parseNote` never throws: a file whose frontmatter is
+  us, editable by humans. `parse_note` never raises: a file whose frontmatter is
   unterminated, non-mapping, invalid YAML, or over the alias-expansion node
   budget (YAML aliases re-expand — a 250-byte billion-laughs note would
   otherwise become a megabytes-wide index row) still indexes with the whole file
-  as its body and a `malformedFrontmatter` flag for `doctor` to report; so does
+  as its body and a `malformed_frontmatter` flag for `doctor` to report; so does
   a non-string `title`/`type`, whose value is ignored. Title = frontmatter
   `title` ?? first `# ` heading ?? filename stem.
 - Wikilinks (`[[target]]`, `[[target|alias]]` — target only, deduped) and the fallback
@@ -149,7 +185,7 @@ nothing survives the cutoffs, the result is empty — callers (the write gate
 especially) must treat that as "no similar notes exist", not an error.
 One-hop wikilink expansion is an opt-in second pass, never an LLM graph walk:
 neighbours (either direction) of the survivors are appended below every direct
-hit, capped at N of their own, so `expandLinks` returns at most 2N.
+hit, capped at N of their own, so `expand_links` returns at most 2N.
 
 The user's query never reaches FTS5 as syntax: each whitespace-separated run
 becomes one quoted phrase (embedded quotes doubled), so `NEAR(`, `OR`, `*` and
@@ -171,7 +207,7 @@ caller that already knows which note it wants (wilcus-core#42: one note parser
 in the ecosystem, this one):
 
 - **`get(path)`** takes a note's identity — the vault-relative path *including*
-  `.md`; `ledger/q3` names nothing — and returns the parsed note or null. It
+  `.md`; `ledger/q3` names nothing — and returns the parsed note or None. It
   reads the **file**, never the index row, so a stale, missing or half-written
   row cannot change the answer; that is what makes it safe for another package
   to delete its own parser. The argument is canonicalized first, into the same
@@ -179,11 +215,11 @@ in the ecosystem, this one):
   `ledger//q3.md`, a Windows-joined `ledger\q3.md` and an absolute path inside
   the vault are all the one note, and the `path` handed back is the identity a
   caller may store — it cannot vary with how the caller spelled it. Only a regular file is a note, so a directory or a
-  symlink at the path is null exactly like an absent one. The path's *parent* is
-  put through the same `confinedPath` rail the write gate uses, so an escape, a
-  dot-directory or a symlinked directory on the way down **throws** — a caller
+  symlink at the path is None exactly like an absent one. The path's *parent* is
+  put through the same `confined_path` rail the write gate uses, so an escape, a
+  dot-directory or a symlinked directory on the way down **raises** — a caller
   that built such a path has a bug, and silence would hide it. The leaf needs no
-  confinement of its own: a symlink there is already null, and a path cannot
+  confinement of its own: a symlink there is already None, and a path cannot
   escape the root through its last segment alone.
 - **`list(prefix?)`** returns vault-relative paths from the index rows, sorted.
   Derived data is legitimate here — paths are precisely what the scan rebuilds,
@@ -194,7 +230,7 @@ in the ecosystem, this one):
   notes are listed and no cutoff applies.
 
 Both take a `VaultContext` as an optional trailing parameter, and under a
-`ScopePolicy` it decides what they answer: `get` returns null for a note the
+`ScopePolicy` it decides what they answer: `get` returns None for a note the
 agent may not read (exactly like an absent one) and `list` is filtered to the
 readable set. With no policy in force the parameter is inert — there is nothing
 to enforce — but it is refused rather than ignored when one is (§ Scopes and
@@ -202,8 +238,8 @@ context).
 
 ## Embedding
 
-`Embedder = { model: string; dims: number; embed(texts: string[]): Promise<Float32Array[]> }`
-— injected. Vectors are L2-normalized on insert and on query (so cosine distance
+`Embedder` is a protocol — `model: str`, `dims: int`, `async embed(texts:
+list[str]) -> list[list[float]]` — injected. Vectors are L2-normalized on insert and on query (so cosine distance
 is well-defined regardless of provider). Ships: `TokenOverlapEmbedder`
 (deterministic bag-of-tokens, for tests/evals — exercises the plumbing, not
 semantics) and `FetchEmbedder` (OpenAI-compatible `/v1/embeddings`; endpoint,
@@ -227,14 +263,14 @@ whatever holds `:11434`":
 - **Keys are not adopted by it.** A `VAULT_EMBED_API_KEY` in the environment was
   put there for someone's remote provider; the defaulted endpoint never sends
   it, so a local process cannot harvest a cloud key. Configure an endpoint (or
-  pass `apiKey` — a local gateway may want one) and the key travels.
+  pass `api_key` — a local gateway may want one) and the key travels.
 - **No key is required to reach localhost**; any other endpoint refuses to
   construct without one. A configured endpoint is validated as an http(s) URL
   with a host, and the error names the setting that holds the bad value.
 - **"Start Ollama" is only said about that endpoint.** When nothing answers
   there the first request fails with "no embedder configured: start Ollama
   (`ollama pull all-minilm`) or configure a remote provider", the original
-  failure attached as its `cause` — one attempt, no retry, and no fallback to a
+  failure attached as its `__cause__` — one attempt, no retry, and no fallback to a
   remote provider, which would ship note bodies off the machine to fix a daemon
   that is merely not running. An endpoint the caller chose (a vLLM on `:8000`)
   surfaces its own error instead, and a timeout means something *is* listening
@@ -245,13 +281,13 @@ The CLI is a caller like any other: every command builds that same defaulted
 with no daemon (and for the suite, so CI needs no Ollama). Either way a bad
 configuration or an unreachable endpoint reaches the user as the one sentence it
 was written as, and exit 1 — never a stack, and never raw: an error now quotes a
-provider's response body, so it goes through `term.ts` like every other
+provider's response body, so it goes through `term.py` like every other
 untrusted string the vault prints (`safe`/`printable` — control characters
 become `?`, so nothing can redraw the terminal's last line).
 
 **A model swap does not destroy anything until its replacements exist.**
-Staleness is *detected* read-only (`vectorsStale`) before `embed` is called, and
-the drop-and-recreate (`resetVectors`) runs inside the write transaction that
+Staleness is *detected* read-only (`vectors_stale`) before `embed` is called, and
+the drop-and-recreate (`reset_vectors`) runs inside the write transaction that
 files the new vectors. Embedding is a network call that fails for ordinary
 reasons — the daemon is not running, `--lexical` and the default were swapped —
 and the old order left the vault with an empty `vectors` table, an empty
@@ -287,12 +323,12 @@ confinement, and one this agent may not write:
    gate **must** pass `cutoffs`: without them the search always returns
    *something*, and "most similar note" becomes "least unrelated note" — the
    gate would update or supersede a stranger instead of creating a new note.
-   `{}` is refused at runtime, not just discouraged — at least one ceiling must
-   be set, or the mandate is only a type. Note bodies reaching the prompt are
+   `Cutoffs()` is refused at runtime, not just discouraged — at least one ceiling
+   must be set, or the mandate is only a type. Note bodies reaching the prompt are
    data, not instruction: any line that could pass for one of the prompt's
    delimiters is indented so a note cannot close its own fence;
-2. `decider({candidate, similar})` → `{action: update|supersede|create|discard, target?}`
-   — decider is an injected async fn (the caller wires an LLM; tests use fakes).
+2. `decider(DeciderInput(candidate, similar))` → `Decision(action=update|supersede|create|discard, target=...)`
+   — decider is an injected `async def` (the caller wires an LLM; tests use fakes).
    A prompt template + strict response parser ship here;
 3. apply, with two safety rails:
    - **Check-and-write:** before touching a target file, re-hash it; if it
@@ -317,14 +353,14 @@ confinement, and one this agent may not write:
      `superseded_by`) are **textual patches of the frontmatter block** — append
      a line, or replace every occurrence of a key's line, so YAML last-wins
      cannot resurrect the old value — leaving every other line byte-identical.
-     `serializeNote` is only for notes the gate authors from scratch. "Has a
-     usable block" is one predicate shared with `parseNote`: a fenced block
+     `serialize_note` is only for notes the gate authors from scratch. "Has a
+     usable block" is one predicate shared with `parse_note`: a fenced block
      whose YAML the parser cannot read is *not* a block, and gets a fresh one
      prepended, or a `superseded_by` patched into it would be a line nothing
      ever reads.
    - `create` writes a new file; `update` rewrites the target body, bumps
      `updated` and sets *or clears* the provenance keys to match the call
-     (textual patches, per the rule above — the patcher takes a `null` value as
+     (textual patches, per the rule above — the patcher takes a `None` value as
      an unset for exactly this); `supersede`
      writes the new note, adds `superseded_by` (vault-relative path) to the old
      note's frontmatter plus a **path-qualified** forward wikilink
@@ -346,12 +382,12 @@ confinement, and one this agent may not write:
      Bounded but never deleted (#33): at 5 MiB it rotates to `.discarded.N.log`,
      and the first write to a fresh log adds `.discarded.log*` to the vault's
      `.gitignore` — once; a line the user removed stays removed — so refused
-     note bodies never ride into git history. The read side is `discards.ts`
+     note bodies never ride into git history. The read side is `discards.py`
      (`vault discards list | show <n> | restore <n>`, and a count in `doctor`'s
      report): `restore` feeds the candidate back through `propose`, so
      re-admission re-runs search+decide against *current* vault state — the
-     gate stays the only write door. The CLI's `restore` wires `fetchDecider`
-     (`decide.ts`), FetchEmbedder's chat twin: OpenAI-compatible, configured by
+     gate stays the only write door. The CLI's `restore` wires `fetch_decider`
+     (`decide.py`), FetchEmbedder's chat twin: OpenAI-compatible, configured by
      `VAULT_DECIDE_*`, endpoint defaulting to the local Ollama, model always
      explicit — the one CLI command that runs a model, because restoring
      without re-deciding would bypass the gate.
@@ -368,7 +404,7 @@ unique any more, but the gate keeps *its* notes' stems unique anyway, because
 adding a second `acme.md` is exactly what turns a human's existing `[[acme]]`
 ambiguous. A title that slugifies to nothing (CJK, Cyrillic, emoji)
 is named `note-<8 hex of the candidate's hash>`; a candidate the gate cannot
-place at all is appended to `<root>/.discarded.log` before it throws. Losing the
+place at all is appended to `<root>/.discarded.log` before it raises. Losing the
 note is never one of the outcomes.
 
 Human edits bypass the gate by definition (files are truth); the watcher +
@@ -384,8 +420,11 @@ values that vary per call (wilcus-core#43 learned this the hard way).
 
 **`VaultContext`** — per-call identity:
 
-```ts
-type VaultContext = { agent: string; source?: string };
+```python
+@dataclass(frozen=True)
+class VaultContext:
+    agent: str
+    source: str | None = None
 ```
 
 `agent` names the caller (`core/scheduler`); `source` optionally records what
@@ -412,24 +451,29 @@ it. An `agent` that is empty or whitespace is refused outright. Marking the
 bookkeeping, not authorship, and the superseding agent is already on the
 successor. Provenance lives in the file, like every other truth here.
 
-**`ScopePolicy`** — optional in `VaultOptions` (`scopes?`); **absent means
+**`ScopePolicy`** — the optional `scopes=` of `open()`; **absent means
 allow-all**, so existing single-agent callers change nothing. Present, it is
 an allowlist, and it fails closed: an agent with no entry is refused with a
-throw, not a silently empty result — silence is how an orchestrator typo
+`VaultError`, not a silently empty result — silence is how an orchestrator typo
 makes an agent re-create the memory it thinks it lost — and a call without a
-`VaultContext` throws for the same reason. An empty policy `{}` therefore
-denies everyone: `{}` and `undefined` sit on opposite sides of the
+`VaultContext` raises for the same reason. An empty policy `{}` therefore
+denies everyone: `{}` and `None` sit on opposite sides of the
 fail-open/fail-closed line, deliberately.
 
-```ts
-type ScopeRule = { prefix: string; read?: boolean; write?: boolean };
-type ScopePolicy = Record<string, ScopeRule[]>; // agent name → rules
+```python
+class ScopeRule(TypedDict):  # plain dicts: {"prefix": "ledger/", "write": False}
+    prefix: str
+    read: NotRequired[bool]
+    write: NotRequired[bool]
+
+
+ScopePolicy = Mapping[str, list[ScopeRule]]  # agent name → rules
 ```
 
 A `prefix` names a namespace subtree and matches on **segment boundaries
 only**: every non-empty prefix is normalized to a trailing `/` at `open()`,
 and `ledger/` matches `ledger/q3.md` but not `ledger-archive/q3.md` — raw
-`startsWith` would grant across sibling namespaces, which is precisely what
+`startswith` would grant across sibling namespaces, which is precisely what
 an allowlist exists to stop. `""` is the root rule: it matches every note,
 and a root-level note (no `/` in its path) matches only it. Resolution is
 **per permission, longest prefix wins**: for each of `read` and `write`
@@ -447,18 +491,18 @@ lands as `create`: a duplicate factory, not a scope.
 `open()` also refuses what a policy's *type* cannot: it is operator
 configuration, so it arrives from a file, an orchestrator, another process's
 JSON, and a `read: "false"` there is **truthy** — a rule meant as a denial
-would grant. Every rule is checked to be `{prefix: string, read?: boolean,
-write?: boolean}`, and a prefix that is not the canonical form of a path
+would grant. Every rule is checked to be `{prefix: str, read?: bool,
+write?: bool}`, and a prefix that is not the canonical form of a path
 (`./ledger`, `ledger//sub`, `ledger/../x`) is refused rather than normalized:
 stored paths are canonical, so such a prefix matches nothing, and a deny rule
 that matches nothing is a deny that never fires.
 
-Resolution itself lives in `scope.ts` — validated and normalized once at
+Resolution itself lives in `scope.py` — validated and normalized once at
 `open()`, then one `may(permission, path)` every enforcement point calls, plus
 the same rules compiled to a SQL `case` for the two filters that have to run
 inside the query. Two spellings of one rule, held to the same answers by the
-suite; the alternative was the prefix rule reimplemented in `vault.ts`,
-`search.ts` and `gate.ts`.
+suite; the alternative was the prefix rule reimplemented in `vault.py`,
+`search.py` and `gate.py`.
 
 Enforcement points, all inside the library so no caller re-implements them:
 
@@ -467,10 +511,10 @@ Enforcement points, all inside the library so no caller re-implements them:
   to** N readable hits. Up to: the over-fetch is a fixed 3×N, so an agent
   scoped to a thin slice of the vault can exhaust it and see fewer — accepted,
   and the over-fetch factor is where the fix goes if it bites. The one-hop
-  `expandLinks` pass is its own enforcement point: neighbour rows pass the
+  `expand_links` pass is its own enforcement point: neighbour rows pass the
   same read filter before they are appended, or a scoped agent would read
   forbidden titles one wikilink away;
-- `get` / `list` — the read check. An unreadable `get` returns null, exactly
+- `get` / `list` — the read check. An unreadable `get` returns None, exactly
   like an absent note: a scope is not an existence oracle. (`create`'s slug
   collision suffixing can still betray that *something* holds a stem —
   accepted: it leaks a stem's existence, never content.)
@@ -483,7 +527,7 @@ Enforcement points, all inside the library so no caller re-implements them:
   bypass, not a cosmetic difference. Only notes the agent may read feed the
   decider as `similar`: an agent must not have another agent's note bodies
   quoted back to it by the prompt. The SQL filter decides that, and the gate
-  re-checks each hit in JS before reading its body off disk — that is where
+  re-checks each hit in Python before reading its body off disk — that is where
   note bodies leave the vault for a prompt, so it does not rest on one
   filter. A note readable but not writable is marked read-only in that
   prompt — a hint to the model, never the enforcement, since a title is
@@ -548,11 +592,11 @@ the `VaultContext` the operator hands it.
   cluster's failure (merger error, no free filename) must not discard the
   report of what landed: on a write run, per-cluster errors are collected into
   the report's `errors` field (scrubbed via `printable`; when the merged note
-  was created before the throw, the entry carries its `path` — the file is
+  was created before the raise, the entry carries its `path` — the file is
   live in search and nothing else names it) and the run continues, and the
   closing reindex runs regardless so the index never lags the landed writes —
-  and when the reindex itself fails, that rides on the report's `indexError`
-  instead of discarding it. A dry run still throws — nothing has landed that a
+  and when the reindex itself fails, that rides on the report's `index_error`
+  instead of discarding it. A dry run still raises — nothing has landed that a
   report would need to account for. One failure stays loud even on a write
   run: a member path failing confinement is a tampered index, not a cluster
   error, and aborts the run.
@@ -586,35 +630,39 @@ touches `.vault/`, and the report says so. It runs only on a **repairing** run
 (the default, or `--rebuild`); `repair: false` is a report, and a report does
 not move files.
 
-`vault watch` — `fs.watch` (recursive) on the root, acting only on `.md` paths
+`vault watch` — `watchfiles` (recursive) on the root, acting only on `.md` paths
 outside dot-directories, so the index's own writes under `.vault/` cannot feed
 the watcher its own tail. Debounce is **per path** (~250ms): an editor writing
 one file continuously delays that file, never every other change queued behind
 it; paths that come due together are indexed in one pass, and a pass in flight
 makes later ones queue rather than run concurrently against the same database.
-Each pass is `indexPaths`, so the hash check — not the event — decides whether a
+Each pass is `index_paths`, so the hash check — not the event — decides whether a
 note is reindexed and re-embedded, and a delete is just a path whose file is
 gone. The CLI reindexes once before watching, so edits made while nothing was
 watching are not missed.
 
 Three failure modes, all of which land in the same place. A transient error (a
-provider blip, a locked database, an `fs.watch` error event) is logged and the
-watcher keeps going — it never throws at the caller mid-run, and never takes the
-process down, including when the caller's own `onError` throws. A directory
+provider blip, a locked database, a `watchfiles` error) is logged and the
+watcher keeps going — it never raises at the caller mid-run, and never takes the
+process down, including when the caller's own `on_error` raises. A directory
 rename reports only the directory, so notes moved inside it are missed. A
 `close()` drops paths still inside their debounce window and anything queued
 behind the pass in flight. None of these is data loss: the files are the truth,
 and `doctor` rebuilds every row from them.
 
-`close()` returns the pass in flight, because that pass still holds the database
-handle: `await watcher.close()` before closing the database is what keeps a
+`close()` is synchronous and returns an awaitable for the pass in flight,
+because that pass still holds the database handle: `await watcher.close()` before closing the database is what keeps a
 shutdown from racing a write. Queued paths are dropped rather than drained —
 nobody is waiting for them, and doctor knows where they are.
 
 ## Testing / evals
 
-`bun test` runs everything; done-check: `bun run check` (= `bun test && tsc
---noEmit`). CI (`.github/workflows/check.yml`) runs the check on every PR and
+`uv run pytest` runs everything; done-check: `./scripts/check.sh` (= `ruff
+check`, `ruff format --check`, `mypy` strict over `src` and `tests`, `pytest`).
+Fixture vaults live under `tmp-test/` in the repo (pytest's basetemp), and every
+test starts with the `VAULT_*` environment cleared, so a developer's own key or
+endpoint can never decide one. `tests/test_lines.py` holds every source module
+under 200 lines unless it is listed there with a reason. CI (`.github/workflows/check.yml`) runs the check on every PR and
 push to main; the agent workflow also runs it before merge. Deterministic-first evals (spec §8): retrieval
 (exact identifier hits via FTS, overlap paraphrase via vector path, fusion beats
 either alone on a seeded vault), write-gate behaviors per action incl. the
@@ -625,9 +673,9 @@ LLM-judge evals only where a rubric is unavoidable — none needed for MVP.
 
 Real filesystem events are timed by the OS, so the watcher is tested at two
 levels: its event core driven directly (`watcher.touch(path)` is the same entry
-point `fs.watch` calls, and `idle()` resolves when the queue has drained), plus
+point `watchfiles` calls, and `idle()` resolves when the queue has drained), plus
 one end-to-end pass that edits, creates and deletes real files under a real
-`fs.watch` and waits for the index rows to catch up.
+`watchfiles` and waits for the index rows to catch up.
 
 ## Build slices (issues)
 
