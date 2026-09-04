@@ -6,12 +6,7 @@ from .consolidate import (
     ConsolidateReport,
     ConsolidateRun,
     Merge,
-    MergedNote,
     MergeError,
-    MergeInput,
-    Merger,
-    merge_prompt,
-    parse_merged,
 )
 from .decide import fetch_decider
 from .decision import (
@@ -35,13 +30,16 @@ from .discards import (
 from .doctor import AmbiguousLink, DoctorOptions, DoctorReport, LinkProblem
 from .embed import Embedder, TokenOverlapEmbedder, Vector
 from .fetch_embedder import FetchEmbedder
-from .gate import GateOptions, GateResult
+from .gate import GateOptions
+from .gate_write import GateResult
 from .indexer import IndexStats
+from .merge import MergedNote, MergeInput, Merger, merge_prompt, parse_merged
 from .note import Note
 from .paths import slugify
 from .qualify import Qualified
 from .scope import Permission, ScopePolicy, ScopeRule, VaultContext
-from .search import Cutoffs, SearchHit, SearchOptions
+from .search import SearchOptions
+from .search_sql import Cutoffs, SearchHit
 from .term import VaultError
 from .vault import Vault, open
 from .watch import Watcher, WatchOptions

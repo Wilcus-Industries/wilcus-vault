@@ -12,8 +12,9 @@ from .decision import Candidate
 from .doctor import DoctorOptions, DoctorReport
 from .doctor import doctor as run_doctor
 from .embed import Embedder
-from .gate import GateOptions, GateResult
+from .gate import GateOptions
 from .gate import propose as run_gate
+from .gate_write import GateResult
 from .indexer import IndexStats, is_note_path, note_entry, read_note
 from .indexer import reindex as reindex_vault
 from .note import Note
@@ -26,7 +27,8 @@ from .scope import (
     normalize_prefix,
     scope_for,
 )
-from .search import SearchHit, SearchOptions, hybrid_search
+from .search import SearchOptions, hybrid_search
+from .search_sql import SearchHit
 from .term import VaultError
 from .watch import Watcher, WatchOptions
 from .watch import watch as watch_vault

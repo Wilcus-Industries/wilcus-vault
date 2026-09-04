@@ -14,7 +14,7 @@ from typing import Any, Protocol
 
 from .decision import Candidate, Decision
 from .discard_log import ROTATED, discard_log, read_nofollow
-from .gate import GateResult
+from .gate_write import GateResult
 from .scope import VaultContext
 from .term import VaultError
 
