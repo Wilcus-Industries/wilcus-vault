@@ -51,6 +51,8 @@ CompiledPolicy = dict[str, list[Rule]]  # longest prefix first
 def normalize_prefix(prefix: str | None) -> str:
     """`ledger`, `/ledger/` and `ledger/` all name `ledger/`; `""`, `/` and None name the root."""
     ns = (prefix or "").strip("/")
+    if ns == ".":  # what a relative path to the root itself looks like
+        ns = ""
     return f"{ns}/" if ns else ""
 
 

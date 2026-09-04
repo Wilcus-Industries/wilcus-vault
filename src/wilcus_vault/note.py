@@ -5,6 +5,7 @@ file as its body and `malformed_frontmatter` set for doctor to report.
 """
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -21,13 +22,38 @@ _NODE_BUDGET = 4096
 
 
 class _Loader(yaml.SafeLoader):
-    """SafeLoader that leaves dates and timestamps as strings."""
+    """SafeLoader with the YAML 1.2 core schema for plain scalars.
+
+    PyYAML speaks YAML 1.1, where `yes`, `on`, `12:30:00` and `2026-01-02` are
+    not strings and `01234` is octal. Obsidian and the previous parser read 1.2,
+    so only true/false, decimal/0o/0x integers, floats and null resolve.
+    """
 
 
+_CORE_SCHEMA = {
+    "tag:yaml.org,2002:bool": (r"^(?:true|True|TRUE|false|False|FALSE)$", "tTfF"),
+    "tag:yaml.org,2002:int": (r"^(?:[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+)$", "-+0123456789"),
+    "tag:yaml.org,2002:float": (
+        r"^(?:[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
+        r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$",
+        "-+.0123456789",
+    ),
+}
 _Loader.yaml_implicit_resolvers = {
-    key: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:timestamp"]
+    key: [(tag, rx) for tag, rx in resolvers if tag.endswith((":null", ":merge"))]
     for key, resolvers in _Loader.yaml_implicit_resolvers.items()
 }
+for _tag, (_pattern, _first) in _CORE_SCHEMA.items():
+    _Loader.add_implicit_resolver(_tag, re.compile(_pattern), list(_first))
+
+
+def _construct_int(loader: yaml.SafeLoader, node: yaml.Node) -> int:
+    text = loader.construct_scalar(node)  # type: ignore[arg-type]
+    base = 16 if text[:2] == "0x" else 8 if text[:2] == "0o" else 10
+    return int(text, base)
+
+
+_Loader.add_constructor("tag:yaml.org,2002:int", _construct_int)
 
 
 @dataclass(frozen=True)
@@ -96,6 +122,12 @@ def usable_frontmatter(text: str) -> dict[str, Any] | None:
         return None
     if not isinstance(parsed, dict) or not within_node_budget(parsed):
         return None
+    # An explicit `!!binary`, `!!set` or `!!timestamp` builds a value the index
+    # cannot store as JSON: the block is malformed, never a crash in reindex.
+    try:
+        json.dumps(parsed)
+    except (TypeError, ValueError):
+        return None
     return parsed
 
 
@@ -160,5 +192,6 @@ def serialize_note(frontmatter: dict[str, Any], body: str) -> str:
     round-trip drops comments and rewrites `01234` and `1.0`."""
     if not frontmatter:
         return body
-    dumped = yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True)
+    # One line per key, however long the value: the textual patcher edits by line.
+    dumped = yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True, width=2**31)
     return f"---\n{dumped.rstrip('\n')}\n---\n{body}"

@@ -53,10 +53,17 @@ class Decision:
 Decider = Callable[[DeciderInput], Awaitable[Decision]]
 
 
+_ABSENT = object()
+
+
 def check_decision(value: object) -> Decision:
     """Validate a decider's answer. Malformed output raises: the gate never
     guesses what a model meant, because a wrong guess writes to the wrong file."""
-    raw = asdict(value) if isinstance(value, Decision) else value
+    raw = (
+        {k: v for k, v in asdict(value).items() if v is not None}
+        if isinstance(value, Decision)
+        else value
+    )
 
     def bad(why: str) -> VaultError:
         return VaultError(
@@ -65,22 +72,27 @@ def check_decision(value: object) -> Decision:
 
     if not isinstance(raw, dict):
         raise bad("a non-object")
-    action, target, body = raw.get("action"), raw.get("target"), raw.get("body")
+    # A key that is present, even as null, is an answer; only an absent key is not.
+    action, target, body = raw.get("action"), raw.get("target", _ABSENT), raw.get("body", _ABSENT)
     if action not in ACTIONS:
         raise bad("an unknown action")
-    if target is not None and not isinstance(target, str):
+    if target is not _ABSENT and not isinstance(target, str):
         raise bad("a non-string target")
-    if body is not None and not isinstance(body, str):
+    if body is not _ABSENT and not isinstance(body, str):
         raise bad("a non-string body")
-    if body is not None and body.strip() == "":
+    if isinstance(body, str) and body.strip() == "":
         raise bad("an empty body")  # a model that lost the text, not an instruction to blank a note
     needs_target = action in ("update", "supersede")
-    if needs_target and not target:
+    if needs_target and not (isinstance(target, str) and target):
         raise bad(f"{action} without a target")
-    if not needs_target and target is not None:
+    if not needs_target and target is not _ABSENT:
         raise bad(f"{action} with a target")
     # Rebuilt rather than passed through: unknown keys from a model do not travel.
-    return Decision(action=action, target=target, body=body)
+    return Decision(
+        action=action,
+        target=target if isinstance(target, str) else None,
+        body=body if isinstance(body, str) else None,
+    )
 
 
 def parse_decision(text: str) -> Decision:

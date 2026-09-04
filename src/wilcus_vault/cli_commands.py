@@ -13,7 +13,7 @@ from .decide import fetch_decider
 from .discards import entry_to_json, get_discard, list_discards, restore_discard
 from .embed import Embedder
 from .gate import GateOptions
-from .indexer import reindex
+from .indexer import IndexStats, reindex
 from .search import hybrid_search
 from .search_sql import Cutoffs
 from .term import VaultError, safe
@@ -85,7 +85,7 @@ async def cmd_discards(args: Args, embedder: Embedder, rest: list[str]) -> int:
             lines.append(f"({malformed} unreadable line{'' if malformed == 1 else 's'} skipped)")
         print("\n".join(lines) if lines else "no discards")
         return 0
-    n = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else 0
+    n = int(rest[1]) if len(rest) > 1 and rest[1].isascii() and rest[1].isdigit() else 0
     if sub not in ("show", "restore") or n < 1:
         raise VaultError(f"discards needs list, show <n> or restore <n>\n\n{USAGE}")
     if sub == "show":
@@ -112,6 +112,14 @@ async def cmd_discards(args: Args, embedder: Embedder, rest: list[str]) -> int:
     return 0
 
 
+def pass_line(paths: list[str], stats: IndexStats) -> str | None:
+    """The line `vault watch` prints for a pass, or None when nothing changed: an
+    editor rewriting identical bytes is not news."""
+    if not (stats.added or stats.updated or stats.removed):
+        return None
+    return safe(f"{' '.join(paths)} — {summary(stats)}")
+
+
 async def cmd_watch(root: str, embedder: Embedder) -> int:
     db = open_db(db_path(root))
     try:
@@ -122,8 +130,9 @@ async def cmd_watch(root: str, embedder: Embedder) -> int:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stopped.set)
 
-        def on_change(paths: list[str], stats: object) -> None:
-            print(safe(f"{' '.join(paths)} — {summary(stats)}"))  # type: ignore[arg-type]
+        def on_change(paths: list[str], stats: IndexStats) -> None:
+            if (line := pass_line(paths, stats)) is not None:
+                print(line)
 
         watcher = watch(db, root, embedder, WatchOptions(on_change=on_change))
         print(f"watching {os.path.abspath(root)} — press ctrl-c to stop")

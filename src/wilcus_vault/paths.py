@@ -48,7 +48,7 @@ def write_atomic(abs_path: Path, text: str) -> None:
     sees a half-written note, and rename replaces a symlink instead of following
     it. The temp name is not `.md`, so a crash leaves nothing the scan indexes."""
     tmp = abs_path.with_name(f"{abs_path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
-    tmp.write_text(text, encoding="utf-8")
+    tmp.write_text(text, encoding="utf-8", newline="")
     os.replace(tmp, abs_path)
 
 

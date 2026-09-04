@@ -153,9 +153,10 @@ def count_discards(root: str | Path) -> dict[str, int]:
 
 def _parse_at(at: str) -> datetime | None:
     try:
-        return datetime.fromisoformat(at.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(at.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return parsed if parsed.tzinfo is not None else None  # naive: not comparable, not recent
 
 
 def entry_to_json(entry: DiscardEntry) -> dict[str, Any]:

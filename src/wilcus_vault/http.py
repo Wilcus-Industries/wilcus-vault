@@ -12,7 +12,8 @@ import urllib.error
 import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from http.client import HTTPMessage
+from typing import IO, Any
 from urllib.parse import urlparse
 
 from .term import VaultError
@@ -23,6 +24,25 @@ Transport = Callable[[str, dict[str, str], bytes, float], Awaitable[tuple[int, s
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is answered as the 3xx it is. urllib would otherwise replay the
+    request, Authorization header included, at whatever host the Location names."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 async def default_transport(
     url: str, headers: dict[str, str], body: bytes, timeout: float
 ) -> tuple[int, str]:
@@ -31,7 +51,7 @@ async def default_transport(
     def post() -> tuple[int, str]:
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with _OPENER.open(request, timeout=timeout) as response:
                 return response.status, response.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", "replace")

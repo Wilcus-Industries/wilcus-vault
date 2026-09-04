@@ -42,7 +42,7 @@ def read_nofollow(path: Path) -> str | None:
 
 def append_nofollow(path: Path, text: str) -> None:
     fd = _open_nofollow(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
         f.write(text)
 
 
