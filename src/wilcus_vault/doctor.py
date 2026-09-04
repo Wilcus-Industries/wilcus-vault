@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .db import db_path, open_db
-from .discard_log import discard_log
+from .discard_log import append_nofollow, discard_log, ensure_gitignore, read_nofollow
 from .discards import count_discards
 from .embed import Embedder
 from .indexer import read_note, reindex, scan_vault
@@ -92,11 +92,12 @@ def _migrate_discard_log(root: Path) -> bool:
     old = root / ".vault" / "discarded.log"
     if not old.exists():
         return False
-    with old.open(encoding="utf-8", newline="") as f:
-        lines = f.read()
-    if lines != "":
-        with discard_log(root).open("a", encoding="utf-8") as f:
-            f.write(lines if lines.endswith("\n") else lines + "\n")
+    lines = read_nofollow(old)
+    if lines:
+        log = discard_log(root)
+        if not log.exists():
+            ensure_gitignore(root)
+        append_nofollow(log, lines if lines.endswith("\n") else lines + "\n")
     old.unlink()
     return True
 

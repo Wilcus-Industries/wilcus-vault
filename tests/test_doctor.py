@@ -5,6 +5,7 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from conftest import MakeVault, write_note
 
 from wilcus_vault.db import db_path, open_db
@@ -183,3 +184,23 @@ async def test_skips_a_log_entry_whose_candidate_is_not_one(make_vault: MakeVaul
     entries, malformed = list_discards(root)
     assert [e.candidate.title for e in entries] == ["t"]
     assert malformed == 1
+
+
+async def test_migration_never_writes_through_a_symlink_and_gitignores_the_log(
+    make_vault: MakeVault,
+) -> None:
+    """The migration writes whole candidate bodies, so it obeys the same two
+    rails as every other write to the log: never through a link, always ignored."""
+    root = make_vault(GRAPH)
+    outside = make_vault({})
+    line = json.dumps({"at": "2026-01-01T00:00:00.000Z", "candidate": {"title": "t", "body": "b"}})
+    write_note(root, ".vault/discarded.log", line + "\n")
+    os.symlink(outside / "stolen.log", root / ".discarded.log")
+
+    with pytest.raises(OSError):
+        await doctor(root, embedder, DoctorOptions(repair=True))
+    assert not (outside / "stolen.log").exists()
+
+    (root / ".discarded.log").unlink()
+    assert (await doctor(root, embedder, DoctorOptions(repair=True))).migrated_discard_log is True
+    assert ".discarded.log*" in (root / ".gitignore").read_text()

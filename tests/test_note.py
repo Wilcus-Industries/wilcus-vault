@@ -179,3 +179,13 @@ def test_non_string_title_type_are_ignored_and_flagged_for_doctor() -> None:
     assert n.type is None
     assert n.malformed_frontmatter is True
     assert n.frontmatter == {"title": 42, "type": ["a", "b"]}  # kept as written
+
+
+def test_frontmatter_too_deeply_nested_to_parse_is_malformed_not_an_exception() -> None:
+    """PyYAML's composer recurses per nesting level, so a deep enough block
+    raises RecursionError rather than a YAMLError. Parsing never raises."""
+    raw = "---\na: " + "[" * 3000 + "]" * 3000 + "\n---\n# Deep\n\nbody\n"
+    note = parse_note(raw, "deep.md")
+    assert note.malformed_frontmatter is True
+    assert note.frontmatter == {}
+    assert note.body == raw.replace("\r\n", "\n")

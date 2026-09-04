@@ -118,7 +118,9 @@ def usable_frontmatter(text: str) -> dict[str, Any] | None:
         return {}
     try:
         parsed = yaml.load(text, Loader=_Loader)
-    except yaml.YAMLError:
+    # PyYAML composes and constructs recursively, so nesting deep enough to
+    # exhaust the stack raises RecursionError rather than a YAMLError.
+    except (yaml.YAMLError, RecursionError):
         return None
     if not isinstance(parsed, dict) or not within_node_budget(parsed):
         return None
