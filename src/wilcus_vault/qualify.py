@@ -96,7 +96,8 @@ def _rewrite(abs_path: Path, rel: str, hash_at_index: str, stem: str, target: st
     """Rewrite one linker in place. False when it was skipped: gone, edited
     since the index read it (never clobbered), or holding no matching link."""
     try:
-        raw = abs_path.read_text(encoding="utf-8", errors="replace", newline="")
+        with abs_path.open(encoding="utf-8", errors="replace", newline="") as f:
+            raw = f.read()
     except FileNotFoundError:
         return False
     if parse_note(raw, rel).hash != hash_at_index:

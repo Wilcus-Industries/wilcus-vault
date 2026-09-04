@@ -92,7 +92,8 @@ def _migrate_discard_log(root: Path) -> bool:
     old = root / ".vault" / "discarded.log"
     if not old.exists():
         return False
-    lines = old.read_text(encoding="utf-8", newline="")
+    with old.open(encoding="utf-8", newline="") as f:
+        lines = f.read()
     if lines != "":
         with discard_log(root).open("a", encoding="utf-8") as f:
             f.write(lines if lines.endswith("\n") else lines + "\n")
