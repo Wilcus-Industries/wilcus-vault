@@ -1,7 +1,11 @@
-node_modules/
 .tools/
 .tools-ext/
 .claude/worktrees/
 tmp-test/
 *.db
 .vault/
+.venv/
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
