@@ -36,7 +36,7 @@ def read_nofollow(path: Path) -> str | None:
         fd = _open_nofollow(path, os.O_RDONLY)
     except FileNotFoundError:
         return None
-    with os.fdopen(fd, encoding="utf-8") as f:
+    with os.fdopen(fd, encoding="utf-8", newline="") as f:
         return f.read()
 
 

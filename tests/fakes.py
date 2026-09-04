@@ -4,7 +4,9 @@ that records calls and answers OpenAI-shaped JSON."""
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import cast
 
+from wilcus_vault.decision import Decider, DeciderInput, Decision
 from wilcus_vault.embed import Vector
 
 Embed = Callable[[list[str]], Awaitable[list[Vector]]]
@@ -69,3 +71,12 @@ def chat_reply(content: str) -> Reply:
         200,
         json.dumps({"choices": [{"message": {"role": "assistant", "content": content}}]}),
     )
+
+
+def fixed_decider(value: object) -> Decider:
+    """A decider that always answers `value` (a Decision, or a dict of anything)."""
+
+    async def decide(_input: DeciderInput) -> Decision:
+        return cast(Decision, value)
+
+    return decide

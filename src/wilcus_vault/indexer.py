@@ -72,7 +72,7 @@ def note_entry(root: str | Path, rel: str) -> os.stat_result | None:
 def read_raw(root: str | Path, rel: str) -> str | None:
     """The file's text, or None if it is no longer there. Other errors raise."""
     try:
-        return (Path(root) / rel).read_text(encoding="utf-8", errors="replace")
+        return (Path(root) / rel).read_text(encoding="utf-8", errors="replace", newline="")
     except FileNotFoundError:
         return None
 

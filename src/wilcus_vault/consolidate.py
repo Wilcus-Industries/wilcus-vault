@@ -102,15 +102,14 @@ async def consolidate(
         if acted >= run.cap:
             report.remaining.append(cluster)
             continue
-        notes = _read_members(base, cluster.members)
-        if notes is None:
-            report.remaining.append(
-                cluster
-            )  # a member vanished: not the cluster we would ask about
-            continue
-        acted += 1
         created: str | None = None
         try:
+            notes = _read_members(base, cluster.members)
+            if notes is None:
+                # A member vanished: not the cluster we would ask about.
+                report.remaining.append(cluster)
+                continue
+            acted += 1
             candidate = check_merged(await options.merger(MergeInput(notes)))
             if not run.write:
                 report.merges.append(Merge(cluster, candidate))

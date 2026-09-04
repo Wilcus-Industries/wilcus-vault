@@ -7,7 +7,7 @@ ponytail: a full parse per call, bounded by the rotation cap per file.
 import errno
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -69,14 +69,29 @@ def _parse_line(line: str) -> DiscardEntry | None:
         return None
     decision = raw.get("decision")
     similar = raw.get("similar")
-    return DiscardEntry(
-        n=0,
-        at=raw["at"],
-        candidate=Candidate(**raw["candidate"]),
-        decision=Decision(**decision) if isinstance(decision, dict) else None,
-        reason=raw.get("reason"),
-        similar=[DiscardedSimilar(**s) for s in similar] if isinstance(similar, list) else [],
-    )
+    # A hand-edited or older line may miss a field or carry an extra one: it is
+    # a malformed line to skip, never an exception out of doctor.
+    try:
+        return DiscardEntry(
+            n=0,
+            at=raw["at"],
+            candidate=_build(Candidate, raw["candidate"]),
+            decision=_build(Decision, decision) if isinstance(decision, dict) else None,
+            reason=raw.get("reason"),
+            similar=[_build(DiscardedSimilar, s) for s in similar]
+            if isinstance(similar, list)
+            else [],
+        )
+    except TypeError:
+        return None
+
+
+def _build[T](cls: type[T], raw: object) -> T:
+    """A dataclass from a JSON object, known fields only. Raises TypeError otherwise."""
+    if not isinstance(raw, dict):
+        raise TypeError(f"expected an object for {cls.__name__}")
+    known = {f.name for f in fields(cls)}  # type: ignore[arg-type]
+    return cls(**{k: v for k, v in raw.items() if k in known})
 
 
 def list_discards(root: str | Path) -> tuple[list[DiscardEntry], int]:
