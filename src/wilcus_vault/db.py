@@ -64,7 +64,10 @@ def open_db(path: str | Path) -> sqlite3.Connection:
 
 @contextmanager
 def transaction(db: sqlite3.Connection) -> Iterator[None]:
-    db.execute("begin")
+    # `immediate`, not the default deferred: a deferred begin takes the write
+    # lock at the first write, and SQLite refuses that upgrade outright instead
+    # of waiting out busy_timeout. Taking it up front makes a second writer queue.
+    db.execute("begin immediate")
     try:
         yield
     except BaseException:

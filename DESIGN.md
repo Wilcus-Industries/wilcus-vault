@@ -655,6 +655,41 @@ because that pass still holds the database handle: `await watcher.close()` befor
 shutdown from racing a write. Queued paths are dropped rather than drained —
 nobody is waiting for them, and doctor knows where they are.
 
+## Concurrency
+
+The intended deployment is one writing process — a library caller holding one
+handle, or `vault watch`. What happens when that is not true was left unsaid,
+which is worse than a documented limitation: a caller cannot obey a rule nobody
+wrote down. So the boundary is drawn here, and the parts that can hold without a
+lock do.
+
+**Safe against any number of writers.** Every write to an existing note is
+check-and-write against the file's content hash, re-read at the moment of
+writing: the gate's update path, `mark_superseded` and `qualify` all refuse and
+report rather than overwrite a file that changed under them, which is the same
+mechanism that protects a human editing in Obsidian. `write_atomic` renames a
+finished temp file over the target, so no reader ever sees half a note. A note
+the gate authors claims its filename with `os.link`, which fails rather than
+overwrites — of two writers racing for `acme.md`, one gets it and the other
+moves to `acme-2.md` still holding its content. Discard-log entries are single
+short appends to a file opened `O_APPEND`, which POSIX makes atomic.
+
+**Safe because SQLite is.** The index is WAL with a 5s `busy_timeout`, so
+readers never block writers and separate processes share one index file. Write
+transactions are `begin immediate`: a deferred transaction takes the write lock
+only at its first write, and SQLite refuses *that* upgrade outright rather than
+waiting, so the lock is taken at the top where the timeout applies.
+
+**Not safe, and not fixable without a lock.** `doctor --rebuild` renames a fresh
+index over `index.db`; another process's open handle keeps writing to the
+replaced inode and those writes are lost. Index-level only — the notes are
+untouched and the next `doctor` rebuilds what was lost from the files — but it
+is the one case the rails above do not cover, and closing it needs an advisory
+lock file rather than a cleverer rename.
+
+**Not corruption, just waste.** Two reindex passes racing do redundant work and
+converge: every write is a per-path upsert, and the hash decides.
+
 ## Testing / evals
 
 `uv run pytest` runs everything; done-check: `./scripts/check.sh` (= `ruff

@@ -9,7 +9,7 @@ from fakes import fixed_decider
 from gate_common import CANDIDATE, VAULT, open_gate, read
 
 from wilcus_vault.decision import DeciderInput, Decision
-from wilcus_vault.paths import write_atomic
+from wilcus_vault.paths import write_new
 
 TARGET = "notes/acme-renewal.md"
 SUCCESSOR = "notes/acme-renewal-2026.md"
@@ -75,13 +75,14 @@ async def test_supersede_keeps_the_successor_and_reports_the_old_note_unmarked_i
     # saves *after* the successor is written but before the old note is patched.
     root = make_vault(VAULT)
 
-    def write(abs_path: Path, text: str) -> None:
-        write_atomic(abs_path, text)
-        if "acme-renewal-2026" in str(abs_path):
+    def write(abs_path: Path, text: str) -> bool:
+        done = write_new(abs_path, text)
+        if done and "acme-renewal-2026" in str(abs_path):
             monkeypatch.undo()  # the successor has landed: now a human saves the old note
             write_note(root, TARGET, "# Acme renewal\n\nhand edit\n")
+        return done
 
-    monkeypatch.setattr("wilcus_vault.gate_write.write_atomic", write)
+    monkeypatch.setattr("wilcus_vault.gate_write.write_new", write)
     v = await open_gate(root, SUPERSEDE)
     r = await v.propose(CANDIDATE)
     assert (r.action, r.path, r.unmarked) == ("supersede", SUCCESSOR, TARGET)

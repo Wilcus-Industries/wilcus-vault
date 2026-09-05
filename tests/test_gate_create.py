@@ -3,6 +3,7 @@
 import json
 import re
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from conftest import MakeVault
@@ -123,4 +124,43 @@ async def test_the_facade_refuses_to_propose_without_a_decider_and_cutoffs(
         await v.propose(CANDIDATE)
     assert len(await v.search("acme")) > 0  # the rest of the facade works
     assert (await v.doctor()).stale == []
+    v.close()
+
+
+def test_write_new_claims_a_name_and_a_second_writer_loses_it(make_vault: MakeVault) -> None:
+    """`os.replace` lets a second writer overwrite the first. A create claims its
+    filename with the write itself, so only one of two racing writers wins."""
+    from wilcus_vault.paths import write_new
+
+    root = make_vault({})
+    target = root / "note.md"
+    assert write_new(target, "first\n") is True
+    assert write_new(target, "second\n") is False
+    assert target.read_text() == "first\n"
+    assert [p.name for p in root.iterdir()] == ["note.md"]  # no temp file left behind
+
+
+async def test_a_filename_taken_after_the_index_check_is_never_overwritten(
+    make_vault: MakeVault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window between "is this name free?" and the write: another writer
+    takes it. The candidate must move to the next slug, never clobber."""
+    from wilcus_vault.paths import write_new
+
+    root = make_vault(VAULT)
+    taken: list[Path] = []
+
+    def racing_write_new(abs_path: Path, text: str) -> bool:
+        if not taken:  # first attempt only: someone else got there first
+            taken.append(abs_path)
+            abs_path.write_text("not ours\n", encoding="utf-8")
+        return write_new(abs_path, text)
+
+    monkeypatch.setattr("wilcus_vault.gate_write.write_new", racing_write_new)
+    v = await open_gate(root, CREATE)
+    r = await v.propose(CANDIDATE)
+
+    assert r.action == "create"
+    assert r.path is not None and r.path.endswith("-2.md")  # moved on, did not clobber
+    assert taken[0].read_text() == "not ours\n"  # the other writer's note stands
     v.close()

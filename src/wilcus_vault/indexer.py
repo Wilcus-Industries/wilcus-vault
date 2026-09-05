@@ -4,6 +4,7 @@ Dirtiness is decided by content hash, never by the database's own bookkeeping,
 and one function (`index_paths`) writes every index row.
 """
 
+import errno
 import os
 import sqlite3
 import stat
@@ -21,6 +22,11 @@ from .term import VaultError, printable
 # Rewrites per collision before the rest is left to doctor. A generous fuse
 # against a pathological vault, not a tuning knob.
 QUALIFY_CAP = 500
+
+# The filesystem saying there is no note at this path. Anything else — EACCES on
+# a directory, EIO on a bad disk — means we could not look, which is not the same
+# fact and must not read as a deletion.
+_ABSENT = (errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP)
 
 
 @dataclass
@@ -63,13 +69,17 @@ def note_entry(root: str | Path, rel: str) -> os.stat_result | None:
     """The lstat of a path that really holds a note, or None. Only a regular file
     is a note: a path that is gone, a directory, or a symlink holds none.
 
-    Any OSError is that same answer — a segment that is a file not a directory,
-    a name too long for the filesystem, a directory we may not read — so a
-    caller asking "is there a note here" never has to catch errno itself.
+    A segment that is a file not a directory, a name too long for the filesystem
+    and a symlink loop are all that same answer, so a caller asking "is there a
+    note here" never has to catch errno itself. Every other OSError is raised:
+    `index_paths` purges the rows of a path that answers None, and purging
+    because a directory went unreadable would lose the index behind our back.
     """
     try:
         entry = os.lstat(Path(root) / rel)
-    except OSError:
+    except OSError as e:
+        if e.errno not in _ABSENT:
+            raise
         return None
     return entry if stat.S_ISREG(entry.st_mode) else None
 

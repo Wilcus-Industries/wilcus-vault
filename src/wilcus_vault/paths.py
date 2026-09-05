@@ -43,13 +43,36 @@ def confined_path(root: str | Path, rel: str) -> Path:
     return abs_path
 
 
-def write_atomic(abs_path: Path, text: str) -> None:
-    """Write through a temp file and rename it over the target: a reader never
-    sees a half-written note, and rename replaces a symlink instead of following
-    it. The temp name is not `.md`, so a crash leaves nothing the scan indexes."""
+def _staged(abs_path: Path, text: str) -> Path:
+    """`text` in a temp file beside its target, ready to be moved into place. The
+    temp name is not `.md`, so a crash leaves nothing the scan indexes."""
     tmp = abs_path.with_name(f"{abs_path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
     tmp.write_text(text, encoding="utf-8", newline="")
-    os.replace(tmp, abs_path)
+    return tmp
+
+
+def write_atomic(abs_path: Path, text: str) -> None:
+    """Write through a temp file and rename it over the target: a reader never
+    sees a half-written note, and rename replaces a symlink instead of following it."""
+    os.replace(_staged(abs_path, text), abs_path)
+
+
+def write_new(abs_path: Path, text: str) -> bool:
+    """Write a file that is not there yet, or answer False because it is.
+
+    The name is claimed by linking the finished temp file into place: `link`
+    fails rather than overwriting, so of two writers racing for one filename
+    exactly one wins and the loser still holds its note. `os.replace` would let
+    the second silently destroy the first.
+    """
+    tmp = _staged(abs_path, text)
+    try:
+        os.link(tmp, abs_path)
+    except FileExistsError:
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)
+    return True
 
 
 def now() -> str:

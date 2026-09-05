@@ -186,3 +186,25 @@ async def test_an_empty_vault_indexes_to_an_empty_database(make_vault: MakeVault
     assert (stats.added, stats.removed) == (0, 0)
     assert one(db, "select count(*) from notes") == 0
     db.close()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+async def test_an_unreadable_directory_raises_rather_than_purging_its_notes(
+    make_vault: MakeVault,
+) -> None:
+    """A directory we cannot read is not a directory whose notes are gone: EACCES
+    read as absence would silently drop every note under it from the index."""
+    root = make_vault({"locked/secret.md": "# Secret\n\nbody\n", "open.md": "# Open\n"})
+    db = open_index(root)
+    try:
+        assert (await reindex(db, root, embedder)).added == 2
+        (root / "locked").chmod(0o000)
+        try:
+            with pytest.raises(PermissionError):
+                await reindex(db, root, embedder)
+            rows = [r["path"] for r in db.execute("select path from notes order by path")]
+            assert "locked/secret.md" in rows  # not purged behind our back
+        finally:
+            (root / "locked").chmod(0o755)
+    finally:
+        db.close()
