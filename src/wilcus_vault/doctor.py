@@ -2,12 +2,11 @@
 what drifted, and report what only a human can fix."""
 
 import sqlite3
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .db import db_path, open_db
+from .db import db_path, open_db, transaction
 from .discard_log import append_nofollow, discard_log, ensure_gitignore, read_nofollow
 from .discards import count_discards
 from .embed import Embedder
@@ -172,27 +171,19 @@ def _graph_report(
 
 
 async def _rebuild_index(root: Path, embedder: Embedder) -> None:
-    """Rebuild from the files into a temp DB, then rename it over index.db: a
-    half-finished rebuild can never become the live index.
-    ponytail: a watcher holding the old file keeps writing to the replaced inode;
-    those writes are lost, not corrupting, and the next doctor run recovers them."""
-    target = db_path(root)
-    tmp = target.with_name(f"{target.name}.rebuild-{uuid.uuid4().hex}")
-    db = open_db(tmp)
+    """Clear every derived row and index the files again, in the live database.
+    Nothing is renamed over `index.db`: replacing the inode strands any handle
+    another process already has open, which then writes rows into a file nobody
+    will open again. `vectors` is dropped rather than emptied so the rebuild
+    picks up the embedder's width even when the table predates it.
+    ponytail: a crash mid-rebuild leaves a partly filled index, not the old one —
+    stale, never corrupt, and the next doctor run finishes it from the files."""
+    db = open_db(db_path(root))
     try:
+        with transaction(db):
+            db.execute("drop table if exists vectors")
+            for table in ("notes", "edges", "notes_fts", "vector_meta"):
+                db.execute(f"delete from {table}")
         await reindex(db, root, embedder)
-        db.execute("pragma wal_checkpoint(truncate)")  # fold the WAL in before the rename
-    except BaseException:
+    finally:
         db.close()
-        _rm_db(tmp)
-        raise
-    db.close()
-    _rm_db(target, journals_only=True)  # the old journal describes a database about to vanish
-    tmp.replace(target)
-
-
-def _rm_db(path: Path, journals_only: bool = False) -> None:
-    for suffix in ("-wal", "-shm"):
-        path.with_name(path.name + suffix).unlink(missing_ok=True)
-    if not journals_only:
-        path.unlink(missing_ok=True)

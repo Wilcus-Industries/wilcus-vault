@@ -42,7 +42,7 @@ src/wilcus_vault/
   indexer.py        # scan vault dir, hash-diff, one write path (index_paths)
   index_rows.py     # every index row a note owns: write, purge, resolve edges
   qualify.py        # auto-qualify bare wikilinks when a pass creates a stem collision
-  doctor.py         # drift report + repair + --rebuild into a temp DB, renamed into place
+  doctor.py         # drift report + repair + --rebuild in place, in the live index
   search.py         # hybrid: query vector + FTS terms → pre-fusion cutoffs → RRF ordering
   search_sql.py     # the fused-ranking and link-expansion statements, SearchHit, Cutoffs
   scope.py          # ScopePolicy: validate/normalize at open(), one prefix resolver for
@@ -294,8 +294,9 @@ and the old order left the vault with an empty `vectors` table, an empty
 `vector_meta` and nothing recording that a re-embed was owed: `search` would
 then quietly answer on FTS alone, at exit 0. Now a failed swap rolls back whole,
 and `search` keeps refusing stale vectors until a pass has actually replaced
-them. (`doctor --rebuild` was always safe — it builds a temp DB and renames it
-into place.)
+them. (`doctor --rebuild` is safe for the same reason — it drops `vectors`
+and refills it in the same pass, so a failure never leaves an empty table
+claiming to be current.)
 
 Requests are batched by text count *and* by characters, since a
 whole-note payload is what actually blows a provider's per-request limit. Notes
@@ -622,8 +623,15 @@ qualified form and reads as the ambiguous stem itself; that note has to move
 into a namespace.) A duplicate filename stem is
 *not* itself reported: two namespaces holding an `acme.md` is the point of
 namespaces, and only a bare link to them is a problem.
-`--rebuild` reindexes from scratch into a temp DB file, then atomically renames it
-over `index.db` (safe against a concurrently running watcher). Doctor also carries
+`--rebuild` clears every derived row and indexes from scratch in the live
+`index.db`. It deliberately does *not* build a temp file and rename it over:
+the rename is atomic, but it replaces the inode, and any process that already
+had the index open goes on writing rows into a file nobody will open again.
+Working in place costs the guarantee that a half-finished rebuild can never
+become the live index — a crash part-way through leaves a partly filled index
+rather than the old one. That is stale, not corrupt, and the next `doctor`
+finishes it from the files, which is the trade every other part of
+files-are-truth already makes. Doctor also carries
 the one migration the vault has: a discard log still sitting in `.vault/` is
 appended to `<root>/.discarded.log` and removed, once, before anything else
 touches `.vault/`, and the report says so. It runs only on a **repairing** run
@@ -694,12 +702,13 @@ transactions are `begin immediate`: a deferred transaction takes the write lock
 only at its first write, and SQLite refuses *that* upgrade outright rather than
 waiting, so the lock is taken at the top where the timeout applies.
 
-**Not safe, and not fixable without a lock.** `doctor --rebuild` renames a fresh
-index over `index.db`; another process's open handle keeps writing to the
-replaced inode and those writes are lost. Index-level only — the notes are
-untouched and the next `doctor` rebuilds what was lost from the files — but it
-is the one case the rails above do not cover, and closing it needs an advisory
-lock file rather than a cleverer rename.
+**Safe by not moving the file.** `doctor --rebuild` used to rename a fresh index
+over `index.db`, which stranded any handle another process already held: it went
+on writing rows to the replaced inode, into a file nobody would open again. The
+rebuild now clears and refills the live database, so there is no second inode to
+strand a handle on and no advisory lock for a watcher and a library handle to
+agree about. Coordination is avoided rather than implemented, which is the
+cheaper answer whenever it is available.
 
 **Not corruption, just waste.** Two reindex passes racing do redundant work and
 converge: every write is a per-path upsert, and the hash decides.

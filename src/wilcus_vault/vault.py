@@ -115,13 +115,8 @@ class Vault:
         return await reindex_vault(self._db, self.root, self._embedder)
 
     async def doctor(self, options: DoctorOptions | None = None) -> DoctorReport:
-        report = await run_doctor(self.root, self._embedder, options)
-        # A rebuild renamed a fresh index over the old file; our handle still
-        # points at the replaced inode, so take the new one.
-        if options is not None and options.rebuild:
-            self._db.close()
-            self._db = open_db(db_path(self.root))
-        return report
+        # A rebuild works in the live index file, so this handle stays valid.
+        return await run_doctor(self.root, self._embedder, options)
 
     def watch(self, options: WatchOptions | None = None) -> Watcher:
         """Keep the index up to date as the files change, until `close()`."""

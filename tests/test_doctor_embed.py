@@ -15,7 +15,12 @@ from wilcus_vault.term import VaultError
 from wilcus_vault.vault import open as open_vault
 
 
-async def test_a_failed_rebuild_leaves_no_temp_database(make_vault: MakeVault) -> None:
+async def test_a_failed_rebuild_leaves_a_stale_index_the_next_run_finishes(
+    make_vault: MakeVault,
+) -> None:
+    """The rebuild works in the live file, so a failure part-way through leaves a
+    partly filled index rather than the old one. That is the price of never
+    replacing the inode: stale is recoverable from the files, stranded is not."""
     root = make_vault(GRAPH)
     await doctor(root, embedder)
 
@@ -25,8 +30,9 @@ async def test_a_failed_rebuild_leaves_no_temp_database(make_vault: MakeVault) -
     boom = stub_embedder("boom-v1", 32, down)
     with pytest.raises(RuntimeError, match="provider down"):
         await doctor(root, boom, DoctorOptions(rebuild=True))
-    assert os.listdir(root / ".vault") == ["index.db"]
-    assert len(snapshot(root)[0]) == 5  # the live index is untouched
+    assert os.listdir(root / ".vault") == ["index.db"]  # no temp database either way
+    assert await doctor(root, embedder, DoctorOptions(rebuild=True)) is not None
+    assert len(snapshot(root)[0]) == 5  # the next run rebuilds it from the files
 
 
 async def test_survives_a_file_deleted_mid_run(make_vault: MakeVault) -> None:
