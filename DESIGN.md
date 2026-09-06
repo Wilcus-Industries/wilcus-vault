@@ -591,15 +591,26 @@ fact learned once *the* fact. Concurrent writers to it are safe: every update is
 check-and-write against the file's hash, and a create claims its filename with a
 link that fails rather than overwrites.
 
-**Open question, not settled here.** A shared writable namespace makes the vault
-one memory rather than several, but it also means the decider chooses among
-every agent's notes on every propose, and nothing but the decider's judgement
-keeps one agent's proposal from landing on a note another agent depends on.
-Whether that wants a further rail — a per-call restriction on which note a
-single `propose` may target, which `ScopePolicy` cannot express because it is
-agent-keyed and fixed at `open()` — is undecided. The current answer is that a
-caller who asked to update a specific note checks the returned `GateResult.path`
-is the one it asked for.
+**What splits along that line.** `knowledge/` holds facts about the *world* —
+what is true, learned once and refined in place by whoever learns more.
+`agents/<self>/` holds facts about *that agent* — its identity, its task state,
+its own working notes: things that are only ever true of one agent, where a
+second agent's copy would be wrong rather than duplicated. The test is not "who
+learned it" but "who is it about". A fact the clerk learns about the ledger is a
+ledger fact and belongs in `knowledge/`; the clerk's own half-finished task does
+not become everyone's when another agent reads it.
+
+**The decider is the rail, and that is accepted.** A shared writable namespace
+means the decider chooses among every agent's notes on every propose, and
+nothing but its judgement keeps one agent's proposal off a note another agent
+depends on. A per-call restriction on which note a single `propose` may target
+would not help here: the target is *deliberately* shared, so confining a call to
+its own namespace would defeat the model rather than protect it — and
+`ScopePolicy` could not express it anyway, being agent-keyed and fixed at
+`open()`. A caller that asked to update a specific note checks the returned
+`GateResult.path` is the one it asked for; that is the whole guarantee, and it is
+enough because a wrong landing is a bad edit to a versioned text file, not a
+loss.
 
 ## Consolidation pass
 
