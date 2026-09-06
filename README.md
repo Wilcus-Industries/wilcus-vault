@@ -236,8 +236,9 @@ once the vault has a scope policy — see [Scopes](#scopes).
    written path is `<namespace>/<slug>.md` with a single slugified segment,
    resolved under the vault root, never through a symlink or dot-directory.
 
-Writes land through a temp file renamed into place, so a reader never sees half a
-note. A discarded candidate — or one the gate cannot place at all — is appended
+Writes land through a temp file, so a reader never sees half a note: an update
+renames it over the target, and a new note hardlinks it into place, which fails
+rather than overwrite when another writer already claimed the name. A discarded candidate — or one the gate cannot place at all — is appended
 whole to `<root>/.discarded.log`, along with the similar set the decider saw;
 losing the note is never an outcome. That log is
 history, not index, so it sits beside the notes rather than in the disposable

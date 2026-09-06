@@ -190,3 +190,31 @@ async def test_fetch_decider_model_mandatory_reply_parsed(monkeypatch: pytest.Mo
     monkeypatch.setenv("VAULT_DECIDE_ENDPOINT", "https://api.example.invalid/v1/chat/completions")
     with pytest.raises(VaultError, match="API key"):
         fetch_decider(model="m")
+
+
+def test_a_log_line_whose_values_are_the_wrong_type_is_malformed(make_vault: MakeVault) -> None:
+    """Known keys used to be passed through unchecked, so a corrupted or
+    hand-edited line built a Candidate holding a number and only failed later,
+    inside the write gate, once `restore` was already running."""
+    root = make_vault({})
+    lines = [
+        {"at": "2026-01-01T00:00:00.000Z", "candidate": {"title": 7, "body": "b"}},
+        {"at": "2026-01-01T00:00:00.000Z", "candidate": {"title": "t", "body": ["b"]}},
+        {
+            "at": "2026-01-01T00:00:00.000Z",
+            "candidate": {"title": "t", "body": "b"},
+            "decision": {"action": "nonsense"},
+        },
+        {
+            "at": "2026-01-01T00:00:00.000Z",
+            "candidate": {"title": "t", "body": "b"},
+            "similar": [{"path": "a.md", "hash": "h", "score": "not a number"}],
+        },
+    ]
+    ok = {"at": "2026-01-01T00:00:00.000Z", "candidate": {"title": "keeper", "body": "b"}}
+    text = "".join(json.dumps(line) + "\n" for line in [*lines, ok])
+    discard_log(root).write_text(text, encoding="utf-8")
+
+    entries, malformed = list_discards(root)
+    assert malformed == len(lines)
+    assert [e.candidate.title for e in entries] == ["keeper"]

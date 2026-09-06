@@ -29,7 +29,7 @@ from .scope import (
 )
 from .search import SearchOptions, hybrid_search
 from .search_sql import SearchHit
-from .term import VaultError
+from .term import VaultError, printable, safe
 from .watch import Watcher, WatchOptions
 from .watch import watch as watch_vault
 
@@ -67,7 +67,9 @@ class Vault:
         Read from the file, so a stale index row cannot change the answer. None
         when nothing is there, or when the agent may not read it: a scope is not
         an existence oracle. A path that escapes the vault or runs through a
-        hidden or symlinked directory raises.
+        hidden or symlinked directory raises, and so does a path we could not
+        read — an unreadable directory in the way, an I/O error. "I cannot say"
+        is not "there is nothing there", and it must not answer None.
         """
         scope = scope_for(self._policy, ctx)
         # Canonicalized into the form the scan stores, so `./x.md`, `a//x.md`
@@ -80,9 +82,13 @@ class Vault:
         confined_path(self.root, os.path.dirname(norm))
         if not scope.may("read", norm):
             return None
-        if not is_note_path(norm) or note_entry(self.root, norm) is None:
-            return None
-        return read_note(self.root, norm)
+        try:
+            if not is_note_path(norm) or note_entry(self.root, norm) is None:
+                return None
+            return read_note(self.root, norm)
+        except OSError as e:
+            # As a VaultError, like every other refusal this surface raises.
+            raise VaultError(f"vault: cannot read {safe(path)}: {printable(e)}") from e
 
     def list(self, prefix: str | None = None, ctx: VaultContext | None = None) -> list[str]:
         """Vault-relative paths of every note, sorted. `prefix` names a namespace and
@@ -115,13 +121,8 @@ class Vault:
         return await reindex_vault(self._db, self.root, self._embedder)
 
     async def doctor(self, options: DoctorOptions | None = None) -> DoctorReport:
-        report = await run_doctor(self.root, self._embedder, options)
-        # A rebuild renamed a fresh index over the old file; our handle still
-        # points at the replaced inode, so take the new one.
-        if options is not None and options.rebuild:
-            self._db.close()
-            self._db = open_db(db_path(self.root))
-        return report
+        # A rebuild works in the live index file, so this handle stays valid.
+        return await run_doctor(self.root, self._embedder, options)
 
     def watch(self, options: WatchOptions | None = None) -> Watcher:
         """Keep the index up to date as the files change, until `close()`."""

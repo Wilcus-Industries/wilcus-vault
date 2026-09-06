@@ -7,10 +7,11 @@ ponytail: a full parse per call, bounded by the rotation cap per file.
 import errno
 import json
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from types import UnionType
+from typing import Any, Literal, Protocol, Union, get_args, get_origin, get_type_hints
 
 from .decision import Candidate, Decision
 from .discard_log import ROTATED, discard_log, read_nofollow
@@ -86,12 +87,36 @@ def _parse_line(line: str) -> DiscardEntry | None:
         return None
 
 
+def _fits(annotation: object, value: object) -> bool:
+    """Does a JSON value fit a field's annotation? Only the shapes a log line can
+    hold: `str`, `float`, a `Literal` of strings, and the optional forms of those."""
+    if get_origin(annotation) is Literal:
+        return value in get_args(annotation)
+    if get_origin(annotation) in (UnionType, Union):  # `str | None`
+        return any(_fits(member, value) for member in get_args(annotation))
+    if annotation is float:  # JSON writes a whole number without its `.0`
+        return isinstance(value, int | float) and not isinstance(value, bool)
+    return isinstance(annotation, type) and isinstance(value, annotation)
+
+
 def _build[T](cls: type[T], raw: object) -> T:
-    """A dataclass from a JSON object, known fields only. Raises TypeError otherwise."""
+    """A dataclass from a JSON object, known fields only, each checked against the
+    type it is declared as. Raises TypeError otherwise.
+
+    The values come off disk, so they are read like any other untrusted input: a
+    corrupted line must be one skipped entry, not a Candidate holding a number
+    that only fails later, inside the write gate a restore already started.
+    """
     if not isinstance(raw, dict):
         raise TypeError(f"expected an object for {cls.__name__}")
-    known = {f.name for f in fields(cls)}  # type: ignore[arg-type]
-    return cls(**{k: v for k, v in raw.items() if k in known})
+    # Resolved, not `Field.type`: that is the annotation as written, and a string
+    # under `from __future__ import annotations` would fit nothing and drop every entry.
+    known = get_type_hints(cls)
+    taken = {k: v for k, v in raw.items() if k in known}
+    for name, value in taken.items():
+        if not _fits(known[name], value):
+            raise TypeError(f"{cls.__name__}.{name} is not a {known[name]}")
+    return cls(**taken)
 
 
 def list_discards(root: str | Path) -> tuple[list[DiscardEntry], int]:

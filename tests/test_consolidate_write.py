@@ -9,7 +9,7 @@ from consolidate_fixture import CTX, NOTES, PAIRS, fake_merger, fm, open_vault, 
 
 import wilcus_vault.gate_write as gate_write
 from wilcus_vault import ConsolidateRun
-from wilcus_vault.paths import write_atomic
+from wilcus_vault.paths import write_new
 
 
 async def test_a_write_run_creates_the_merged_note_and_marks_every_member_superseded(
@@ -102,14 +102,15 @@ async def test_a_member_edited_mid_flight_is_reported_unmarked_and_the_merged_no
 ) -> None:
     v = open_vault(make_vault, NOTES, fake_merger()[0])
 
-    def racing_write(abs_path: Path, text: str) -> None:
-        write_atomic(abs_path, text)
-        if "merged-note" in abs_path.name:
+    def racing_write(abs_path: Path, text: str) -> bool:
+        done = write_new(abs_path, text)
+        if done and "merged-note" in abs_path.name:
             # The merged note has landed; now a human saves a member.
-            monkeypatch.setattr(gate_write, "write_atomic", write_atomic)
+            monkeypatch.setattr(gate_write, "write_new", write_new)
             write_note(v.root, "notes/beta.md", "# Beta\n\nhand edit\n")
+        return done
 
-    monkeypatch.setattr(gate_write, "write_atomic", racing_write)
+    monkeypatch.setattr(gate_write, "write_new", racing_write)
     r = await v.consolidate(ConsolidateRun(ceiling=0.25, write=True))
 
     merge = r.merges[0]

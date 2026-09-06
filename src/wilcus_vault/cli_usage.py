@@ -70,6 +70,9 @@ def summary(s: IndexStats) -> str:
             )
             if q.skipped:
                 out += f" ({len(q.skipped)} skipped — see doctor)"
+    if s.unreadable:
+        # Their notes are invisible this pass, so the counts above undercount the vault.
+        out += safe(f"; could not read: {', '.join(s.unreadable)}")
     if s.index_error is not None:
         out += safe(f"; re-index of rewritten notes failed: {s.index_error}")
     return out
@@ -94,4 +97,5 @@ def print_report(r: DoctorReport) -> None:
     ]
     lines += [f"malformed frontmatter: {p}" for p in r.malformed]
     lines += [f"orphan: {p}" for p in r.orphans]
+    lines += [f"unreadable directory: {p} (its notes are invisible)" for p in r.unreadable]
     print("\n".join(safe(line) for line in lines))

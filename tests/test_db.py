@@ -103,3 +103,26 @@ def test_l2_normalize_unit_length_and_zero_vector() -> None:
     assert v[1] == pytest.approx(0.8, abs=1e-6)
     assert math.hypot(*v) == pytest.approx(1)
     assert l2_normalize([0, 0]) == [0, 0]
+
+
+def test_transaction_takes_the_write_lock_up_front(make_vault: MakeVault) -> None:
+    """A deferred `begin` defers the conflict to the first write, where SQLite
+    refuses the upgrade outright rather than waiting out `busy_timeout`. Taking
+    the lock at the top makes a second writer queue instead of fail."""
+    from wilcus_vault.db import transaction
+
+    path = db_path(make_vault({}))
+    a, b = open_db(path), open_db(path)
+    b.execute("pragma busy_timeout = 0")
+    try:
+        with transaction(a):
+            a.execute(
+                "insert into notes (path, slug, title, hash, frontmatter, mtime)"
+                " values ('a.md', 'a', 'A', 'h', '{}', 0)"
+            )
+            # the begin itself must be what is refused, not a later write
+            with pytest.raises(sqlite3.OperationalError, match="locked"), transaction(b):
+                pass
+    finally:
+        a.close()
+        b.close()

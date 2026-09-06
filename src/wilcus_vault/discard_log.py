@@ -41,9 +41,14 @@ def read_nofollow(path: Path) -> str | None:
 
 
 def append_nofollow(path: Path, text: str) -> None:
+    """One `write` under `O_APPEND`, not a buffered writer: an entry holds a whole
+    candidate body, so it routinely exceeds a writer's 8KiB buffer, and an entry
+    split across writes interleaves with another writer's and ruins both lines."""
     fd = _open_nofollow(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-        f.write(text)
+    try:
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 def log_candidate(

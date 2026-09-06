@@ -42,7 +42,7 @@ src/wilcus_vault/
   indexer.py        # scan vault dir, hash-diff, one write path (index_paths)
   index_rows.py     # every index row a note owns: write, purge, resolve edges
   qualify.py        # auto-qualify bare wikilinks when a pass creates a stem collision
-  doctor.py         # drift report + repair + --rebuild into a temp DB, renamed into place
+  doctor.py         # drift report + repair + --rebuild in place, in the live index
   search.py         # hybrid: query vector + FTS terms → pre-fusion cutoffs → RRF ordering
   search_sql.py     # the fused-ranking and link-expansion statements, SearchHit, Cutoffs
   scope.py          # ScopePolicy: validate/normalize at open(), one prefix resolver for
@@ -294,8 +294,9 @@ and the old order left the vault with an empty `vectors` table, an empty
 `vector_meta` and nothing recording that a re-embed was owed: `search` would
 then quietly answer on FTS alone, at exit 0. Now a failed swap rolls back whole,
 and `search` keeps refusing stale vectors until a pass has actually replaced
-them. (`doctor --rebuild` was always safe — it builds a temp DB and renames it
-into place.)
+them. (`doctor --rebuild` is safe for the same reason — it forces every note dirty and
+lands in that same transaction, so a failure never leaves an empty table claiming
+to be current.)
 
 Requests are batched by text count *and* by characters, since a
 whole-note payload is what actually blows a provider's per-request limit. Notes
@@ -622,13 +623,39 @@ qualified form and reads as the ambiguous stem itself; that note has to move
 into a namespace.) A duplicate filename stem is
 *not* itself reported: two namespaces holding an `acme.md` is the point of
 namespaces, and only a bare link to them is a problem.
-`--rebuild` reindexes from scratch into a temp DB file, then atomically renames it
-over `index.db` (safe against a concurrently running watcher). Doctor also carries
+`--rebuild` rewrites every row from the files, in the live `index.db`. It
+deliberately does *not* build a temp file and rename it over: the rename is
+atomic, but it replaces the inode, and any process that already had the index
+open goes on writing rows into a file nobody will open again. Nor does it clear
+the old rows first — that would publish an empty index for the whole embedding
+window, and a `propose` landing in that window judges against an empty vault and
+writes a duplicate note to disk, which no later `doctor` can undo. It passes
+`force` to `index_paths` instead: the hash check is skipped so every note is
+dirty, and the one write transaction that already swaps the vectors replaces
+every row and purges what the files no longer have. A failed rebuild rolls back
+whole, and no reader ever sees a half-rebuilt index. Doctor also carries
 the one migration the vault has: a discard log still sitting in `.vault/` is
 appended to `<root>/.discarded.log` and removed, once, before anything else
 touches `.vault/`, and the report says so. It runs only on a **repairing** run
 (the default, or `--rebuild`); `repair: false` is a report, and a report does
 not move files.
+
+**A directory the scan cannot read.** `os.walk` reports an unreadable directory
+as an empty one, so notes under it are invisible with nothing raised. That is the
+mirror of the index side, where EACCES on an already-indexed note raises rather
+than reading as a deletion — and the two are answered differently on purpose.
+Purging known-good rows because we could not look is destructive, so it raises;
+declining to add rows we never had is only a gap in visibility, and raising there
+would make one unreadable directory anywhere in the tree fail every `reindex`
+**and** `doctor --rebuild`, leaving the vault no way back. So the scan reports
+instead: `scan_vault` returns those directories alongside the paths,
+`IndexStats.unreadable` and `DoctorReport.unreadable` carry them, and both the
+pass summary and the doctor report name them — an operator is told the vault was
+only partly seen rather than reading the counts as the whole of it. This covers
+directories, which `os.walk` hides; an unreadable *file* still raises out of
+`read_raw`, and so out of `reindex` and `doctor`, because there the failure is
+visible and reporting it would mean deciding whether an unreadable note counts as
+one — a question with no answer the index can act on.
 
 `vault watch` — `watchfiles` (recursive) on the root, acting only on `.md` paths
 outside dot-directories, so the index's own writes under `.vault/` cannot feed
@@ -654,6 +681,49 @@ and `doctor` rebuilds every row from them.
 because that pass still holds the database handle: `await watcher.close()` before closing the database is what keeps a
 shutdown from racing a write. Queued paths are dropped rather than drained —
 nobody is waiting for them, and doctor knows where they are.
+
+## Concurrency
+
+The intended deployment is one writing process — a library caller holding one
+handle, or `vault watch`. What happens when that is not true was left unsaid,
+which is worse than a documented limitation: a caller cannot obey a rule nobody
+wrote down. So the boundary is drawn here, and the parts that can hold without a
+lock do.
+
+**Safe against any number of writers.** Every write to an existing note is
+check-and-write against the file's content hash, re-read at the moment of
+writing: the gate's update path, `mark_superseded` and `qualify` all refuse and
+report rather than overwrite a file that changed under them, which is the same
+mechanism that protects a human editing in Obsidian. `write_atomic` renames a
+finished temp file over the target, so no reader ever sees half a note. A note
+the gate authors claims its filename with `os.link`, which fails rather than
+overwrites — of two writers racing for `acme.md`, one gets it and the other
+moves to `acme-2.md` still holding its content. Discard-log entries are one
+`os.write` to a file opened `O_APPEND`, which POSIX makes atomic. A buffered
+writer would not do: an entry holds a whole candidate body, so it easily passes
+the 8KiB buffer, and an entry split across writes interleaves with another
+writer's and ruins both lines.
+
+**Safe because SQLite is.** The index is WAL with a 5s `busy_timeout`, so
+readers never block writers and separate processes share one index file. Write
+transactions are `begin immediate`: a deferred transaction takes the write lock
+only at its first write, and SQLite refuses *that* upgrade outright rather than
+waiting, so the lock is taken at the top where the timeout applies.
+
+**Safe by not moving the file.** `doctor --rebuild` used to rename a fresh index
+over `index.db`, which stranded any handle another process already held: it went
+on writing rows to the replaced inode, into a file nobody would open again. The
+rebuild now rewrites every row in the live database, inside the one transaction
+it was already taking, so there is no second inode to strand a handle on and no
+advisory lock for a watcher and a library handle to agree about. Coordination is
+avoided rather than implemented, which is the cheaper answer when it is available.
+
+**Not corruption, just waste.** Two reindex passes racing do redundant work and
+converge: every write is a per-path upsert, and the hash decides. One edge is not
+quite convergence — a pass decides which rows are `gone` *before* the embed await
+and purges after it, so a note another process creates in that window has its
+fresh row purged and stays unindexed until the next watcher event or `doctor`.
+The file is untouched, which is why this is waste and not loss.
 
 ## Testing / evals
 

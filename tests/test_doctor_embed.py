@@ -84,3 +84,22 @@ async def test_reopen_with_another_embedder_doctor_reembeds_and_search_works(
     # and the vault is usable again through the new embedder
     assert "notes/globex.md" in [h.path for h in await after.search("globex vendor")]
     after.close()
+
+
+async def test_a_rebuild_never_publishes_an_empty_index(make_vault: MakeVault) -> None:
+    """Clearing the old rows in their own transaction, before the embed, left every
+    other reader looking at a vault with no notes for the whole embed window — long
+    enough against a network provider that `propose` would judge against nothing and
+    write a duplicate note to disk. The rebuild is one transaction."""
+    root = make_vault(GRAPH)
+    await doctor(root, embedder)
+    seen: list[object] = []
+
+    async def watching(texts: list[str]) -> list[Vector]:
+        other = open_db(db_path(root))
+        seen.append(other.execute("select count(*) from notes").fetchone()[0])
+        other.close()
+        return [[1.0] * 32 for _ in texts]
+
+    await doctor(root, stub_embedder("watch-v1", 32, watching), DoctorOptions(rebuild=True))
+    assert seen == [5]  # the complete old index, right up to the commit

@@ -2,7 +2,6 @@
 what drifted, and report what only a human can fix."""
 
 import sqlite3
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,7 +10,7 @@ from .db import db_path, open_db
 from .discard_log import append_nofollow, discard_log, ensure_gitignore, read_nofollow
 from .discards import count_discards
 from .embed import Embedder
-from .indexer import read_note, reindex, scan_vault
+from .indexer import index_paths, read_note, reindex, scan_vault
 from .note import link_target
 
 
@@ -42,12 +41,13 @@ class DoctorReport:
     reembedded: bool  # every note was re-embedded: model or dims changed, or a rebuild
     migrated_discard_log: bool  # a log left in `.vault/` was moved beside the notes
     discards: dict[str, int]  # discard log: total entries, and those from the last 7 days
+    unreadable: list[str]  # directories the scan could not read: the vault is only partly seen
 
 
 @dataclass(frozen=True)
 class DoctorOptions:
     repair: bool = True  # reindex stale notes and purge deleted ones
-    rebuild: bool = False  # index into a temp DB and rename it over index.db
+    rebuild: bool = False  # rewrite every row from the files, hash check skipped
 
 
 async def doctor(
@@ -60,7 +60,7 @@ async def doctor(
     # `rm -rf .vault` from gone. Only on a repairing run; a report moves nothing.
     migrated = (opts.repair or opts.rebuild) and _migrate_discard_log(root)
     # Drift is measured before any repair, so the report says what was wrong.
-    stale, missing = _with_db(path, lambda db: _disk_drift(db, root))
+    stale, missing, unreadable = _with_db(path, lambda db: _disk_drift(db, root))
     reembedded = opts.rebuild
     if opts.rebuild:
         await _rebuild_index(root, embedder)
@@ -81,6 +81,7 @@ async def doctor(
         reembedded=reembedded,
         migrated_discard_log=migrated,
         discards=count_discards(root),
+        unreadable=unreadable,
     )
 
 
@@ -110,19 +111,20 @@ def _with_db[T](path: Path, fn: Callable[[sqlite3.Connection], T]) -> T:
         db.close()
 
 
-def _disk_drift(db: sqlite3.Connection, root: Path) -> tuple[list[str], list[str]]:
-    """(stale, missing): what the files say that the index does not.
+def _disk_drift(db: sqlite3.Connection, root: Path) -> tuple[list[str], list[str], list[str]]:
+    """(stale, missing, unreadable): what the files say that the index does not.
     ponytail: re-reads and re-hashes every note; gate on mtime if a vault gets huge."""
     indexed = {r["path"]: r["hash"] for r in db.execute("select path, hash from notes")}
     stale = []
-    for rel in scan_vault(root):
+    paths, unreadable = scan_vault(root)
+    for rel in paths:
         note = read_note(root, rel)
         if note is None:
             continue  # deleted while we looked: it counts as missing
         if indexed.get(rel) != note.hash:
             stale.append(rel)
         indexed.pop(rel, None)
-    return stale, sorted(indexed)
+    return stale, sorted(indexed), unreadable
 
 
 def _graph_report(
@@ -169,27 +171,16 @@ def _graph_report(
 
 
 async def _rebuild_index(root: Path, embedder: Embedder) -> None:
-    """Rebuild from the files into a temp DB, then rename it over index.db: a
-    half-finished rebuild can never become the live index.
-    ponytail: a watcher holding the old file keeps writing to the replaced inode;
-    those writes are lost, not corrupting, and the next doctor run recovers them."""
-    target = db_path(root)
-    tmp = target.with_name(f"{target.name}.rebuild-{uuid.uuid4().hex}")
-    db = open_db(tmp)
+    """Index the files again from scratch, in the live database. Nothing is
+    renamed over `index.db`: replacing the inode strands any handle another
+    process already has open, which then writes rows into a file nobody will open
+    again. `force` skips the hash check, so every note is rewritten inside the one
+    transaction that already replaces the vectors: a failed rebuild rolls back
+    whole, and no reader ever sees a vault this pass has emptied."""
+    db = open_db(db_path(root))
     try:
-        await reindex(db, root, embedder)
-        db.execute("pragma wal_checkpoint(truncate)")  # fold the WAL in before the rename
-    except BaseException:
+        # Scanned paths plus indexed ones, as `reindex` does: the extras are deletions.
+        indexed = [r["path"] for r in db.execute("select path from notes")]
+        await index_paths(db, root, embedder, [*scan_vault(root)[0], *indexed], force=True)
+    finally:
         db.close()
-        _rm_db(tmp)
-        raise
-    db.close()
-    _rm_db(target, journals_only=True)  # the old journal describes a database about to vanish
-    tmp.replace(target)
-
-
-def _rm_db(path: Path, journals_only: bool = False) -> None:
-    for suffix in ("-wal", "-shm"):
-        path.with_name(path.name + suffix).unlink(missing_ok=True)
-    if not journals_only:
-        path.unlink(missing_ok=True)

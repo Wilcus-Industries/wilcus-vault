@@ -12,7 +12,7 @@ from wilcus_vault.db import db_path, open_db
 from wilcus_vault.discards import list_discards
 from wilcus_vault.doctor import AmbiguousLink, DoctorOptions, LinkProblem, doctor
 from wilcus_vault.embed import TokenOverlapEmbedder
-from wilcus_vault.indexer import reindex
+from wilcus_vault.indexer import index_paths, reindex
 
 embedder = TokenOverlapEmbedder(32)
 
@@ -204,3 +204,40 @@ async def test_migration_never_writes_through_a_symlink_and_gitignores_the_log(
     (root / ".discarded.log").unlink()
     assert (await doctor(root, embedder, DoctorOptions(repair=True))).migrated_discard_log is True
     assert ".discarded.log*" in (root / ".gitignore").read_text()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+async def test_doctor_reports_directories_it_could_not_read(make_vault: MakeVault) -> None:
+    """Doctor is the operator's view of drift, and "we could not look here" is
+    drift it cannot repair: the notes under a locked directory are not missing."""
+    root = make_vault({"locked/secret.md": "# Secret\n", "open.md": "# Open\n"})
+    (root / "locked").chmod(0o000)
+    try:
+        report = await doctor(root, embedder, DoctorOptions(repair=False))
+        assert report.unreadable == ["locked"]
+    finally:
+        (root / "locked").chmod(0o755)
+
+
+async def test_rebuild_keeps_the_live_index_file_so_open_handles_are_not_stranded(
+    make_vault: MakeVault,
+) -> None:
+    """`--rebuild` used to rename a fresh index over `index.db`. A process that
+    already had the file open kept writing to the replaced inode — into a file
+    nothing would ever open again — so its rows were lost. The rebuild happens in
+    the live file instead, and there is no second inode to be stranded on."""
+    root = make_vault(GRAPH)
+    await doctor(root, embedder)
+    held = open_db(db_path(root))
+    inode = db_path(root).stat().st_ino
+    try:
+        await doctor(root, embedder, DoctorOptions(rebuild=True))
+        assert db_path(root).stat().st_ino == inode
+        write_note(root, "notes/after.md", "# After\n")
+        await index_paths(held, root, embedder, ["notes/after.md"])
+    finally:
+        held.close()
+    fresh = open_db(db_path(root))
+    rows = fresh.execute("select count(*) from notes where path = 'notes/after.md'").fetchone()
+    fresh.close()
+    assert rows[0] == 1  # the held handle wrote into the index everyone else reads

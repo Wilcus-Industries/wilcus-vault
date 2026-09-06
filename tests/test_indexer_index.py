@@ -21,7 +21,7 @@ def test_scan_md_only_dot_dirs_skipped_symlinks_never_followed(make_vault: MakeV
     other = make_vault({"secret.md": "# Secret\n"})
     os.symlink(other, root / "linked-dir")
     os.symlink(other / "secret.md", root / "linked.md")
-    assert scan_vault(root) == ["notes/acme.md", "notes/globex.md", "notes/lonely.md"]
+    assert scan_vault(root) == (["notes/acme.md", "notes/globex.md", "notes/lonely.md"], [])
 
 
 async def test_reindex_writes_notes_fts_vectors_and_edges(make_vault: MakeVault) -> None:
@@ -64,7 +64,7 @@ async def test_a_pass_with_nothing_changed_writes_nothing(make_vault: MakeVault)
     before = db.total_changes
     # the watcher's entry point: an editor saving identical bytes must not
     # dirty the database
-    stats = await index_paths(db, root, embedder, scan_vault(root))
+    stats = await index_paths(db, root, embedder, scan_vault(root)[0])
     assert stats == IndexStats(unchanged=3)
     assert db.total_changes == before
     db.close()
@@ -186,3 +186,43 @@ async def test_an_empty_vault_indexes_to_an_empty_database(make_vault: MakeVault
     assert (stats.added, stats.removed) == (0, 0)
     assert one(db, "select count(*) from notes") == 0
     db.close()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+async def test_an_unreadable_directory_raises_rather_than_purging_its_notes(
+    make_vault: MakeVault,
+) -> None:
+    """A directory we cannot read is not a directory whose notes are gone: EACCES
+    read as absence would silently drop every note under it from the index."""
+    root = make_vault({"locked/secret.md": "# Secret\n\nbody\n", "open.md": "# Open\n"})
+    db = open_index(root)
+    try:
+        assert (await reindex(db, root, embedder)).added == 2
+        (root / "locked").chmod(0o000)
+        try:
+            with pytest.raises(PermissionError):
+                await reindex(db, root, embedder)
+            rows = [r["path"] for r in db.execute("select path from notes order by path")]
+            assert "locked/secret.md" in rows  # not purged behind our back
+        finally:
+            (root / "locked").chmod(0o755)
+    finally:
+        db.close()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+async def test_a_never_indexed_unreadable_directory_is_reported_not_ignored(
+    make_vault: MakeVault,
+) -> None:
+    """os.walk swallows the scandir error, so notes under a directory we cannot
+    read are invisible with nothing raised. That is the twin of the purge: the
+    pass must say the vault was only partly visible, not read as a smaller vault."""
+    root = make_vault({"locked/secret.md": "# Secret\n", "open.md": "# Open\n"})
+    (root / "locked").chmod(0o000)
+    db = open_index(root)
+    try:
+        stats = await reindex(db, root, embedder)
+        assert (stats.added, stats.unreadable) == (1, ["locked"])
+    finally:
+        (root / "locked").chmod(0o755)
+        db.close()

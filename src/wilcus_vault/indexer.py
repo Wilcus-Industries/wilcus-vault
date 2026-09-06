@@ -1,9 +1,8 @@
-"""Files are truth: the scan is the input, the database is the output.
+"""Files are truth: the scan is the input, the database is the output. Dirtiness
+is decided by content hash, never the database's own bookkeeping, and one
+function (`index_paths`) writes every index row."""
 
-Dirtiness is decided by content hash, never by the database's own bookkeeping,
-and one function (`index_paths`) writes every index row.
-"""
-
+import errno
 import os
 import sqlite3
 import stat
@@ -22,6 +21,10 @@ from .term import VaultError, printable
 # against a pathological vault, not a tuning knob.
 QUALIFY_CAP = 500
 
+# The filesystem saying there is no note here. Anything else — EACCES on a
+# directory, EIO on a bad disk — means we could not look, which is not a deletion.
+_ABSENT = (errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP)
+
 
 @dataclass
 class IndexStats:
@@ -34,14 +37,18 @@ class IndexStats:
     # The re-index of rewritten linkers failed; their rows lag the files until
     # the next pass. Reported, not raised, so the stats still say what changed.
     index_error: str | None = None
+    unreadable: list[str] = field(default_factory=list)  # directories the scan could not read
 
 
-def scan_vault(root: str | Path) -> list[str]:
-    """Vault-relative paths of every `.md` file, sorted. Dot-directories are
-    skipped and symlinks are never followed."""
+def scan_vault(root: str | Path) -> tuple[list[str], list[str]]:
+    """Vault-relative paths of every `.md` file, sorted, and the directories the
+    scan could not read. Dot-directories are skipped, symlinks never followed.
+    `os.walk` reports an unreadable directory as an empty one — the same lie as
+    reading EACCES on a note as a deletion — so it is handed back instead."""
     root = Path(root)
     out = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    bad: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: bad.append(e.filename)):
         here = Path(dirpath)
         dirnames[:] = [d for d in dirnames if not d.startswith(".") and not (here / d).is_symlink()]
         for name in filenames:
@@ -50,7 +57,7 @@ def scan_vault(root: str | Path) -> list[str]:
                 continue
             if path.is_file():
                 out.append(path.relative_to(root).as_posix())
-    return sorted(out)
+    return sorted(out), sorted(Path(p).relative_to(root).as_posix() for p in bad if p)
 
 
 def is_note_path(rel: str) -> bool:
@@ -63,13 +70,17 @@ def note_entry(root: str | Path, rel: str) -> os.stat_result | None:
     """The lstat of a path that really holds a note, or None. Only a regular file
     is a note: a path that is gone, a directory, or a symlink holds none.
 
-    Any OSError is that same answer — a segment that is a file not a directory,
-    a name too long for the filesystem, a directory we may not read — so a
-    caller asking "is there a note here" never has to catch errno itself.
+    A segment that is a file not a directory, a name too long for the filesystem
+    and a symlink loop are all that same answer, so a caller asking "is there a
+    note here" never has to catch errno itself. Every other OSError is raised:
+    `index_paths` purges the rows of a path that answers None, and purging
+    because a directory went unreadable would lose the index behind our back.
     """
     try:
         entry = os.lstat(Path(root) / rel)
-    except OSError:
+    except OSError as e:
+        if e.errno not in _ABSENT:
+            raise
         return None
     return entry if stat.S_ISREG(entry.st_mode) else None
 
@@ -90,10 +101,11 @@ def read_note(root: str | Path, rel: str) -> Note | None:
 
 async def reindex(db: sqlite3.Connection, root: str | Path, embedder: Embedder) -> IndexStats:
     """Hash-diff the whole vault against the index and write only what changed."""
-    # Every path the files know plus every path the index knows: the ones only
-    # the index has are deletions, and index_paths purges them.
+    # Files' paths plus the index's: those only the index has are deletions.
     indexed = [r["path"] for r in db.execute("select path from notes")]
-    stats = await index_paths(db, root, embedder, [*scan_vault(root), *indexed])
+    paths, unreadable = scan_vault(root)
+    stats = await index_paths(db, root, embedder, [*paths, *indexed])
+    stats.unreadable = unreadable
     # Unconditional, unlike inside index_paths: an index written by an older
     # version may hold to_id values an older resolution rule produced.
     resolve_edges(db)
@@ -106,13 +118,15 @@ async def index_paths(
     embedder: Embedder,
     rels: Iterable[str],
     qualify_cap: int = QUALIFY_CAP,
+    force: bool = False,
 ) -> IndexStats:
     """Hash-diff exactly these paths and write only what changed; a path whose
     file is gone is purged. When the pass creates a stem collision, bare links
-    to the incumbent are rewritten to its qualified form after the commit."""
+    to the incumbent are rewritten to its qualified form after the commit.
+    `force` rebuilds: no hash check, so every path is rewritten in one pass."""
     root = Path(root)
     # Asked here, acted on inside the write transaction with the new vectors in hand.
-    reembedded = vectors_stale(db, embedder)
+    reembedded = force or vectors_stale(db, embedder)
     rows = db.execute("select id, path, hash, slug from notes").fetchall()
     by_path = {r["path"]: r for r in rows}
     embedded = {r["note_id"] for r in db.execute("select note_id from vector_meta")}
