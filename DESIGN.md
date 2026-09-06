@@ -630,6 +630,20 @@ touches `.vault/`, and the report says so. It runs only on a **repairing** run
 (the default, or `--rebuild`); `repair: false` is a report, and a report does
 not move files.
 
+
+**A directory the scan cannot read.** `os.walk` reports an unreadable directory
+as an empty one, so notes under it are invisible with nothing raised. That is the
+mirror of the index side, where EACCES on an already-indexed note raises rather
+than reading as a deletion — and the two are answered differently on purpose.
+Purging known-good rows because we could not look is destructive, so it raises;
+declining to add rows we never had is only a gap in visibility, and raising there
+would make one unreadable directory anywhere in the tree fail every `reindex`
+**and** `doctor --rebuild`, leaving the vault no way back. So the scan reports
+instead: `scan_vault` returns those directories alongside the paths,
+`IndexStats.unreadable` and `DoctorReport.unreadable` carry them, and both the
+pass summary and the doctor report name them — an operator is told the vault was
+only partly seen rather than reading the counts as the whole of it.
+
 `vault watch` — `watchfiles` (recursive) on the root, acting only on `.md` paths
 outside dot-directories, so the index's own writes under `.vault/` cannot feed
 the watcher its own tail. Debounce is **per path** (~250ms): an editor writing

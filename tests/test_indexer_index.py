@@ -21,7 +21,7 @@ def test_scan_md_only_dot_dirs_skipped_symlinks_never_followed(make_vault: MakeV
     other = make_vault({"secret.md": "# Secret\n"})
     os.symlink(other, root / "linked-dir")
     os.symlink(other / "secret.md", root / "linked.md")
-    assert scan_vault(root) == ["notes/acme.md", "notes/globex.md", "notes/lonely.md"]
+    assert scan_vault(root) == (["notes/acme.md", "notes/globex.md", "notes/lonely.md"], [])
 
 
 async def test_reindex_writes_notes_fts_vectors_and_edges(make_vault: MakeVault) -> None:
@@ -64,7 +64,7 @@ async def test_a_pass_with_nothing_changed_writes_nothing(make_vault: MakeVault)
     before = db.total_changes
     # the watcher's entry point: an editor saving identical bytes must not
     # dirty the database
-    stats = await index_paths(db, root, embedder, scan_vault(root))
+    stats = await index_paths(db, root, embedder, scan_vault(root)[0])
     assert stats == IndexStats(unchanged=3)
     assert db.total_changes == before
     db.close()
@@ -207,4 +207,22 @@ async def test_an_unreadable_directory_raises_rather_than_purging_its_notes(
         finally:
             (root / "locked").chmod(0o755)
     finally:
+        db.close()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+async def test_a_never_indexed_unreadable_directory_is_reported_not_ignored(
+    make_vault: MakeVault,
+) -> None:
+    """os.walk swallows the scandir error, so notes under a directory we cannot
+    read are invisible with nothing raised. That is the twin of the purge: the
+    pass must say the vault was only partly visible, not read as a smaller vault."""
+    root = make_vault({"locked/secret.md": "# Secret\n", "open.md": "# Open\n"})
+    (root / "locked").chmod(0o000)
+    db = open_index(root)
+    try:
+        stats = await reindex(db, root, embedder)
+        assert (stats.added, stats.unreadable) == (1, ["locked"])
+    finally:
+        (root / "locked").chmod(0o755)
         db.close()

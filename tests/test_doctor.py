@@ -204,3 +204,16 @@ async def test_migration_never_writes_through_a_symlink_and_gitignores_the_log(
     (root / ".discarded.log").unlink()
     assert (await doctor(root, embedder, DoctorOptions(repair=True))).migrated_discard_log is True
     assert ".discarded.log*" in (root / ".gitignore").read_text()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+async def test_doctor_reports_directories_it_could_not_read(make_vault: MakeVault) -> None:
+    """Doctor is the operator's view of drift, and "we could not look here" is
+    drift it cannot repair: the notes under a locked directory are not missing."""
+    root = make_vault({"locked/secret.md": "# Secret\n", "open.md": "# Open\n"})
+    (root / "locked").chmod(0o000)
+    try:
+        report = await doctor(root, embedder, DoctorOptions(repair=False))
+        assert report.unreadable == ["locked"]
+    finally:
+        (root / "locked").chmod(0o755)

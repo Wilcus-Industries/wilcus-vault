@@ -23,9 +23,8 @@ from .term import VaultError, printable
 # against a pathological vault, not a tuning knob.
 QUALIFY_CAP = 500
 
-# The filesystem saying there is no note at this path. Anything else — EACCES on
-# a directory, EIO on a bad disk — means we could not look, which is not the same
-# fact and must not read as a deletion.
+# The filesystem saying there is no note here. Anything else — EACCES on a
+# directory, EIO on a bad disk — means we could not look, which is not a deletion.
 _ABSENT = (errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP)
 
 
@@ -40,14 +39,18 @@ class IndexStats:
     # The re-index of rewritten linkers failed; their rows lag the files until
     # the next pass. Reported, not raised, so the stats still say what changed.
     index_error: str | None = None
+    unreadable: list[str] = field(default_factory=list)  # directories the scan could not read
 
 
-def scan_vault(root: str | Path) -> list[str]:
-    """Vault-relative paths of every `.md` file, sorted. Dot-directories are
-    skipped and symlinks are never followed."""
+def scan_vault(root: str | Path) -> tuple[list[str], list[str]]:
+    """Vault-relative paths of every `.md` file, sorted, and the directories the
+    scan could not read. Dot-directories are skipped, symlinks never followed.
+    `os.walk` reports an unreadable directory as an empty one — the same lie as
+    reading EACCES on a note as a deletion — so it is handed back instead."""
     root = Path(root)
     out = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    bad: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: bad.append(e.filename)):
         here = Path(dirpath)
         dirnames[:] = [d for d in dirnames if not d.startswith(".") and not (here / d).is_symlink()]
         for name in filenames:
@@ -56,7 +59,7 @@ def scan_vault(root: str | Path) -> list[str]:
                 continue
             if path.is_file():
                 out.append(path.relative_to(root).as_posix())
-    return sorted(out)
+    return sorted(out), sorted(Path(p).relative_to(root).as_posix() for p in bad)
 
 
 def is_note_path(rel: str) -> bool:
@@ -100,10 +103,11 @@ def read_note(root: str | Path, rel: str) -> Note | None:
 
 async def reindex(db: sqlite3.Connection, root: str | Path, embedder: Embedder) -> IndexStats:
     """Hash-diff the whole vault against the index and write only what changed."""
-    # Every path the files know plus every path the index knows: the ones only
-    # the index has are deletions, and index_paths purges them.
+    # Files' paths plus the index's: those only the index has are deletions.
     indexed = [r["path"] for r in db.execute("select path from notes")]
-    stats = await index_paths(db, root, embedder, [*scan_vault(root), *indexed])
+    paths, unreadable = scan_vault(root)
+    stats = await index_paths(db, root, embedder, [*paths, *indexed])
+    stats.unreadable = unreadable
     # Unconditional, unlike inside index_paths: an index written by an older
     # version may hold to_id values an older resolution rule produced.
     resolve_edges(db)

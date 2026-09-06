@@ -38,7 +38,7 @@ async def test_a_new_stem_collision_auto_qualifies_every_bare_link(make_vault: M
 
     # idempotent: the next pass has nothing to qualify and dirties nothing
     before = db.total_changes
-    again = await index_paths(db, root, embedder, scan_vault(root))
+    again = await index_paths(db, root, embedder, scan_vault(root)[0])
     assert again.qualified == []
     assert db.total_changes == before
     db.close()

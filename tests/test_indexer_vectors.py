@@ -78,7 +78,7 @@ async def test_a_note_with_no_tokens_gets_no_vector_row_and_stays_idempotent(
     # must not look half-indexed on the next pass (measured on `index_paths`:
     # `reindex` re-resolves edges on every run by design)
     before = db.total_changes
-    stats = await index_paths(db, root, embedder, scan_vault(root))
+    stats = await index_paths(db, root, embedder, scan_vault(root)[0])
     assert (stats.unchanged, stats.updated) == (2, 0)
     assert db.total_changes == before
     db.close()

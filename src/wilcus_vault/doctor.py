@@ -42,6 +42,7 @@ class DoctorReport:
     reembedded: bool  # every note was re-embedded: model or dims changed, or a rebuild
     migrated_discard_log: bool  # a log left in `.vault/` was moved beside the notes
     discards: dict[str, int]  # discard log: total entries, and those from the last 7 days
+    unreadable: list[str]  # directories the scan could not read: the vault is only partly seen
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,7 @@ async def doctor(
     # `rm -rf .vault` from gone. Only on a repairing run; a report moves nothing.
     migrated = (opts.repair or opts.rebuild) and _migrate_discard_log(root)
     # Drift is measured before any repair, so the report says what was wrong.
-    stale, missing = _with_db(path, lambda db: _disk_drift(db, root))
+    stale, missing, unreadable = _with_db(path, lambda db: _disk_drift(db, root))
     reembedded = opts.rebuild
     if opts.rebuild:
         await _rebuild_index(root, embedder)
@@ -81,6 +82,7 @@ async def doctor(
         reembedded=reembedded,
         migrated_discard_log=migrated,
         discards=count_discards(root),
+        unreadable=unreadable,
     )
 
 
@@ -110,19 +112,20 @@ def _with_db[T](path: Path, fn: Callable[[sqlite3.Connection], T]) -> T:
         db.close()
 
 
-def _disk_drift(db: sqlite3.Connection, root: Path) -> tuple[list[str], list[str]]:
-    """(stale, missing): what the files say that the index does not.
+def _disk_drift(db: sqlite3.Connection, root: Path) -> tuple[list[str], list[str], list[str]]:
+    """(stale, missing, unreadable): what the files say that the index does not.
     ponytail: re-reads and re-hashes every note; gate on mtime if a vault gets huge."""
     indexed = {r["path"]: r["hash"] for r in db.execute("select path, hash from notes")}
     stale = []
-    for rel in scan_vault(root):
+    paths, unreadable = scan_vault(root)
+    for rel in paths:
         note = read_note(root, rel)
         if note is None:
             continue  # deleted while we looked: it counts as missing
         if indexed.get(rel) != note.hash:
             stale.append(rel)
         indexed.pop(rel, None)
-    return stale, sorted(indexed)
+    return stale, sorted(indexed), unreadable
 
 
 def _graph_report(
