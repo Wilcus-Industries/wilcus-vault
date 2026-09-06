@@ -554,6 +554,53 @@ filesystem (macOS, Windows) a path spelled `Secret/plans.md` reaches the same
 file a `secret/` rule denies, so the rule does not cover it. One more reason
 the sentence above is the operative one — containment, not security.
 
+### Shaping a policy: read wide, write narrow
+
+The mechanism above says what a policy *can* express, not what one should say.
+The shape worth reaching for first, and the one the rules were separated to
+allow:
+
+```python
+{
+    "clerk": [
+        {"prefix": "", "read": True, "write": False},  # see the whole vault
+        {"prefix": "knowledge", "write": True},  # the shared memory
+        {"prefix": "agents/clerk", "write": True},  # identity, task state
+    ]
+}
+```
+
+Read and write resolve independently, so the root rule grants reads everywhere
+and the narrower rules add writes without taking reads away — a permission left
+out defers to the next-shorter matching rule rather than denying.
+
+**Reads should be wide.** Restricting them buys nothing defensive: scopes are
+advisory containment, and anything with filesystem access reads the notes
+anyway. What it costs is real — the gate decides against the similar notes the
+search returns, so an agent that cannot see a fact proposes a second copy of it.
+Narrowing reads to sharpen retrieval is solving a ranking problem with a
+permission, and it should be solved in ranking.
+
+**Writes are where containment belongs**, and the choice that matters is *where
+a shared fact lives*. If every agent writes only under `agents/<self>/`, a fact
+the clerk learns is visible to all but owned by the clerk: when another agent
+later refines it the gate refuses the cross-namespace write, falls back to an
+in-namespace `create`, and the vault ends up holding two drifting copies of one
+fact. A namespace every agent may write — `knowledge/` above — is what makes a
+fact learned once *the* fact. Concurrent writers to it are safe: every update is
+check-and-write against the file's hash, and a create claims its filename with a
+link that fails rather than overwrites.
+
+**Open question, not settled here.** A shared writable namespace makes the vault
+one memory rather than several, but it also means the decider chooses among
+every agent's notes on every propose, and nothing but the decider's judgement
+keeps one agent's proposal from landing on a note another agent depends on.
+Whether that wants a further rail — a per-call restriction on which note a
+single `propose` may target, which `ScopePolicy` cannot express because it is
+agent-keyed and fixed at `open()` — is undecided. The current answer is that a
+caller who asked to update a specific note checks the returned `GateResult.path`
+is the one it asked for.
+
 ## Consolidation pass
 
 Vaults accrete near-duplicates: the gate only sees top-k similar at write
