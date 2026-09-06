@@ -1,8 +1,6 @@
-"""Files are truth: the scan is the input, the database is the output.
-
-Dirtiness is decided by content hash, never by the database's own bookkeeping,
-and one function (`index_paths`) writes every index row.
-"""
+"""Files are truth: the scan is the input, the database is the output. Dirtiness
+is decided by content hash, never the database's own bookkeeping, and one
+function (`index_paths`) writes every index row."""
 
 import errno
 import os
@@ -59,7 +57,7 @@ def scan_vault(root: str | Path) -> tuple[list[str], list[str]]:
                 continue
             if path.is_file():
                 out.append(path.relative_to(root).as_posix())
-    return sorted(out), sorted(Path(p).relative_to(root).as_posix() for p in bad)
+    return sorted(out), sorted(Path(p).relative_to(root).as_posix() for p in bad if p)
 
 
 def is_note_path(rel: str) -> bool:
@@ -120,13 +118,15 @@ async def index_paths(
     embedder: Embedder,
     rels: Iterable[str],
     qualify_cap: int = QUALIFY_CAP,
+    force: bool = False,
 ) -> IndexStats:
     """Hash-diff exactly these paths and write only what changed; a path whose
     file is gone is purged. When the pass creates a stem collision, bare links
-    to the incumbent are rewritten to its qualified form after the commit."""
+    to the incumbent are rewritten to its qualified form after the commit.
+    `force` rebuilds: no hash check, so every path is rewritten in one pass."""
     root = Path(root)
     # Asked here, acted on inside the write transaction with the new vectors in hand.
-    reembedded = vectors_stale(db, embedder)
+    reembedded = force or vectors_stale(db, embedder)
     rows = db.execute("select id, path, hash, slug from notes").fetchall()
     by_path = {r["path"]: r for r in rows}
     embedded = {r["note_id"] for r in db.execute("select note_id from vector_meta")}

@@ -15,12 +15,7 @@ from wilcus_vault.term import VaultError
 from wilcus_vault.vault import open as open_vault
 
 
-async def test_a_failed_rebuild_leaves_a_stale_index_the_next_run_finishes(
-    make_vault: MakeVault,
-) -> None:
-    """The rebuild works in the live file, so a failure part-way through leaves a
-    partly filled index rather than the old one. That is the price of never
-    replacing the inode: stale is recoverable from the files, stranded is not."""
+async def test_a_failed_rebuild_leaves_no_temp_database(make_vault: MakeVault) -> None:
     root = make_vault(GRAPH)
     await doctor(root, embedder)
 
@@ -30,9 +25,8 @@ async def test_a_failed_rebuild_leaves_a_stale_index_the_next_run_finishes(
     boom = stub_embedder("boom-v1", 32, down)
     with pytest.raises(RuntimeError, match="provider down"):
         await doctor(root, boom, DoctorOptions(rebuild=True))
-    assert os.listdir(root / ".vault") == ["index.db"]  # no temp database either way
-    assert await doctor(root, embedder, DoctorOptions(rebuild=True)) is not None
-    assert len(snapshot(root)[0]) == 5  # the next run rebuilds it from the files
+    assert os.listdir(root / ".vault") == ["index.db"]
+    assert len(snapshot(root)[0]) == 5  # the live index is untouched
 
 
 async def test_survives_a_file_deleted_mid_run(make_vault: MakeVault) -> None:
@@ -90,3 +84,22 @@ async def test_reopen_with_another_embedder_doctor_reembeds_and_search_works(
     # and the vault is usable again through the new embedder
     assert "notes/globex.md" in [h.path for h in await after.search("globex vendor")]
     after.close()
+
+
+async def test_a_rebuild_never_publishes_an_empty_index(make_vault: MakeVault) -> None:
+    """Clearing the old rows in their own transaction, before the embed, left every
+    other reader looking at a vault with no notes for the whole embed window — long
+    enough against a network provider that `propose` would judge against nothing and
+    write a duplicate note to disk. The rebuild is one transaction."""
+    root = make_vault(GRAPH)
+    await doctor(root, embedder)
+    seen: list[object] = []
+
+    async def watching(texts: list[str]) -> list[Vector]:
+        other = open_db(db_path(root))
+        seen.append(other.execute("select count(*) from notes").fetchone()[0])
+        other.close()
+        return [[1.0] * 32 for _ in texts]
+
+    await doctor(root, stub_embedder("watch-v1", 32, watching), DoctorOptions(rebuild=True))
+    assert seen == [5]  # the complete old index, right up to the commit

@@ -6,11 +6,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .db import db_path, open_db, transaction
+from .db import db_path, open_db
 from .discard_log import append_nofollow, discard_log, ensure_gitignore, read_nofollow
 from .discards import count_discards
 from .embed import Embedder
-from .indexer import read_note, reindex, scan_vault
+from .indexer import index_paths, read_note, reindex, scan_vault
 from .note import link_target
 
 
@@ -47,7 +47,7 @@ class DoctorReport:
 @dataclass(frozen=True)
 class DoctorOptions:
     repair: bool = True  # reindex stale notes and purge deleted ones
-    rebuild: bool = False  # index into a temp DB and rename it over index.db
+    rebuild: bool = False  # rewrite every row from the files, hash check skipped
 
 
 async def doctor(
@@ -171,19 +171,16 @@ def _graph_report(
 
 
 async def _rebuild_index(root: Path, embedder: Embedder) -> None:
-    """Clear every derived row and index the files again, in the live database.
-    Nothing is renamed over `index.db`: replacing the inode strands any handle
-    another process already has open, which then writes rows into a file nobody
-    will open again. `vectors` is dropped rather than emptied so the rebuild
-    picks up the embedder's width even when the table predates it.
-    ponytail: a crash mid-rebuild leaves a partly filled index, not the old one —
-    stale, never corrupt, and the next doctor run finishes it from the files."""
+    """Index the files again from scratch, in the live database. Nothing is
+    renamed over `index.db`: replacing the inode strands any handle another
+    process already has open, which then writes rows into a file nobody will open
+    again. `force` skips the hash check, so every note is rewritten inside the one
+    transaction that already replaces the vectors: a failed rebuild rolls back
+    whole, and no reader ever sees a vault this pass has emptied."""
     db = open_db(db_path(root))
     try:
-        with transaction(db):
-            db.execute("drop table if exists vectors")
-            for table in ("notes", "edges", "notes_fts", "vector_meta"):
-                db.execute(f"delete from {table}")
-        await reindex(db, root, embedder)
+        # Scanned paths plus indexed ones, as `reindex` does: the extras are deletions.
+        indexed = [r["path"] for r in db.execute("select path from notes")]
+        await index_paths(db, root, embedder, [*scan_vault(root)[0], *indexed], force=True)
     finally:
         db.close()

@@ -214,3 +214,19 @@ async def test_get_a_path_that_cannot_hold_a_note_is_none_never_an_oserror(
     v = await open_vault()
     assert await v.get("ledger/q4.md/nested.md") is None  # ENOTDIR: a file used as a directory
     assert await v.get("ledger/" + "x" * 300 + ".md") is None  # ENAMETOOLONG
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+async def test_get_raises_a_vault_error_when_it_cannot_read_rather_than_answering_none(
+    open_vault: OpenVault,
+) -> None:
+    """Saying "I could not look" is not saying "there is nothing there", so it
+    raises — as a VaultError, the one failure type this surface uses, so a caller
+    catching the public error type does not get a bare PermissionError instead."""
+    v = await open_vault({"locked/secret.md": "# Secret\n"})
+    (v.root / "locked").chmod(0o000)
+    try:
+        with pytest.raises(VaultError, match="cannot read"):
+            await v.get("locked/secret.md")
+    finally:
+        (v.root / "locked").chmod(0o755)

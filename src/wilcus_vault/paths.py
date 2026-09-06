@@ -45,7 +45,9 @@ def confined_path(root: str | Path, rel: str) -> Path:
 
 def _staged(abs_path: Path, text: str) -> Path:
     """`text` in a temp file beside its target, ready to be moved into place. The
-    temp name is not `.md`, so a crash leaves nothing the scan indexes."""
+    temp name is not `.md`, so a crash leaves nothing the scan indexes.
+    ponytail: a failed write leaves the temp file behind; sweep them in doctor if
+    a full disk ever turns that into more than clutter."""
     tmp = abs_path.with_name(f"{abs_path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
     tmp.write_text(text, encoding="utf-8", newline="")
     return tmp
@@ -70,8 +72,23 @@ def write_new(abs_path: Path, text: str) -> bool:
         os.link(tmp, abs_path)
     except FileExistsError:
         return False
+    except OSError:
+        # No hardlinks on this filesystem (FAT, some FUSE and network mounts).
+        # `O_EXCL` claims the name just as exclusively; the note is written in
+        # place rather than moved in, which is the lesser loss on such a mount.
+        return _write_exclusive(abs_path, text)
     finally:
         tmp.unlink(missing_ok=True)
+    return True
+
+
+def _write_exclusive(abs_path: Path, text: str) -> bool:
+    try:
+        fd = os.open(abs_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
     return True
 
 
