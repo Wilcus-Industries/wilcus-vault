@@ -554,63 +554,76 @@ filesystem (macOS, Windows) a path spelled `Secret/plans.md` reaches the same
 file a `secret/` rule denies, so the rule does not cover it. One more reason
 the sentence above is the operative one — containment, not security.
 
-### Shaping a policy: read wide, write narrow
+### One shared memory, and how to carve exceptions in it
 
-The mechanism above says what a policy *can* express, not what one should say.
-The shape worth reaching for first, and the one the rules were separated to
-allow:
+**The vault is one memory, not one memory per agent.** A fact the clerk learns
+is *the* fact: one note, which any agent may later refine in place. That is the
+default and it needs no configuration — `open()` without a `scopes=` policy
+already gives every agent the whole vault, and the concurrency rails make
+shared writing safe (every update is check-and-write against the file's hash,
+every create claims its filename with a link that fails rather than
+overwrites).
+
+Per-agent partitioning is what a policy is *not* for. If every agent could only
+write under `agents/<self>/`, a fact the clerk learned would be visible to all
+but owned by the clerk: another agent refining it gets the cross-namespace write
+refused, falls back to an in-namespace `create`, and the vault holds two
+drifting copies of one fact. Namespaces are for *topics* — `customers/`,
+`ledger/` — not for authorship. Authorship is already recorded, in the
+`vault_agent` frontmatter the gate stamps on every note it writes.
+
+What a policy *is* for is the narrow exception: a subtree some agent must not
+write. The shape to reach for, and the one read and write were resolved
+separately to allow:
 
 ```python
 {
     "clerk": [
-        {"prefix": "", "read": True, "write": False},  # see the whole vault
-        {"prefix": "knowledge", "write": True},  # the shared memory
-        {"prefix": "agents/clerk", "write": True},  # identity, task state
+        {"prefix": "", "read": True, "write": True},  # the shared memory
+        {"prefix": "ledger", "write": False},  # ...except the numbers
     ]
 }
 ```
 
-Read and write resolve independently, so the root rule grants reads everywhere
-and the narrower rules add writes without taking reads away — a permission left
-out defers to the next-shorter matching rule rather than denying.
-
-**Reads should be wide.** Restricting them buys nothing defensive: scopes are
+**Reads should stay wide.** Narrowing them buys nothing defensive — scopes are
 advisory containment, and anything with filesystem access reads the notes
-anyway. What it costs is real — the gate decides against the similar notes the
-search returns, so an agent that cannot see a fact proposes a second copy of it.
-Narrowing reads to sharpen retrieval is solving a ranking problem with a
-permission, and it should be solved in ranking.
+anyway. What it costs is real: the gate decides against the similar notes the
+search returns, so an agent that cannot *see* a fact proposes a second copy of
+it. Narrowing reads to sharpen retrieval is solving a ranking problem with a
+permission, and it belongs in ranking.
 
-**Writes are where containment belongs**, and the choice that matters is *where
-a shared fact lives*. If every agent writes only under `agents/<self>/`, a fact
-the clerk learns is visible to all but owned by the clerk: when another agent
-later refines it the gate refuses the cross-namespace write, falls back to an
-in-namespace `create`, and the vault ends up holding two drifting copies of one
-fact. A namespace every agent may write — `knowledge/` above — is what makes a
-fact learned once *the* fact. Concurrent writers to it are safe: every update is
-check-and-write against the file's hash, and a create claims its filename with a
-link that fails rather than overwrites.
+**The decider is the rail, and that is accepted.** One shared memory means the
+decider chooses among every agent's notes on every propose, and nothing but its
+judgement keeps one agent's proposal off a note another agent depends on. A
+per-call restriction on which note a single `propose` may target would not help:
+the target is *deliberately* shared, so confining a call to its caller's
+namespace defeats the model rather than protects it — and `ScopePolicy` could
+not express it anyway, being agent-keyed and fixed at `open()`. A caller that
+asked to update a specific note checks the returned `GateResult.path` is the one
+it asked for. That is the whole guarantee, and it is enough: a wrong landing is
+a bad edit to a versioned text file, not a loss.
 
-**What splits along that line.** `knowledge/` holds facts about the *world* —
-what is true, learned once and refined in place by whoever learns more.
-`agents/<self>/` holds facts about *that agent* — its identity, its task state,
-its own working notes: things that are only ever true of one agent, where a
-second agent's copy would be wrong rather than duplicated. The test is not "who
-learned it" but "who is it about". A fact the clerk learns about the ledger is a
-ledger fact and belongs in `knowledge/`; the clerk's own half-finished task does
-not become everyone's when another agent reads it.
+### Not built: per-agent memory
 
-**The decider is the rail, and that is accepted.** A shared writable namespace
-means the decider chooses among every agent's notes on every propose, and
-nothing but its judgement keeps one agent's proposal off a note another agent
-depends on. A per-call restriction on which note a single `propose` may target
-would not help here: the target is *deliberately* shared, so confining a call to
-its own namespace would defeat the model rather than protect it — and
-`ScopePolicy` could not express it anyway, being agent-keyed and fixed at
-`open()`. A caller that asked to update a specific note checks the returned
-`GateResult.path` is the one it asked for; that is the whole guarantee, and it is
-enough because a wrong landing is a bad edit to a versioned text file, not a
-loss.
+Recorded so it is not re-derived, and deliberately **not designed here**. The
+system above is memory of the *world*, and its mechanism suits that: an agent
+proposes a fact, a decider decides where it lands, and it may be merged into an
+existing note or discarded outright. An agent's memory of *itself* — a
+scratchpad, notes worth reloading every session, how to drive a particular tool,
+a workflow it has settled on — wants the opposite mechanism: the agent names the
+path, the note lands there, no decider judges it and nothing discards it. Those
+are two systems that would share one file tree, not one system with two
+namespaces.
+
+The gap in the current surface is exactly one thing: `propose` is the only write
+path. Direct reads already exist (`get`, `list`). Whether that second system
+gets built, whether its notes are embedded at all (a scratchpad rewritten thirty
+times a session is thirty embeddings, and agent chatter dilutes the brain's
+retrieval), and whether the gate may target the agent's own subtree, are all
+open. One idea worth keeping if it is: when the same fact turns up in two
+agents' own memories, that is evidence it is not about either of them — the
+consolidation pass promoting it into the shared memory is the natural home for
+that rule.
 
 ## Consolidation pass
 
