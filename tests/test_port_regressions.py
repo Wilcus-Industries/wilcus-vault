@@ -164,7 +164,7 @@ async def test_discards_show_with_a_unicode_digit_prints_usage(
 
 
 def test_watch_pass_is_only_reported_when_something_changed() -> None:
-    from wilcus_vault.cli_commands import pass_line
+    from wilcus_vault.cli.commands import pass_line
     from wilcus_vault.indexer import IndexStats
 
     assert pass_line(["a.md"], IndexStats(unchanged=1)) is None

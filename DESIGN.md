@@ -57,9 +57,10 @@ src/wilcus_vault/
   merge.py          # the merger contract: MergedNote, merge_prompt, parse_merged
   consolidate.py    # the consolidation pass over those clusters, dry-run by default
   watch.py          # watchfiles + per-path debounce + hash dirty-check → index_paths
-  cli.py            # vault reindex|doctor|search|watch|consolidate|discards — arg parsing
-  cli_commands.py   # the subcommands that need more than a line
-  cli_usage.py      # help text and report formatting
+  cli/
+    __init__.py     # vault reindex|doctor|search|watch|consolidate|discards — arg parsing
+    commands.py     # the subcommands that need more than a line
+    usage.py        # help text and report formatting
 tests/
   conftest.py       # make_vault / write_note / vec_of, VAULT_* env cleared per test
   fakes.py          # stub embedder, recording transport, fixed decider
