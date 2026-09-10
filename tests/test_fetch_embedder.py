@@ -1,9 +1,10 @@
 """FetchEmbedder over the wire: request shape, batching, redaction, response checks."""
 
 import json
+from typing import cast
 
 import pytest
-from fakes import stub_transport
+from fakes import StubTransport, stub_transport
 
 from wilcus_vault.fetch_embedder import FetchEmbedder
 from wilcus_vault.term import VaultError
@@ -124,3 +125,47 @@ async def test_rejects_a_response_that_does_not_match_the_request() -> None:
     narrow = FetchEmbedder(api_key=KEY, dims=4, model="m-1", transport=stub_transport(2))
     with pytest.raises(VaultError, match=r"(?s)m-1.*width 2.*expected 4"):
         await narrow.embed(["a"])
+
+
+def _flaky(dims: int, failures: list[tuple[int, str]]) -> StubTransport:
+    """A transport that serves `failures` in order, then embeds normally.
+    A failure of status 0 is raised as a timeout rather than answered."""
+    served = 0
+
+    def reply(payload: dict[str, object]) -> tuple[int, str]:
+        nonlocal served
+        if served < len(failures):
+            status, text = failures[served]
+            served += 1
+            if status == 0:
+                raise TimeoutError(text)
+            return status, text
+        texts = cast(list[str], payload["input"])
+        data = [{"index": i, "embedding": [float(len(t))] * dims} for i, t in enumerate(texts)]
+        return 200, json.dumps({"data": data})
+
+    return stub_transport(dims, reply)
+
+
+async def test_a_transient_provider_failure_is_retried_not_thrown_away() -> None:
+    """A rebuild re-embeds the whole vault in one pass; one 503 must not lose it."""
+    t = _flaky(2, [(503, "upstream busy"), (429, "slow down")])
+    e = FetchEmbedder(api_key=KEY, dims=2, transport=t, backoff=0)
+    assert await e.embed(["a", "bb"]) == [[1.0, 1.0], [2.0, 2.0]]
+    assert len(t.calls) == 3
+
+
+async def test_a_timeout_is_retried_too() -> None:
+    t = _flaky(2, [(0, "read timed out")])
+    e = FetchEmbedder(api_key=KEY, dims=2, transport=t, backoff=0)
+    assert await e.embed(["a"]) == [[1.0, 1.0]]
+    assert len(t.calls) == 2
+
+
+async def test_a_rejected_request_is_not_retried() -> None:
+    """A bad key or an unknown model fails the same way however many times it is asked."""
+    t = _flaky(2, [(401, "bad key"), (401, "bad key")])
+    e = FetchEmbedder(api_key=KEY, dims=2, transport=t, backoff=0)
+    with pytest.raises(VaultError):
+        await e.embed(["a"])
+    assert len(t.calls) == 1

@@ -21,7 +21,7 @@ from .discard_log import log_candidate
 from .embed import Embedder
 from .frontmatter import patch_frontmatter, replace_body
 from .gate_write import PROVENANCE_KEYS, GateResult, create, mark_superseded, provenance
-from .indexer import read_raw, reindex
+from .indexer import index_paths, read_raw, reindex
 from .note import parse_note
 from .paths import confined_path, now, write_atomic
 from .scope import ALLOW_ALL, Scope, VaultContext, normalize_prefix
@@ -69,9 +69,10 @@ async def propose(
         raise VaultError(f'write gate: "{safe(agent)}" may not write to {where}')
 
     applied: GateResult | None = None
-    for attempt in range(2):
-        if attempt > 0:
-            await reindex(db, base, embedder)  # the aborting edit is on disk, not yet indexed
+    stale: str | None = None  # a target that changed under us: on disk, not yet indexed
+    for _ in range(2):
+        if stale is not None:
+            await index_paths(db, base, embedder, [stale])
         similar = await _find_similar(db, base, embedder, candidate, options, scope)
         decision = check_decision(await options.decider(DeciderInput(candidate, similar)))
         if decision.target is not None and not any(s.note.path == decision.target for s in similar):
@@ -85,10 +86,14 @@ async def propose(
         applied = await _apply(db, base, candidate, namespace, decision, similar, ctx)
         if applied is not None:
             break
+        stale = decision.target
     fell_back = applied is None
     if applied is None:
         applied = await create(db, base, candidate, namespace, None, ctx)
-    await reindex(db, base, embedder)  # the index never lags a write we made ourselves
+    # The index never lags a write we made ourselves, and the next call's search
+    # sees what humans changed behind our back: both need the whole pass, which
+    # `index_paths` keeps cheap by reading only what the mtimes say moved.
+    await reindex(db, base, embedder)
     return GateResult(applied.action, applied.path, applied.superseded, applied.unmarked, fell_back)
 
 

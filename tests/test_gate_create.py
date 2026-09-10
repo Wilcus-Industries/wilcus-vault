@@ -164,3 +164,20 @@ async def test_a_filename_taken_after_the_index_check_is_never_overwritten(
     assert r.path is not None and r.path.endswith("-2.md")  # moved on, did not clobber
     assert taken[0].read_text() == "not ours\n"  # the other writer's note stands
     v.close()
+
+
+async def test_the_closing_pass_still_sees_a_note_edited_behind_our_back(
+    make_vault: MakeVault,
+) -> None:
+    """Freshness is why the pass is whole: an out-of-band edit must reach the index,
+    or the gate's next similarity search is blind to it and duplicates it."""
+    v = await open_gate(make_vault(VAULT), CREATE)
+    await v.propose(CANDIDATE)
+
+    edited = Path(v.root) / "notes/support-rota.md"
+    edited.write_text("# Support rota\n\nAcme renewal pricing moved to the rota.\n")
+    await v.propose(replace(CANDIDATE, title="Another note"))  # any write runs the pass
+
+    hits = [h.path for h in await v.search("acme renewal pricing moved rota")]
+    assert "notes/support-rota.md" in hits
+    v.close()
