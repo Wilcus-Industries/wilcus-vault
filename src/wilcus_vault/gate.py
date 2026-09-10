@@ -90,9 +90,10 @@ async def propose(
     fell_back = applied is None
     if applied is None:
         applied = await create(db, base, candidate, namespace, None, ctx)
-    # The index never lags a write we made ourselves, and the next call's search
-    # sees what humans changed behind our back: both need the whole pass, which
-    # `index_paths` keeps cheap by reading only what the mtimes say moved.
+    # Whole on purpose, and it is the expensive part of a propose: dirtiness is
+    # decided by content hash, so this re-reads every note in the vault. What it
+    # buys is the next call's search seeing a note a human edited behind our back
+    # — without which the gate re-creates notes that already exist.
     await reindex(db, base, embedder)
     return GateResult(applied.action, applied.path, applied.superseded, applied.unmarked, fell_back)
 

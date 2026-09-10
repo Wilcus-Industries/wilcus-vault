@@ -2,11 +2,13 @@
 
 import json
 from typing import cast
+from urllib.error import URLError
 
 import pytest
 from fakes import StubTransport, stub_transport
 
 from wilcus_vault.fetch_embedder import FetchEmbedder
+from wilcus_vault.http import Transient
 from wilcus_vault.term import VaultError
 
 KEY = "sk-test-do-not-log-me"
@@ -169,3 +171,32 @@ async def test_a_rejected_request_is_not_retried() -> None:
     with pytest.raises(VaultError):
         await e.embed(["a"])
     assert len(t.calls) == 1
+
+
+async def test_the_retry_budget_is_finite_and_the_last_failure_is_the_one_raised() -> None:
+    """Three 503s exhaust the default budget: the third is raised, not swallowed,
+    and no fourth request is made."""
+    t = _flaky(2, [(503, "one"), (503, "two"), (503, "the last one")])
+    e = FetchEmbedder(api_key=KEY, dims=2, transport=t, backoff=0)
+    with pytest.raises(Transient, match="the last one"):
+        await e.embed(["a"])
+    assert len(t.calls) == 3
+
+
+async def test_a_dropped_connection_is_transient_but_a_refused_one_is_not() -> None:
+    """The overload case and the nothing-is-listening case look alike and are not:
+    a provider that accepted the connection and dropped it is worth asking again."""
+
+    async def dropped(*_: object) -> tuple[int, str]:
+        raise URLError(ConnectionResetError(104, "Connection reset by peer"))
+
+    e = FetchEmbedder(api_key=KEY, dims=2, transport=dropped, backoff=0)
+    with pytest.raises(Transient):
+        await e.embed(["a"])
+
+    async def refused(*_: object) -> tuple[int, str]:
+        raise URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    local = FetchEmbedder(dims=2, transport=refused, backoff=0)
+    with pytest.raises(VaultError, match="no embedder configured"):
+        await local.embed(["a"])

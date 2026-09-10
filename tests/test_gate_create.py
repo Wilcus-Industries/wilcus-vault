@@ -10,7 +10,9 @@ from conftest import MakeVault
 from fakes import fixed_decider
 from gate_common import CANDIDATE, EMBEDDER, NOTHING_SIMILAR, OLD_NOTE, VAULT, open_gate, read
 
+from wilcus_vault.db import db_path, open_db
 from wilcus_vault.decision import DeciderInput, Decision
+from wilcus_vault.note import parse_note
 from wilcus_vault.paths import slugify
 from wilcus_vault.search_sql import Cutoffs
 from wilcus_vault.term import VaultError
@@ -169,15 +171,28 @@ async def test_a_filename_taken_after_the_index_check_is_never_overwritten(
 async def test_the_closing_pass_still_sees_a_note_edited_behind_our_back(
     make_vault: MakeVault,
 ) -> None:
-    """Freshness is why the pass is whole: an out-of-band edit must reach the index,
-    or the gate's next similarity search is blind to it and duplicates it."""
+    """Freshness is why the closing pass is whole: an out-of-band edit has to reach
+    the index, or the next call's similarity search is blind to it and duplicates it.
+
+    Asserted on the indexed hash rather than on search: a stale row keeps its old
+    title and body, which can still match a query for reasons that have nothing to
+    do with the edit.
+    """
     v = await open_gate(make_vault(VAULT), CREATE)
     await v.propose(CANDIDATE)
 
-    edited = Path(v.root) / "notes/support-rota.md"
-    edited.write_text("# Support rota\n\nAcme renewal pricing moved to the rota.\n")
-    await v.propose(replace(CANDIDATE, title="Another note"))  # any write runs the pass
+    rel = "notes/support-rota.md"
+    edited = Path(v.root) / rel
+    edited.write_text("# Support rota\n\nThe pager rota moved to the renewal calendar.\n")
+    fresh = parse_note(edited.read_text(), rel).hash
 
-    hits = [h.path for h in await v.search("acme renewal pricing moved rota")]
-    assert "notes/support-rota.md" in hits
-    v.close()
+    db = open_db(db_path(v.root))
+    try:
+        stale = db.execute("select hash from notes where path = ?", (rel,)).fetchone()["hash"]
+        assert stale != fresh  # nothing has told the index yet
+        await v.propose(replace(CANDIDATE, title="Another note"))  # any write runs the pass
+        indexed = db.execute("select hash from notes where path = ?", (rel,)).fetchone()["hash"]
+        assert indexed == fresh, "the closing pass did not re-read a note edited on disk"
+    finally:
+        db.close()
+        v.close()

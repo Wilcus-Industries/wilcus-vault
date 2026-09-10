@@ -7,6 +7,8 @@ provider is an explicit choice, and one that must name its model and dims.
 import asyncio
 import math
 import os
+import random
+from http.client import RemoteDisconnected
 
 from .embed import Vector
 from .http import (
@@ -17,7 +19,7 @@ from .http import (
     post_json,
     resolve_endpoint,
 )
-from .term import VaultError
+from .term import VaultError, printable
 
 LOCAL_ENDPOINT = "http://localhost:11434/v1/embeddings"
 LOCAL_MODEL = "all-minilm"
@@ -94,7 +96,9 @@ class FetchEmbedder:
             try:
                 return self._vectors(await self._attempt(texts), texts)
             except (Transient, TimeoutError):
-                await asyncio.sleep(self._backoff * 2**attempt)
+                # Jittered: a shared provider 503s every caller at once, and a fixed
+                # delay would have them all come back in lockstep and do it again.
+                await asyncio.sleep(self._backoff * 2**attempt * random.uniform(0.5, 1.5))
         return self._vectors(await self._attempt(texts), texts)
 
     async def _attempt(self, texts: list[str]) -> object:
@@ -111,6 +115,11 @@ class FetchEmbedder:
         except (VaultError, TimeoutError):
             raise
         except Exception as e:
+            # A connection the provider accepted and then dropped is the overload
+            # case, not the absent case: worth asking again. One nobody accepted
+            # means nothing is listening, which no amount of retrying fixes.
+            if isinstance(getattr(e, "reason", e), RemoteDisconnected | ConnectionResetError):
+                raise Transient(f"embedder {self.model}: {printable(e)}") from e
             # Nothing is listening on the default endpoint: say what to do, once.
             # No retry and no fallback to a cloud provider. A chosen endpoint
             # keeps its own error, since `ollama pull` is not the fix for it.
