@@ -12,9 +12,9 @@ RRF_K = 60
 
 OVERFETCH = 3  # k = 3×N per signal: the cut that answers almost every search
 
-# vec0 refuses a larger `k` outright. It bounds how far the widened pass below
-# can reach, so on a vault past this size a thinly-scoped agent can still be
-# crowded out — by the whole index rather than by 3×N of it.
+# vec0 refuses a larger `k` outright, whatever the caller asked for. Every k
+# goes through this clamp: `n` is public API input, and 3×N crosses it at
+# n=1366 on a vault of any size.
 MAX_KNN = 4096
 
 
@@ -49,23 +49,54 @@ def fuse(
 ) -> list[SearchHit]:
     """Both signals, their cutoffs and the RRF fusion, at a cut wide enough to answer.
 
-    Each signal takes its best rows *before* the scope and supersede filters run,
-    so a fixed cut starves: an agent scoped to a thin slice sees the notes it may
-    not read fill the cut, and gets nothing while a perfectly good readable answer
-    sits just outside it. The width needed to reach past that crowd is a property
-    of the vault, not a constant — so when the usual cut comes up short, the query
-    is asked again over the whole index, which cannot starve because there is
-    nothing left outside it. The wide pass costs a full scan and only happens when
-    the narrow one failed to fill the answer.
+    Widens to the whole index only when a signal filled its cut with rows that
+    then failed the scope or supersede filter — see § Retrieval.
     """
-    rows = _fuse(db, vector, match, n, cutoffs, scope, OVERFETCH * n)
-    if len(rows) >= n:
+    narrow = OVERFETCH * n
+    rows = _fuse(db, vector, match, n, cutoffs, scope, narrow)
+    if len(rows) >= n or not _saturated(db, vector, match, cutoffs, narrow):
         return rows
     total = int(db.execute("select count(*) from notes").fetchone()[0])
-    cut = min(total, MAX_KNN) if vector is not None else total
-    if OVERFETCH * n >= cut:
-        return rows  # the narrow cut already reached as wide as this one could
-    return _fuse(db, vector, match, n, cutoffs, scope, cut)
+    if narrow >= total:
+        return rows  # the narrow cut already covered the whole index
+    return _fuse(db, vector, match, n, cutoffs, scope, total)
+
+
+def _saturated(
+    db: sqlite3.Connection,
+    vector: Vector | None,
+    match: str | None,
+    cutoffs: Cutoffs,
+    cut: int,
+) -> bool:
+    """Did either signal fill `cut` with rows that passed its own cutoff?
+
+    Only then can a wider cut find anything. Each ceiling bounds the very
+    quantity its signal is ordered by, so a row the ceiling rejected inside the
+    cut has no better twin outside it: a short answer there means the query is
+    exhausted, not crowded out. Without this the write gate — which must set a
+    cutoff, and whose candidates are usually novel — would widen on every write
+    to re-derive the same empty answer.
+    """
+    if vector is not None:
+        k = min(cut, MAX_KNN)
+        sql = "select count(*) from (select distance from vectors where emb match ? and k = ?)"
+        params: list[object] = [to_blob(vector), k]
+        if cutoffs.distance_ceiling is not None:
+            sql += " where distance <= ?"
+            params.append(cutoffs.distance_ceiling)
+        if int(db.execute(sql, params).fetchone()[0]) >= k:
+            return True
+    if match is not None:
+        sql = """select count(*) from (select rank as score from notes_fts
+                 where notes_fts match ? order by rank, rowid limit ?)"""
+        params = [match, cut]
+        if cutoffs.bm25_ceiling is not None:
+            sql += " where score <= ?"
+            params.append(cutoffs.bm25_ceiling)
+        if int(db.execute(sql, params).fetchone()[0]) >= cut:
+            return True
+    return False
 
 
 def _fuse(
@@ -83,7 +114,7 @@ def _fuse(
     knn = "select null as id, 0.0 as distance where 0"
     if vector is not None:
         knn = "select note_id as id, distance from vectors where emb match ? and k = ?"
-        params += [to_blob(vector), cut]
+        params += [to_blob(vector), min(cut, MAX_KNN)]
     params += readable_params
     vec_cutoff = ""
     if cutoffs.distance_ceiling is not None:

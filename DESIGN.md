@@ -177,15 +177,21 @@ repair the vault.
 
 Embed query → vec0 KNN with over-fetch (`k = 3×N`) and FTS5 BM25 `LIMIT 3×N`.
 That cut is taken *before* the supersede and scope filters run, so it can be
-eaten entirely by rows those filters then drop; when it is, and fewer than N
-hits survive, the whole query is asked again over the entire index, which
-cannot starve because nothing is left outside it. The width needed to reach
-past a crowd of unreadable notes is a property of the vault, not a constant, so
-it is measured rather than guessed. The wide pass is a full scan (~6ms at 1k
-notes, ~28ms at 5k) and only runs when the narrow one came up short. One limit
-survives: vec0 refuses `k` above 4096, so on a vault larger than that a thinly
-scoped agent can still be crowded out — by the whole index rather than by 3×N
-of it. **Relevance cutoffs apply per signal,
+eaten entirely by rows those filters then drop. When fewer than N hits survive
+**and** a signal filled its cut with rows that passed its own cutoff, the query
+is asked again over the entire index, which cannot starve because nothing is
+left outside it. Both conditions matter: the width needed to reach past a crowd
+is a property of the vault rather than a constant, but a *short* cut after the
+cutoff means the query is exhausted, not crowded — each ceiling bounds the very
+quantity its signal is ordered by, so a row rejected inside the cut has no
+better twin outside it. Without that second test the write gate, which must set
+a cutoff and whose candidates are usually novel, would widen on every write to
+re-derive the same empty answer. The wide pass is a full scan (~6ms at 1k notes,
+~28ms at 5k) and only runs when both conditions hold. One limit survives, on the
+KNN side alone: vec0 refuses `k` above 4096 (every `k` is clamped to it, since
+3×N crosses it at N=1366), so on a larger vault a thinly scoped agent can still
+be crowded out of the *vector* signal — by the whole index rather than by 3×N
+of it. The FTS side has no such ceiling and always widens to the whole index. **Relevance cutoffs apply per signal,
 before fusion** — cosine-distance ceiling on the KNN side, BM25 ceiling on the
 FTS side — because RRF scores are ordinal (top hit always scores 1/61 no matter
 how bad it is); a threshold on the fused score cannot filter irrelevance. RRF
@@ -538,15 +544,12 @@ Enforcement points, all inside the library so no caller re-implements them:
 
 - `search` — the scope filter runs over the **over-fetched** set (alongside
   the supersede filter, before RRF caps at N), so a scoped agent gets **up
-  to** N readable hits. This clause used to say that an agent scoped to a thin
-  slice "sees fewer" and that the over-fetch factor was where the fix went. Both
-  halves were wrong. It does not see fewer: with enough unreadable notes ahead
-  of it, it sees **none at all** — measured at 0 hits with 50 unreadable matches
-  and 1 readable one — and it reads that as "nothing similar exists", which is a
-  wrong answer rather than a thin one. And raising the factor only moves the
-  cliff: the width required is `(crowd+1)/N`, which grows with the vault, so no
-  constant survives. The fix is therefore in § Retrieval and not here: the cut
-  widens to the whole index when it comes up short. The one-hop
+  to** N readable hits, and "up to" is the cap and not a hedge: a scoped agent
+  is not thinned by the notes it may not read. It would be under a fixed
+  over-fetch — a crowd of unreadable notes fills the cut and the agent gets
+  **zero** hits, reading them as "nothing similar exists" — and no constant
+  factor fixes that, since the width required is `(crowd+1)/N` and grows with
+  the vault. § Retrieval covers how the cut is widened instead. The one-hop
   `expand_links` pass is its own enforcement point: neighbour rows pass the
   same read filter before they are appended, or a scoped agent would read
   forbidden titles one wikilink away;
