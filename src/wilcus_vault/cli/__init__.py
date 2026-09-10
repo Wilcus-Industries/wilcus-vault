@@ -4,14 +4,14 @@ import asyncio
 import os
 import sys
 
-from .cli_commands import Args, cmd_consolidate, cmd_discards, cmd_search, cmd_watch
-from .cli_usage import USAGE, print_report, summary
-from .db import db_path, open_db
-from .doctor import DoctorOptions, doctor
-from .embed import Embedder, TokenOverlapEmbedder
-from .fetch_embedder import FetchEmbedder
-from .indexer import reindex
-from .term import VaultError, printable
+from ..db import db_path, open_db
+from ..doctor import DoctorOptions, doctor
+from ..embed import Embedder, TokenOverlapEmbedder
+from ..fetch_embedder import FetchEmbedder
+from ..indexer import reindex
+from ..term import VaultError, printable
+from .commands import Args, cmd_consolidate, cmd_discards, cmd_search, cmd_watch
+from .usage import USAGE, print_report, summary
 
 COMMANDS = ("reindex", "doctor", "search", "watch", "consolidate", "discards")
 

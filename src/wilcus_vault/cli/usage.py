@@ -1,8 +1,8 @@
 """The CLI's help text and report formatting."""
 
-from .doctor import DoctorReport
-from .indexer import IndexStats
-from .term import safe
+from ..doctor import DoctorReport
+from ..indexer import IndexStats
+from ..term import safe
 
 USAGE = """vault <command> [options]
 

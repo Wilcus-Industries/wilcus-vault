@@ -57,9 +57,10 @@ src/wilcus_vault/
   merge.py          # the merger contract: MergedNote, merge_prompt, parse_merged
   consolidate.py    # the consolidation pass over those clusters, dry-run by default
   watch.py          # watchfiles + per-path debounce + hash dirty-check → index_paths
-  cli.py            # vault reindex|doctor|search|watch|consolidate|discards — arg parsing
-  cli_commands.py   # the subcommands that need more than a line
-  cli_usage.py      # help text and report formatting
+  cli/
+    __init__.py     # vault reindex|doctor|search|watch|consolidate|discards — arg parsing
+    commands.py     # the subcommands that need more than a line
+    usage.py        # help text and report formatting
 tests/
   conftest.py       # make_vault / write_note / vec_of, VAULT_* env cleared per test
   fakes.py          # stub embedder, recording transport, fixed decider
@@ -174,9 +175,25 @@ repair the vault.
 
 ## Retrieval
 
-Embed query → vec0 KNN with over-fetch (`k = 3×N`, so post-filters can't starve
-the result set) and FTS5 BM25 `LIMIT 3×N`. **Relevance cutoffs apply per signal,
-before fusion** — cosine-distance ceiling on the KNN side, BM25 ceiling on the
+Embed query → vec0 KNN with over-fetch (`k = 3×N`) and FTS5 BM25 `LIMIT 3×N`.
+That cut is taken *before* the supersede and scope filters run, so it can be
+eaten entirely by rows those filters then drop. When fewer than N hits survive
+**and** a signal filled its cut with rows that passed its own cutoff, the query
+is asked again over the entire index, which cannot starve because nothing is
+left outside it. Both conditions matter: the width needed to reach past a crowd
+is a property of the vault rather than a constant, but a *short* cut after the
+cutoff means the query is exhausted, not crowded — each ceiling bounds the very
+quantity its signal is ordered by, so a row rejected inside the cut has no
+better twin outside it. Without that second test the write gate, which must set
+a cutoff and whose candidates are usually novel, would widen on every write to
+re-derive the same empty answer. The wide pass is a full scan (~6ms at 1k notes,
+~28ms at 5k) and only runs when both conditions hold. One limit survives, on the
+KNN side alone: vec0 refuses `k` above 4096 (every `k` is clamped to it, since
+3×N crosses it at N=1366), so on a larger vault a thinly scoped agent can still
+be crowded out of the *vector* signal — by the whole index rather than by 3×N
+of it. The FTS side has no such ceiling and always widens to the whole index.
+
+**Relevance cutoffs apply per signal, before fusion** — cosine-distance ceiling on the KNN side, BM25 ceiling on the
 FTS side — because RRF scores are ordinal (top hit always scores 1/61 no matter
 how bad it is); a threshold on the fused score cannot filter irrelevance. RRF
 (`score = Σ 1/(60+rank)`, FULL OUTER JOIN) then only orders the survivors; cap at
@@ -393,6 +410,25 @@ confinement, and one this agent may not write:
      explicit — the one CLI command that runs a model, because restoring
      without re-deciding would bypass the gate.
 
+**The closing pass, and the freshness window.** A `propose` ends by re-indexing,
+so the index never lags a write we made ourselves. That pass is deliberately the
+*whole* vault and not just the paths written: what it buys is the next call's
+search seeing a note a human edited behind our back, and without it the gate
+re-creates notes that already exist — files are truth, and a human editing one
+is the normal case, not a corner. It is also the expensive part of a `propose`
+(measured at ~86% of one, since dirtiness is decided by content hash and every
+note is therefore re-read), and a caller that writes in bursts pays for the
+whole vault once per note.
+
+`GateOptions.freshness` is the seconds that view may be stale. Zero, the
+default, walks on every write exactly as before; a positive window lets the
+writes inside it share one walk (measured ~4x on a burst of ten over 5k notes).
+Only edits made *outside* the vault API go unseen for the window — a note the
+gate wrote itself is indexed before `propose` returns whatever the setting — so
+the window trades a bounded blindness to outside edits for the cost of finding
+them. The clock is per handle and lives on `Vault`, not in `GateOptions`: it is
+a property of this handle's view of the files, not of the gate's policy.
+
 Two consequences of the rails, recorded so they are not mistaken for slips. A
 traversing *title* is slugified rather than refused (`../../evil` is the note
 `evil`) — a title legitimately contains `/` and `.`, and the slug is one
@@ -509,9 +545,13 @@ Enforcement points, all inside the library so no caller re-implements them:
 
 - `search` — the scope filter runs over the **over-fetched** set (alongside
   the supersede filter, before RRF caps at N), so a scoped agent gets **up
-  to** N readable hits. Up to: the over-fetch is a fixed 3×N, so an agent
-  scoped to a thin slice of the vault can exhaust it and see fewer — accepted,
-  and the over-fetch factor is where the fix goes if it bites. The one-hop
+  to** N readable hits, and the notes an agent may not read do not thin that
+  answer — below the KNN ceiling § Retrieval names, above which the vector
+  signal alone can still be crowded. Under a fixed over-fetch they thinned it
+  to nothing: a crowd of unreadable notes fills the cut and the agent gets
+  **zero** hits, which it reads as "nothing similar exists". No constant factor
+  fixes that, since the width required is `(crowd+1)/N` and grows with the
+  vault; § Retrieval covers how the cut is widened instead. The one-hop
   `expand_links` pass is its own enforcement point: neighbour rows pass the
   same read filter before they are appended, or a scoped agent would read
   forbidden titles one wikilink away;
@@ -553,6 +593,77 @@ The consequence, recorded rather than discovered: on a case-insensitive
 filesystem (macOS, Windows) a path spelled `Secret/plans.md` reaches the same
 file a `secret/` rule denies, so the rule does not cover it. One more reason
 the sentence above is the operative one — containment, not security.
+
+### One shared memory, and how to carve exceptions in it
+
+**The vault is one memory, not one memory per agent.** A fact the clerk learns
+is *the* fact: one note, which any agent may later refine in place. That is the
+default and it needs no configuration — `open()` without a `scopes=` policy
+already gives every agent the whole vault, and the concurrency rails make
+shared writing safe (every update is check-and-write against the file's hash,
+every create claims its filename with a link that fails rather than
+overwrites).
+
+Per-agent partitioning is what a policy is *not* for. If every agent could only
+write under `agents/<self>/`, a fact the clerk learned would be visible to all
+but owned by the clerk: another agent refining it gets the cross-namespace write
+refused, falls back to an in-namespace `create`, and the vault holds two
+drifting copies of one fact. Namespaces are for *topics* — `customers/`,
+`ledger/` — not for authorship. Authorship is already recorded, in the
+`vault_agent` frontmatter the gate stamps on every note it writes.
+
+What a policy *is* for is the narrow exception: a subtree some agent must not
+write. The shape to reach for, and the one read and write were resolved
+separately to allow:
+
+```python
+{
+    "clerk": [
+        {"prefix": "", "read": True, "write": True},  # the shared memory
+        {"prefix": "ledger", "write": False},  # ...except the numbers
+    ]
+}
+```
+
+**Reads should stay wide.** Narrowing them buys nothing defensive — scopes are
+advisory containment, and anything with filesystem access reads the notes
+anyway. What it costs is real: the gate decides against the similar notes the
+search returns, so an agent that cannot *see* a fact proposes a second copy of
+it. Narrowing reads to sharpen retrieval is solving a ranking problem with a
+permission, and it belongs in ranking.
+
+**The decider is the rail, and that is accepted.** One shared memory means the
+decider chooses among every agent's notes on every propose, and nothing but its
+judgement keeps one agent's proposal off a note another agent depends on. A
+per-call restriction on which note a single `propose` may target would not help:
+the target is *deliberately* shared, so confining a call to its caller's
+namespace defeats the model rather than protects it — and `ScopePolicy` could
+not express it anyway, being agent-keyed and fixed at `open()`. A caller that
+asked to update a specific note checks the returned `GateResult.path` is the one
+it asked for. That is the whole guarantee, and it is enough: a wrong landing is
+a bad edit to a versioned text file, not a loss.
+
+### Not built: per-agent memory
+
+Recorded so it is not re-derived, and deliberately **not designed here**. The
+system above is memory of the *world*, and its mechanism suits that: an agent
+proposes a fact, a decider decides where it lands, and it may be merged into an
+existing note or discarded outright. An agent's memory of *itself* — a
+scratchpad, notes worth reloading every session, how to drive a particular tool,
+a workflow it has settled on — wants the opposite mechanism: the agent names the
+path, the note lands there, no decider judges it and nothing discards it. Those
+are two systems that would share one file tree, not one system with two
+namespaces.
+
+The gap in the current surface is exactly one thing: `propose` is the only write
+path. Direct reads already exist (`get`, `list`). Whether that second system
+gets built, whether its notes are embedded at all (a scratchpad rewritten thirty
+times a session is thirty embeddings, and agent chatter dilutes the brain's
+retrieval), and whether the gate may target the agent's own subtree, are all
+open. One idea worth keeping if it is: when the same fact turns up in two
+agents' own memories, that is evidence it is not about either of them — the
+consolidation pass promoting it into the shared memory is the natural home for
+that rule.
 
 ## Consolidation pass
 

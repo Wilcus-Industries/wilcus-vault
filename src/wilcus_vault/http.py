@@ -24,6 +24,16 @@ Transport = Callable[[str, dict[str, str], bytes, float], Awaitable[tuple[int, s
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 
+class Transient(VaultError):
+    """A provider failure that asking again could fix: a rate limit or a 5xx.
+    A 4xx is not one — a bad key or an unknown model answers the same every time.
+
+    The caller picks its own delay: `Transport` answers `(status, text)`, so a
+    429's `Retry-After` never reaches here. Widening that signature is what it
+    would take to honour a remote provider's stated backoff.
+    """
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """A redirect is answered as the 3xx it is. urllib would otherwise replay the
     request, Authorization header included, at whatever host the Location names."""
@@ -133,7 +143,8 @@ async def post_json(
         headers["authorization"] = f"Bearer {endpoint.key}"
     status, text = await transport(endpoint.url, headers, json.dumps(payload).encode(), timeout)
     if not 200 <= status < 300:
-        raise VaultError(f"{request} request failed: {status} {redact(text, endpoint.key)}")
+        fail = Transient if status in (408, 429) or status >= 500 else VaultError
+        raise fail(f"{request} request failed: {status} {redact(text, endpoint.key)}")
     try:
         return json.loads(text)
     except ValueError:

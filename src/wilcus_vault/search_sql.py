@@ -10,7 +10,12 @@ from .scope import Scope
 RRF_K = 60
 
 
-OVERFETCH = 3  # k = 3×N per signal, so filters cannot starve the result set
+OVERFETCH = 3  # k = 3×N per signal: the cut that answers almost every search
+
+# vec0 refuses a larger `k` outright, whatever the caller asked for. Every k
+# goes through this clamp: `n` is public API input, and 3×N crosses it at
+# n=1366 on a vault of any size.
+MAX_KNN = 4096
 
 
 @dataclass(frozen=True)
@@ -42,13 +47,71 @@ def fuse(
     cutoffs: Cutoffs,
     scope: Scope,
 ) -> list[SearchHit]:
-    """One statement: both signals, their cutoffs, and the RRF fusion over them."""
+    """Both signals, their cutoffs and the RRF fusion, at a cut wide enough to answer.
+
+    Widens to the whole index only when a signal filled its cut with rows that
+    then failed the scope or supersede filter — see § Retrieval.
+    """
+    narrow = OVERFETCH * n
+    rows = _fuse(db, vector, match, n, cutoffs, scope, narrow)
+    if len(rows) >= n:
+        return rows
+    total = int(db.execute("select count(*) from notes").fetchone()[0])
+    if narrow >= total:
+        return rows  # the narrow cut already covered the whole index
+    if not _saturated(db, vector, match, cutoffs, narrow):
+        return rows
+    return _fuse(db, vector, match, n, cutoffs, scope, total)
+
+
+def _saturated(
+    db: sqlite3.Connection,
+    vector: Vector | None,
+    match: str | None,
+    cutoffs: Cutoffs,
+    cut: int,
+) -> bool:
+    """Did either signal fill `cut` with rows that passed its own cutoff?
+
+    A cut that the cutoff left short cannot be crowded — see § Retrieval.
+    """
+    if vector is not None:
+        k = min(cut, MAX_KNN)
+        sql = "select count(*) from (select distance from vectors where emb match ? and k = ?)"
+        params: list[object] = [to_blob(vector), k]
+        if cutoffs.distance_ceiling is not None:
+            sql += " where distance <= ?"
+            params.append(cutoffs.distance_ceiling)
+        if int(db.execute(sql, params).fetchone()[0]) >= k:
+            return True
+    if match is not None:
+        sql = """select count(*) from (select rank as score from notes_fts
+                 where notes_fts match ? order by rank, rowid limit ?)"""
+        params = [match, cut]
+        if cutoffs.bm25_ceiling is not None:
+            sql += " where score <= ?"
+            params.append(cutoffs.bm25_ceiling)
+        if int(db.execute(sql, params).fetchone()[0]) >= cut:
+            return True
+    return False
+
+
+def _fuse(
+    db: sqlite3.Connection,
+    vector: Vector | None,
+    match: str | None,
+    n: int,
+    cutoffs: Cutoffs,
+    scope: Scope,
+    cut: int,
+) -> list[SearchHit]:
+    """One statement, taking `cut` rows per signal before the filters run."""
     readable_sql, readable_params = scope.read_sql
     params: list[object] = []
     knn = "select null as id, 0.0 as distance where 0"
     if vector is not None:
         knn = "select note_id as id, distance from vectors where emb match ? and k = ?"
-        params += [to_blob(vector), OVERFETCH * n]
+        params += [to_blob(vector), min(cut, MAX_KNN)]
     params += readable_params
     vec_cutoff = ""
     if cutoffs.distance_ceiling is not None:
@@ -58,7 +121,7 @@ def fuse(
     if match is not None:
         bm25 = """select rowid as id, rank as score from notes_fts
                   where notes_fts match ? order by rank, rowid limit ?"""
-        params += [match, OVERFETCH * n]
+        params += [match, cut]
     params += readable_params
     fts_cutoff = ""
     if cutoffs.bm25_ceiling is not None:

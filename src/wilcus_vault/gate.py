@@ -21,7 +21,7 @@ from .discard_log import log_candidate
 from .embed import Embedder
 from .frontmatter import patch_frontmatter, replace_body
 from .gate_write import PROVENANCE_KEYS, GateResult, create, mark_superseded, provenance
-from .indexer import read_raw, reindex
+from .indexer import index_paths, read_raw, reindex
 from .note import parse_note
 from .paths import confined_path, now, write_atomic
 from .scope import ALLOW_ALL, Scope, VaultContext, normalize_prefix
@@ -37,6 +37,12 @@ class GateOptions:
     # similar note" degrades into "least unrelated note".
     cutoffs: Cutoffs
     n: int = 5  # similar notes to show the decider
+    # How stale the gate's view of the files may be, in seconds. The closing pass
+    # re-reads every note, so a burst of writes otherwise pays for the whole vault
+    # once per note. Zero — the default — walks on every write, as it always has.
+    # Only edits made outside the vault API go unseen for the window; a note the
+    # gate wrote itself is indexed before it returns, whatever this is set to.
+    freshness: float = 0.0
 
 
 async def propose(
@@ -46,6 +52,7 @@ async def propose(
     candidate: Candidate,
     options: GateOptions,
     scope: Scope = ALLOW_ALL,
+    refresh: bool = True,  # walk the vault on the way out; the caller owns the clock
 ) -> GateResult:
     """Search, decide, apply. A target that changed under us re-runs the gate once
     against fresh state; a second mismatch falls back to create."""
@@ -69,9 +76,10 @@ async def propose(
         raise VaultError(f'write gate: "{safe(agent)}" may not write to {where}')
 
     applied: GateResult | None = None
-    for attempt in range(2):
-        if attempt > 0:
-            await reindex(db, base, embedder)  # the aborting edit is on disk, not yet indexed
+    stale: str | None = None  # a target that changed under us: on disk, not yet indexed
+    for _ in range(2):
+        if stale is not None:
+            await index_paths(db, base, embedder, [stale])
         similar = await _find_similar(db, base, embedder, candidate, options, scope)
         decision = check_decision(await options.decider(DeciderInput(candidate, similar)))
         if decision.target is not None and not any(s.note.path == decision.target for s in similar):
@@ -85,10 +93,21 @@ async def propose(
         applied = await _apply(db, base, candidate, namespace, decision, similar, ctx)
         if applied is not None:
             break
+        stale = decision.target
     fell_back = applied is None
     if applied is None:
         applied = await create(db, base, candidate, namespace, None, ctx)
-    await reindex(db, base, embedder)  # the index never lags a write we made ourselves
+    # The whole walk is the expensive part of a propose: dirtiness is decided by
+    # content hash, so it re-reads every note in the vault. What it buys is the
+    # next call's search seeing a note a human edited behind our back — without
+    # which the gate re-creates notes that already exist. Skipping it is the
+    # caller's call; indexing what we just wrote is not optional either way.
+    if refresh:
+        await reindex(db, base, embedder)
+    else:
+        touched = [p for p in (applied.path, applied.superseded, applied.unmarked) if p is not None]
+        if touched:
+            await index_paths(db, base, embedder, touched)
     return GateResult(applied.action, applied.path, applied.superseded, applied.unmarked, fell_back)
 
 

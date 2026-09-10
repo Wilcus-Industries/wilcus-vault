@@ -9,8 +9,9 @@ EXCEPTIONS: dict[str, str] = {}  # relative path -> why it may exceed the cap
 
 def test_source_modules_under_cap() -> None:
     over = {
-        p.name: n
-        for p in sorted(SRC.glob("*.py"))
-        if (n := len(p.read_text().splitlines())) > CAP and p.name not in EXCEPTIONS
+        str(p.relative_to(SRC)): n
+        for p in sorted(SRC.rglob("*.py"))
+        if (n := len(p.read_text().splitlines())) > CAP
+        and str(p.relative_to(SRC)) not in EXCEPTIONS
     }
     assert not over, f"over {CAP} lines: {over}"

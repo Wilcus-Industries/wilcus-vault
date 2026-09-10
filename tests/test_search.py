@@ -4,11 +4,13 @@ in for semantics. No network."""
 import sqlite3
 from pathlib import Path
 
+import pytest
 from conftest import MakeVault
 
 from wilcus_vault.db import db_path, open_db
-from wilcus_vault.embed import Embedder, TokenOverlapEmbedder
+from wilcus_vault.embed import Embedder, TokenOverlapEmbedder, Vector
 from wilcus_vault.indexer import reindex
+from wilcus_vault.scope import Scope
 from wilcus_vault.search import SearchOptions, fts_query, hybrid_search
 from wilcus_vault.search_sql import Cutoffs, SearchHit
 
@@ -200,4 +202,57 @@ async def test_eval_fts5_syntax_in_the_query_is_text_not_syntax(make_vault: Make
     assert long is not None
     assert len(long.split(" OR ")) == 32
     assert long.startswith('"w0" OR "w1" OR "w2"')
+    db.close()
+
+
+async def test_a_query_the_cutoffs_exhausted_does_not_pay_for_a_wider_one(
+    make_vault: MakeVault, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short answer is only worth widening when the cut was full.
+
+    Each ceiling bounds the quantity its own signal is ordered by, so a row it
+    rejected inside the cut has no better twin outside it — widening re-derives
+    the same empty answer over the whole index. That is the write gate's every
+    call: it must set a cutoff, and a novel candidate matches nothing.
+    """
+    import wilcus_vault.search_sql as search_sql
+
+    root, db = await indexed(make_vault, EVAL_VAULT)
+    cuts: list[int] = []
+    real = search_sql._fuse
+
+    def counted(
+        conn: sqlite3.Connection,
+        vector: Vector | None,
+        match: str | None,
+        n: int,
+        cutoffs: Cutoffs,
+        scope: Scope,
+        cut: int,
+    ) -> list[SearchHit]:
+        cuts.append(cut)
+        return real(conn, vector, match, n, cutoffs, scope, cut)
+
+    monkeypatch.setattr(search_sql, "_fuse", counted)
+
+    # n=1, so the narrow cut is 3 and the 10-note vault is genuinely wider than
+    # it — without the saturation test this would widen to 10. n=5 would prove
+    # nothing: 3×5 already covers the vault, so it short-circuits either way.
+    tight = Cutoffs(distance_ceiling=0.001, bm25_ceiling=-99999.0)
+    assert await hybrid_search(db, EMBEDDER, "zebra xylophone", SearchOptions(1, tight)) == []
+    # One pass at 3×N, and no second one. That a genuinely crowded-out query
+    # *does* widen is pinned where it is visible to a caller, in
+    # test_scope_vault.py: that test fails outright without the widening.
+    assert cuts == [3], "an exhausted query widened anyway"
+    db.close()
+
+
+async def test_a_large_n_stays_inside_the_engines_own_knn_ceiling(
+    make_vault: MakeVault,
+) -> None:
+    """`n` is public API input and 3×N crosses vec0's k limit at n=1366, where it
+    refused the query outright rather than returning what it could."""
+    root, db = await indexed(make_vault, EVAL_VAULT)
+    hits = await hybrid_search(db, EMBEDDER, "acme renewal pricing", SearchOptions(1366))
+    assert 0 < len(hits) <= len(EVAL_VAULT)
     db.close()

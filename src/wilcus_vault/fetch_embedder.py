@@ -4,12 +4,22 @@ Unconfigured it talks to a local Ollama and nothing leaves the machine. A remote
 provider is an explicit choice, and one that must name its model and dims.
 """
 
+import asyncio
 import math
 import os
+import random
+from http.client import RemoteDisconnected
 
 from .embed import Vector
-from .http import Endpoint, Transport, default_transport, post_json, resolve_endpoint
-from .term import VaultError
+from .http import (
+    Endpoint,
+    Transient,
+    Transport,
+    default_transport,
+    post_json,
+    resolve_endpoint,
+)
+from .term import VaultError, printable
 
 LOCAL_ENDPOINT = "http://localhost:11434/v1/embeddings"
 LOCAL_MODEL = "all-minilm"
@@ -30,6 +40,8 @@ class FetchEmbedder:
         batch_size: int = 64,
         max_chars: int = 96_000,
         timeout: float = 30.0,
+        retries: int = 2,  # extra attempts per batch, for transient provider failures
+        backoff: float = 0.5,  # seconds before the first retry, doubling after
         transport: Transport = default_transport,
     ) -> None:
         self._endpoint: Endpoint = resolve_endpoint(
@@ -54,6 +66,8 @@ class FetchEmbedder:
         self._batch_size = batch_size
         self._max_chars = max_chars
         self._timeout = timeout
+        self._retries = retries
+        self._backoff = backoff
         self._transport = transport
 
     async def embed(self, texts: list[str]) -> list[Vector]:
@@ -73,6 +87,21 @@ class FetchEmbedder:
         return out
 
     async def _post(self, texts: list[str]) -> list[Vector]:
+        """One batch, retried while the failure is the kind that asking again fixes.
+
+        An index pass embeds every dirty note before it writes any of them, so a
+        single 503 mid-rebuild otherwise rolls the whole pass back.
+        """
+        for attempt in range(self._retries):
+            try:
+                return self._vectors(await self._attempt(texts), texts)
+            except (Transient, TimeoutError):
+                # Jittered: a shared provider 503s every caller at once, and a fixed
+                # delay would have them all come back in lockstep and do it again.
+                await asyncio.sleep(self._backoff * 2**attempt * random.uniform(0.5, 1.5))
+        return self._vectors(await self._attempt(texts), texts)
+
+    async def _attempt(self, texts: list[str]) -> object:
         payload = {"model": self.model, "input": texts}
         try:
             reply = await post_json(
@@ -86,12 +115,20 @@ class FetchEmbedder:
         except (VaultError, TimeoutError):
             raise
         except Exception as e:
+            # A connection the provider accepted and then dropped is the overload
+            # case, not the absent case: worth asking again. One nobody accepted
+            # means nothing is listening, which no amount of retrying fixes.
+            if isinstance(getattr(e, "reason", e), RemoteDisconnected | ConnectionResetError):
+                raise Transient(f"embedder {self.model}: {printable(e)}") from e
             # Nothing is listening on the default endpoint: say what to do, once.
             # No retry and no fallback to a cloud provider. A chosen endpoint
             # keeps its own error, since `ollama pull` is not the fix for it.
             if self._endpoint.defaulted:
                 raise VaultError(NO_EMBEDDER) from e
             raise
+        return reply
+
+    def _vectors(self, reply: object, texts: list[str]) -> list[Vector]:
         data = reply.get("data") if isinstance(reply, dict) else None
         if not isinstance(data, list) or len(data) != len(texts):
             count = len(data) if isinstance(data, list) else 0
