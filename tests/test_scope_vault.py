@@ -166,9 +166,11 @@ async def test_search_returns_only_readable_hits(open_vault: OpenVault) -> None:
     assert "ledger/q3.md" in scoped  # readable, just not writable
 
 
-async def test_scope_filter_runs_before_the_cap(open_vault: OpenVault) -> None:
+async def test_a_scoped_agent_is_not_starved_by_the_notes_it_cannot_read(
+    open_vault: OpenVault,
+) -> None:
     # Three short, dense notes the agent cannot read outrank the one it can on
-    # both signals; the over-fetch (3×N) is what still leaves room for it.
+    # both signals, and fill the usual 3×N cut between them.
     files = {
         "notes/acme-renewal.md": "# Acme renewal\n\nThe Acme renewal closes in March. Contract, "
         "notice periods, uplift caps,\nescalation ladder, finance sign off, procurement "
@@ -181,10 +183,10 @@ async def test_scope_filter_runs_before_the_cap(open_vault: OpenVault) -> None:
 
     query = "acme renewal pricing"
     assert paths(await v.search(query, SearchOptions(n=1, ctx=SCHEDULER))) == ["secret/plan-1.md"]
-    # "up to N": the readable note is outside the 3×1 over-fetch, so a scoped
-    # agent sees fewer hits. Accepted, and documented.
-    assert await v.search(query, SearchOptions(n=1, ctx=NOTES)) == []
-    # Widen N and the over-fetch reaches past the crowd to the note it may read.
+    # The readable note sits outside the 3×1 cut, behind notes this agent may not
+    # see. A fixed cut answers nothing at all here — not "fewer hits", none — so
+    # the search widens to the whole index rather than reporting a false empty.
+    assert paths(await v.search(query, SearchOptions(n=1, ctx=NOTES))) == ["notes/acme-renewal.md"]
     assert paths(await v.search(query, SearchOptions(n=3, ctx=NOTES))) == ["notes/acme-renewal.md"]
 
 

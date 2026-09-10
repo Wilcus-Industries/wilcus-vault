@@ -10,7 +10,12 @@ from .scope import Scope
 RRF_K = 60
 
 
-OVERFETCH = 3  # k = 3×N per signal, so filters cannot starve the result set
+OVERFETCH = 3  # k = 3×N per signal: the cut that answers almost every search
+
+# vec0 refuses a larger `k` outright. It bounds how far the widened pass below
+# can reach, so on a vault past this size a thinly-scoped agent can still be
+# crowded out — by the whole index rather than by 3×N of it.
+MAX_KNN = 4096
 
 
 @dataclass(frozen=True)
@@ -42,13 +47,43 @@ def fuse(
     cutoffs: Cutoffs,
     scope: Scope,
 ) -> list[SearchHit]:
-    """One statement: both signals, their cutoffs, and the RRF fusion over them."""
+    """Both signals, their cutoffs and the RRF fusion, at a cut wide enough to answer.
+
+    Each signal takes its best rows *before* the scope and supersede filters run,
+    so a fixed cut starves: an agent scoped to a thin slice sees the notes it may
+    not read fill the cut, and gets nothing while a perfectly good readable answer
+    sits just outside it. The width needed to reach past that crowd is a property
+    of the vault, not a constant — so when the usual cut comes up short, the query
+    is asked again over the whole index, which cannot starve because there is
+    nothing left outside it. The wide pass costs a full scan and only happens when
+    the narrow one failed to fill the answer.
+    """
+    rows = _fuse(db, vector, match, n, cutoffs, scope, OVERFETCH * n)
+    if len(rows) >= n:
+        return rows
+    total = int(db.execute("select count(*) from notes").fetchone()[0])
+    cut = min(total, MAX_KNN) if vector is not None else total
+    if OVERFETCH * n >= cut:
+        return rows  # the narrow cut already reached as wide as this one could
+    return _fuse(db, vector, match, n, cutoffs, scope, cut)
+
+
+def _fuse(
+    db: sqlite3.Connection,
+    vector: Vector | None,
+    match: str | None,
+    n: int,
+    cutoffs: Cutoffs,
+    scope: Scope,
+    cut: int,
+) -> list[SearchHit]:
+    """One statement, taking `cut` rows per signal before the filters run."""
     readable_sql, readable_params = scope.read_sql
     params: list[object] = []
     knn = "select null as id, 0.0 as distance where 0"
     if vector is not None:
         knn = "select note_id as id, distance from vectors where emb match ? and k = ?"
-        params += [to_blob(vector), OVERFETCH * n]
+        params += [to_blob(vector), cut]
     params += readable_params
     vec_cutoff = ""
     if cutoffs.distance_ceiling is not None:
@@ -58,7 +93,7 @@ def fuse(
     if match is not None:
         bm25 = """select rowid as id, rank as score from notes_fts
                   where notes_fts match ? order by rank, rowid limit ?"""
-        params += [match, OVERFETCH * n]
+        params += [match, cut]
     params += readable_params
     fts_cutoff = ""
     if cutoffs.bm25_ceiling is not None:
