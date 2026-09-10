@@ -1,8 +1,10 @@
 """The public API. Embedder, decider and merger are injected; the vault never
 hardcodes a provider."""
 
+import math
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 from .consolidate import ConsolidateOptions, ConsolidateReport, ConsolidateRun
@@ -54,6 +56,7 @@ class Vault:
         # Validated before anything is opened, so a contradictory policy costs no handle.
         self._policy: CompiledPolicy | None = compile_scopes(scopes)
         self._db: sqlite3.Connection = open_db(db_path(self.root))
+        self._walked = -math.inf  # when the gate last re-read the files
 
     async def search(self, query: str, options: SearchOptions | None = None) -> list[SearchHit]:
         """Hybrid search. Under a scope policy the answer is up to N readable hits."""
@@ -105,7 +108,16 @@ class Vault:
         if self._gate is None:
             raise VaultError("vault: propose needs a gate — Vault(..., gate=GateOptions(...))")
         scope = scope_for(self._policy, ctx)
-        return await run_gate(self._db, self.root, self._embedder, candidate, self._gate, scope)
+        # The clock lives here, not in the gate: freshness is a property of this
+        # handle's view of the files, and a burst of writes shares one walk.
+        now = time.monotonic()
+        walk = now - self._walked >= self._gate.freshness
+        result = await run_gate(
+            self._db, self.root, self._embedder, candidate, self._gate, scope, walk
+        )
+        if walk:
+            self._walked = now
+        return result
 
     async def consolidate(self, run: ConsolidateRun) -> ConsolidateReport:
         """The consolidation pass. An operator operation like doctor, unscoped:

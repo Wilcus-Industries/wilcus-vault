@@ -7,11 +7,15 @@ from pathlib import Path
 import pytest
 from conftest import MakeVault
 from fakes import fixed_decider
-from gate_common import CANDIDATE, VAULT, open_gate, read
+from gate_common import CANDIDATE, CUTOFFS, EMBEDDER, VAULT, open_gate, read
 
+from wilcus_vault.db import db_path, open_db
 from wilcus_vault.decision import DeciderInput, Decision
+from wilcus_vault.gate import GateOptions
+from wilcus_vault.note import parse_note
 from wilcus_vault.paths import confined_path, slugify
 from wilcus_vault.term import VaultError
+from wilcus_vault.vault import open
 
 CREATE = fixed_decider(Decision("create"))
 
@@ -100,3 +104,58 @@ def test_the_vault_root_is_not_walked_so_a_symlinked_root_opens(make_vault: Make
     # Below the root the rule is unchanged.
     with pytest.raises(VaultError, match="outside the vault"):
         confined_path(link, "../elsewhere.md")
+
+
+async def _indexed_hash(root: Path, rel: str) -> str:
+    db = open_db(db_path(root))
+    try:
+        return str(db.execute("select hash from notes where path = ?", (rel,)).fetchone()["hash"])
+    finally:
+        db.close()
+
+
+async def test_a_freshness_window_lets_a_burst_of_writes_share_one_walk(
+    make_vault: MakeVault,
+) -> None:
+    """The closing pass re-reads every note, so a burst of writes pays for the vault
+    once per note. A window says how stale the gate's view of the files may be, and
+    the writes inside it share one walk."""
+    root = make_vault(VAULT)
+    v = open(
+        root,
+        EMBEDDER,
+        gate=GateOptions(decider=CREATE, cutoffs=CUTOFFS, freshness=3600),
+    )
+    await v.reindex()
+    try:
+        rel = "notes/support-rota.md"
+        await v.propose(CANDIDATE)  # first write: due, so it walks
+        before = await _indexed_hash(root, rel)
+
+        (Path(root) / rel).write_text("# Support rota\n\nThe rota moved to the calendar.\n")
+        r = await v.propose(replace(CANDIDATE, title="Second note"))
+
+        # Inside the window an edit made outside the vault API is not looked for...
+        assert await _indexed_hash(root, rel) == before
+        # ...but a note the gate wrote itself is never stale, window or no window.
+        assert r.path is not None
+        assert r.path in [h.path for h in await v.search("second note")]
+    finally:
+        v.close()
+
+
+async def test_the_window_is_off_by_default_so_every_write_still_walks(
+    make_vault: MakeVault,
+) -> None:
+    root = make_vault(VAULT)
+    v = open(root, EMBEDDER, gate=GateOptions(decider=CREATE, cutoffs=CUTOFFS))
+    await v.reindex()
+    try:
+        rel = "notes/support-rota.md"
+        await v.propose(CANDIDATE)
+        (Path(root) / rel).write_text("# Support rota\n\nThe rota moved to the calendar.\n")
+        fresh = parse_note((Path(root) / rel).read_text(), rel).hash
+        await v.propose(replace(CANDIDATE, title="Second note"))
+        assert await _indexed_hash(root, rel) == fresh
+    finally:
+        v.close()

@@ -37,6 +37,12 @@ class GateOptions:
     # similar note" degrades into "least unrelated note".
     cutoffs: Cutoffs
     n: int = 5  # similar notes to show the decider
+    # How stale the gate's view of the files may be, in seconds. The closing pass
+    # re-reads every note, so a burst of writes otherwise pays for the whole vault
+    # once per note. Zero — the default — walks on every write, as it always has.
+    # Only edits made outside the vault API go unseen for the window; a note the
+    # gate wrote itself is indexed before it returns, whatever this is set to.
+    freshness: float = 0.0
 
 
 async def propose(
@@ -46,6 +52,7 @@ async def propose(
     candidate: Candidate,
     options: GateOptions,
     scope: Scope = ALLOW_ALL,
+    refresh: bool = True,  # walk the vault on the way out; the caller owns the clock
 ) -> GateResult:
     """Search, decide, apply. A target that changed under us re-runs the gate once
     against fresh state; a second mismatch falls back to create."""
@@ -90,11 +97,17 @@ async def propose(
     fell_back = applied is None
     if applied is None:
         applied = await create(db, base, candidate, namespace, None, ctx)
-    # Whole on purpose, and it is the expensive part of a propose: dirtiness is
-    # decided by content hash, so this re-reads every note in the vault. What it
-    # buys is the next call's search seeing a note a human edited behind our back
-    # — without which the gate re-creates notes that already exist.
-    await reindex(db, base, embedder)
+    # The whole walk is the expensive part of a propose: dirtiness is decided by
+    # content hash, so it re-reads every note in the vault. What it buys is the
+    # next call's search seeing a note a human edited behind our back — without
+    # which the gate re-creates notes that already exist. Skipping it is the
+    # caller's call; indexing what we just wrote is not optional either way.
+    if refresh:
+        await reindex(db, base, embedder)
+    else:
+        touched = [p for p in (applied.path, applied.superseded, applied.unmarked) if p is not None]
+        if touched:
+            await index_paths(db, base, embedder, touched)
     return GateResult(applied.action, applied.path, applied.superseded, applied.unmarked, fell_back)
 
 

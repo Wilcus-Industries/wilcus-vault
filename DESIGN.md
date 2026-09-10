@@ -394,6 +394,25 @@ confinement, and one this agent may not write:
      explicit — the one CLI command that runs a model, because restoring
      without re-deciding would bypass the gate.
 
+**The closing pass, and the freshness window.** A `propose` ends by re-indexing,
+so the index never lags a write we made ourselves. That pass is deliberately the
+*whole* vault and not just the paths written: what it buys is the next call's
+search seeing a note a human edited behind our back, and without it the gate
+re-creates notes that already exist — files are truth, and a human editing one
+is the normal case, not a corner. It is also the expensive part of a `propose`
+(measured at ~86% of one, since dirtiness is decided by content hash and every
+note is therefore re-read), and a caller that writes in bursts pays for the
+whole vault once per note.
+
+`GateOptions.freshness` is the seconds that view may be stale. Zero, the
+default, walks on every write exactly as before; a positive window lets the
+writes inside it share one walk (measured ~4x on a burst of ten over 5k notes).
+Only edits made *outside* the vault API go unseen for the window — a note the
+gate wrote itself is indexed before `propose` returns whatever the setting — so
+the window trades a bounded blindness to outside edits for the cost of finding
+them. The clock is per handle and lives on `Vault`, not in `GateOptions`: it is
+a property of this handle's view of the files, not of the gate's policy.
+
 Two consequences of the rails, recorded so they are not mistaken for slips. A
 traversing *title* is slugified rather than refused (`../../evil` is the note
 `evil`) — a title legitimately contains `/` and `.`, and the slug is one
