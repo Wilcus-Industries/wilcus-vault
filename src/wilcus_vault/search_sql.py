@@ -54,11 +54,13 @@ def fuse(
     """
     narrow = OVERFETCH * n
     rows = _fuse(db, vector, match, n, cutoffs, scope, narrow)
-    if len(rows) >= n or not _saturated(db, vector, match, cutoffs, narrow):
+    if len(rows) >= n:
         return rows
     total = int(db.execute("select count(*) from notes").fetchone()[0])
     if narrow >= total:
         return rows  # the narrow cut already covered the whole index
+    if not _saturated(db, vector, match, cutoffs, narrow):
+        return rows
     return _fuse(db, vector, match, n, cutoffs, scope, total)
 
 
@@ -71,12 +73,7 @@ def _saturated(
 ) -> bool:
     """Did either signal fill `cut` with rows that passed its own cutoff?
 
-    Only then can a wider cut find anything. Each ceiling bounds the very
-    quantity its signal is ordered by, so a row the ceiling rejected inside the
-    cut has no better twin outside it: a short answer there means the query is
-    exhausted, not crowded out. Without this the write gate — which must set a
-    cutoff, and whose candidates are usually novel — would widen on every write
-    to re-derive the same empty answer.
+    A cut that the cutoff left short cannot be crowded — see § Retrieval.
     """
     if vector is not None:
         k = min(cut, MAX_KNN)

@@ -191,8 +191,9 @@ re-derive the same empty answer. The wide pass is a full scan (~6ms at 1k notes,
 KNN side alone: vec0 refuses `k` above 4096 (every `k` is clamped to it, since
 3×N crosses it at N=1366), so on a larger vault a thinly scoped agent can still
 be crowded out of the *vector* signal — by the whole index rather than by 3×N
-of it. The FTS side has no such ceiling and always widens to the whole index. **Relevance cutoffs apply per signal,
-before fusion** — cosine-distance ceiling on the KNN side, BM25 ceiling on the
+of it. The FTS side has no such ceiling and always widens to the whole index.
+
+**Relevance cutoffs apply per signal, before fusion** — cosine-distance ceiling on the KNN side, BM25 ceiling on the
 FTS side — because RRF scores are ordinal (top hit always scores 1/61 no matter
 how bad it is); a threshold on the fused score cannot filter irrelevance. RRF
 (`score = Σ 1/(60+rank)`, FULL OUTER JOIN) then only orders the survivors; cap at
@@ -544,12 +545,13 @@ Enforcement points, all inside the library so no caller re-implements them:
 
 - `search` — the scope filter runs over the **over-fetched** set (alongside
   the supersede filter, before RRF caps at N), so a scoped agent gets **up
-  to** N readable hits, and "up to" is the cap and not a hedge: a scoped agent
-  is not thinned by the notes it may not read. It would be under a fixed
-  over-fetch — a crowd of unreadable notes fills the cut and the agent gets
-  **zero** hits, reading them as "nothing similar exists" — and no constant
-  factor fixes that, since the width required is `(crowd+1)/N` and grows with
-  the vault. § Retrieval covers how the cut is widened instead. The one-hop
+  to** N readable hits, and the notes an agent may not read do not thin that
+  answer — below the KNN ceiling § Retrieval names, above which the vector
+  signal alone can still be crowded. Under a fixed over-fetch they thinned it
+  to nothing: a crowd of unreadable notes fills the cut and the agent gets
+  **zero** hits, which it reads as "nothing similar exists". No constant factor
+  fixes that, since the width required is `(crowd+1)/N` and grows with the
+  vault; § Retrieval covers how the cut is widened instead. The one-hop
   `expand_links` pass is its own enforcement point: neighbour rows pass the
   same read filter before they are appended, or a scoped agent would read
   forbidden titles one wikilink away;

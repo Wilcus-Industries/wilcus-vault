@@ -235,10 +235,24 @@ async def test_a_query_the_cutoffs_exhausted_does_not_pay_for_a_wider_one(
 
     monkeypatch.setattr(search_sql, "_fuse", counted)
 
+    # n=1, so the narrow cut is 3 and the 10-note vault is genuinely wider than
+    # it — without the saturation test this would widen to 10. n=5 would prove
+    # nothing: 3×5 already covers the vault, so it short-circuits either way.
     tight = Cutoffs(distance_ceiling=0.001, bm25_ceiling=-99999.0)
-    assert await hybrid_search(db, EMBEDDER, "zebra xylophone", SearchOptions(5, tight)) == []
+    assert await hybrid_search(db, EMBEDDER, "zebra xylophone", SearchOptions(1, tight)) == []
     # One pass at 3×N, and no second one. That a genuinely crowded-out query
     # *does* widen is pinned where it is visible to a caller, in
     # test_scope_vault.py: that test fails outright without the widening.
-    assert cuts == [15], "an exhausted query widened anyway"
+    assert cuts == [3], "an exhausted query widened anyway"
+    db.close()
+
+
+async def test_a_large_n_stays_inside_the_engines_own_knn_ceiling(
+    make_vault: MakeVault,
+) -> None:
+    """`n` is public API input and 3×N crosses vec0's k limit at n=1366, where it
+    refused the query outright rather than returning what it could."""
+    root, db = await indexed(make_vault, EVAL_VAULT)
+    hits = await hybrid_search(db, EMBEDDER, "acme renewal pricing", SearchOptions(1366))
+    assert 0 < len(hits) <= len(EVAL_VAULT)
     db.close()
