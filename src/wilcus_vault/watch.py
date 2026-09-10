@@ -14,11 +14,22 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from watchfiles import awatch
+from watchfiles import Change, awatch
 
 from .embed import Embedder
 from .indexer import IndexStats, index_paths, is_note_path, reindex
 from .term import printable
+
+
+def _note_events(_change: Change, path: str) -> bool:
+    """Only `.md` paths reach Python at all.
+
+    The index writes under `.vault/`, and in WAL mode it writes often — every
+    one of those is an event the watcher would wake for and then discard. Kept
+    coarse on purpose: `touch` still applies the real `is_note_path` rule, this
+    only stops the index feeding the watcher its own tail.
+    """
+    return path.endswith(".md")
 
 
 def _log_error(error: BaseException) -> None:
@@ -115,7 +126,13 @@ class Watcher:
 
     async def _watch_fs(self) -> None:
         try:
-            async for changes in awatch(self._root, stop_event=self._stop, debounce=50, step=25):
+            async for changes in awatch(
+                self._root,
+                watch_filter=_note_events,
+                stop_event=self._stop,
+                debounce=50,
+                step=25,
+            ):
                 for _, path in changes:
                     self.touch(os.path.relpath(path, self._root))
         except Exception as e:

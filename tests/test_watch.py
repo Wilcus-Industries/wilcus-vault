@@ -5,11 +5,12 @@ import sqlite3
 from pathlib import Path
 
 from conftest import MakeVault, vec_of, write_note
+from watchfiles import Change
 
 from wilcus_vault.db import db_path, open_db
 from wilcus_vault.embed import TokenOverlapEmbedder
 from wilcus_vault.indexer import IndexStats, is_note_path, reindex
-from wilcus_vault.watch import WatchOptions, watch
+from wilcus_vault.watch import WatchOptions, _note_events, watch
 
 EMBEDDER = TokenOverlapEmbedder(32)
 
@@ -169,3 +170,14 @@ async def test_an_unchanged_file_is_reported_but_rewrites_nothing(make_vault: Ma
         await w.close()
     finally:
         db.close()
+
+
+def test_the_index_never_feeds_the_watcher_its_own_tail() -> None:
+    """`.vault/` is where the index writes, and in WAL mode it writes constantly.
+    Those events are dropped before they reach Python, not after."""
+    assert _note_events(Change.modified, "/v/notes/acme.md")
+    assert _note_events(Change.added, "/v/deep/nested/note.md")
+    assert not _note_events(Change.modified, "/v/.vault/index.db")
+    assert not _note_events(Change.modified, "/v/.vault/index.db-wal")
+    assert not _note_events(Change.modified, "/v/.vault/index.db-shm")
+    assert not _note_events(Change.added, "/v/.discarded.log")
