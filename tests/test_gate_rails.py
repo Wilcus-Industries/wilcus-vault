@@ -1,5 +1,6 @@
 """Write-gate evals: path confinement. An LLM-derived string never names a raw path."""
 
+import asyncio
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -106,7 +107,7 @@ def test_the_vault_root_is_not_walked_so_a_symlinked_root_opens(make_vault: Make
         confined_path(link, "../elsewhere.md")
 
 
-async def _indexed_hash(root: Path, rel: str) -> str:
+def _indexed_hash(root: Path, rel: str) -> str:
     db = open_db(db_path(root))
     try:
         return str(db.execute("select hash from notes where path = ?", (rel,)).fetchone()["hash"])
@@ -130,13 +131,13 @@ async def test_a_freshness_window_lets_a_burst_of_writes_share_one_walk(
     try:
         rel = "notes/support-rota.md"
         await v.propose(CANDIDATE)  # first write: due, so it walks
-        before = await _indexed_hash(root, rel)
+        before = _indexed_hash(root, rel)
 
         (Path(root) / rel).write_text("# Support rota\n\nThe rota moved to the calendar.\n")
         r = await v.propose(replace(CANDIDATE, title="Second note"))
 
         # Inside the window an edit made outside the vault API is not looked for...
-        assert await _indexed_hash(root, rel) == before
+        assert _indexed_hash(root, rel) == before
         # ...but a note the gate wrote itself is never stale, window or no window.
         assert r.path is not None
         assert r.path in [h.path for h in await v.search("second note")]
@@ -144,18 +145,32 @@ async def test_a_freshness_window_lets_a_burst_of_writes_share_one_walk(
         v.close()
 
 
-async def test_the_window_is_off_by_default_so_every_write_still_walks(
+async def test_a_write_inside_the_window_does_not_push_the_window_along(
     make_vault: MakeVault,
 ) -> None:
+    """Bounded is the entire claim the window makes, and it rests on the clock
+    marking walks rather than writes. Mark it on every write and each one inside
+    the window shifts the deadline forward: a caller writing faster than its own
+    window then never walks again, and the blindness stops being bounded at all.
+
+    Three writes, because two cannot show it — the middle one is what moves a
+    clock that should not have moved.
+    """
     root = make_vault(VAULT)
-    v = open(root, EMBEDDER, gate=GateOptions(decider=CREATE, cutoffs=CUTOFFS))
+    v = open(root, EMBEDDER, gate=GateOptions(decider=CREATE, cutoffs=CUTOFFS, freshness=0.1))
     await v.reindex()
     try:
         rel = "notes/support-rota.md"
-        await v.propose(CANDIDATE)
+        await v.propose(CANDIDATE)  # walks, and starts the window
         (Path(root) / rel).write_text("# Support rota\n\nThe rota moved to the calendar.\n")
         fresh = parse_note((Path(root) / rel).read_text(), rel).hash
-        await v.propose(replace(CANDIDATE, title="Second note"))
-        assert await _indexed_hash(root, rel) == fresh
+
+        await asyncio.sleep(0.06)
+        await v.propose(replace(CANDIDATE, title="Second note"))  # inside: must not walk
+        assert _indexed_hash(root, rel) != fresh
+
+        await asyncio.sleep(0.06)  # now past the window measured from the first write
+        await v.propose(replace(CANDIDATE, title="Third note"))
+        assert _indexed_hash(root, rel) == fresh, "a write inside the window moved the deadline"
     finally:
         v.close()
