@@ -55,8 +55,8 @@ may start with a dash. Exit code 0 on success, 1 on error — and 1 from `doctor
 when it found links only a human can fix: broken (nothing to point at) or
 ambiguous (a bare `[[stem]]` several notes answer to — `doctor` prints the
 candidate paths, and qualifying the link with one of them is the fix) — or when
-reindex hit an error it could not absorb (a confinement or permission failure,
-or a failed re-entry).
+`doctor`'s own reindex hit an error it could not absorb (a confinement or
+permission failure, or a failed re-entry).
 
 Every command embeds through the zero-config default described under
 [Embedders](#embedders): a local Ollama (`all-minilm`, 384 dims), or whatever

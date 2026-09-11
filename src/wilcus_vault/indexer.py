@@ -34,8 +34,10 @@ class IndexStats:
     unchanged: int = 0
     reembedded: bool = False  # the model or dims changed, so every note was re-embedded
     qualified: list[Qualified] = field(default_factory=list)  # stem collisions this pass handled
-    # The re-index of rewritten linkers failed; their rows lag the files until
-    # the next pass. Reported, not raised, so the stats still say what changed.
+    # A linker rewrite failed confinement, was unreadable or unwritable (nothing
+    # was written for it), or its re-index after a successful rewrite failed (its
+    # row lags the file until the next pass). Reported, not raised, so the stats
+    # still say what changed.
     index_error: str | None = None
     unreadable: list[str] = field(default_factory=list)  # directories the scan could not read
 

@@ -47,8 +47,8 @@ on their next pass and search refuses to go without.
 Exit code 0 on success, 1 on error — and 1 from doctor when it found links
 only a human can fix (broken: nothing to point at; ambiguous: a bare
 [[stem]] several notes answer to — qualify it as [[folder/stem]]) or when
-reindex hit an error it could not absorb (a confinement or permission
-failure, or a failed re-entry)."""
+doctor's own reindex hit an error it could not absorb (a confinement or
+permission failure, or a failed re-entry)."""
 
 
 def _plural(n: int, word: str) -> str:
