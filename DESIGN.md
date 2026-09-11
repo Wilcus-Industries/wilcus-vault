@@ -136,11 +136,15 @@ repair the vault.
   mid-flight (hash mismatch, never clobbered), and the cap's remainder are
   all reported and left to `doctor`'s ambiguous report — `rewritten` +
   `skipped` account for every linker. A linker failing confinement (a stale
-  row whose parent directory became a symlink), unreadable, or unwritable,
-  or a failure in the post-rewrite re-entry all ride on
-  `IndexStats.index_error` instead of raising (the files have already
-  changed; the next pass recovers the rows). This is narrower than
-  consolidate's member-path confinement check, which aborts the run (below):
+  row whose parent directory became a symlink), unreadable, or unwritable
+  also lands in `skipped`, but unlike the causes above it rides on
+  `IndexStats.index_error` too: nothing was written for that linker, so
+  there is nothing to recover, but the cause is a filesystem or index fault
+  rather than an ordinary ambiguity, worth a louder signal than a silent
+  skip. A failure in the post-rewrite re-entry rides on the same field for a
+  different reason — the files have already changed, and the next pass
+  recovers the rows. This is narrower than consolidate's member-path
+  confinement check, which aborts the run (below):
   there a tampered path sits in front of a merge action about to write; here
   it is one linker among independent per-file rewrites the pass has already
   committed, so it is skipped and reported like any other post-commit
