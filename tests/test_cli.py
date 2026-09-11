@@ -57,6 +57,38 @@ async def test_reindex_doctor_and_doctor_rebuild(
     assert (await cli(capsys, "doctor", "--rebuild", "--lexical", "--vault", root)).code == 1
 
 
+async def test_doctor_exits_1_on_a_reindex_index_error(
+    make_vault: MakeVault,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An index_error alone — no broken or ambiguous link — must still fail
+    the exit code: it means rows lag the files, which doctor exists to catch."""
+    import wilcus_vault.cli as cli_module
+    from wilcus_vault.doctor import DoctorReport
+
+    async def fake_doctor(root: Path, embedder: object, options: object = None) -> DoctorReport:
+        return DoctorReport(
+            stale=[],
+            missing=[],
+            broken_links=[],
+            ambiguous_links=[],
+            orphans=[],
+            malformed=[],
+            reembedded=False,
+            migrated_discard_log=False,
+            discards={"entries": 0, "recent": 0},
+            unreadable=[],
+            index_error="boom",
+        )
+
+    monkeypatch.setattr(cli_module, "doctor", fake_doctor)
+    root = make_vault({})
+    r = await cli(capsys, "doctor", "--lexical", "--vault", root)
+    assert r.code == 1
+    assert "boom" in r.out
+
+
 async def test_doctor_names_candidates_for_an_ambiguous_link(
     make_vault: MakeVault, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -45,8 +45,9 @@ spaces: switching costs a full re-embed, which reindex, doctor and watch do
 on their next pass and search refuses to go without.
 
 Exit code 0 on success, 1 on error — and 1 from doctor when it found links
-only a human can fix: broken (nothing to point at) or ambiguous (a bare
-[[stem]] several notes answer to — qualify it as [[folder/stem]])."""
+only a human can fix (broken: nothing to point at; ambiguous: a bare
+[[stem]] several notes answer to — qualify it as [[folder/stem]]) or when
+its repair could not finish re-indexing what it rewrote."""
 
 
 def _plural(n: int, word: str) -> str:
@@ -98,4 +99,6 @@ def print_report(r: DoctorReport) -> None:
     lines += [f"malformed frontmatter: {p}" for p in r.malformed]
     lines += [f"orphan: {p}" for p in r.orphans]
     lines += [f"unreadable directory: {p} (its notes are invisible)" for p in r.unreadable]
+    if r.index_error is not None:
+        lines.append(f"re-index failed: {r.index_error}")
     print("\n".join(safe(line) for line in lines))

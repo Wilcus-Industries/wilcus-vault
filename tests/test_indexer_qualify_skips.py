@@ -115,7 +115,10 @@ async def test_a_confined_path_failure_on_a_linker_is_skipped_not_raised(
         Qualified("acme", "customers/acme", ["notes/deal.md"], ["sub/hub.md"])
     ]
     assert stats.index_error is not None and "symlink" in stats.index_error
-    assert read_file(root, "notes/deal.md") == "# Deal\n\nclosing [[customers/acme|Acme Corp]] this week\n"
+    assert (
+        read_file(root, "notes/deal.md")
+        == "# Deal\n\nclosing [[customers/acme|Acme Corp]] this week\n"
+    )
     db.close()
 
 
