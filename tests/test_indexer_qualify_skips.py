@@ -87,6 +87,38 @@ async def test_vanished_and_new_in_pass_linkers_land_in_skipped(make_vault: Make
     db.close()
 
 
+async def test_a_confined_path_failure_on_a_linker_is_skipped_not_raised(
+    make_vault: MakeVault,
+) -> None:
+    # A linker's parent directory is replaced by a symlink after it was indexed
+    # (a stale row): confined_path must not throw out of the pass after an
+    # earlier linker was already rewritten — it is routed into skipped instead.
+    root = make_vault(
+        {
+            "customers/acme.md": "# Acme the customer\n",
+            "sub/hub.md": "# Hub\n\nsee [[acme]] for the account\n",
+            "notes/deal.md": "# Deal\n\nclosing [[acme|Acme Corp]] this week\n",
+        }
+    )
+    db = open_index(root)
+    await reindex(db, root, embedder)
+    write_note(root, "vendors/acme.md", "# Acme the vendor\n")
+    sub, real = root / "sub", root / "sub-real"
+    sub.rename(real)
+    sub.symlink_to(real)
+    try:
+        stats = await index_paths(db, root, embedder, ["vendors/acme.md"])
+    finally:
+        sub.unlink()
+        real.rename(sub)
+    assert stats.qualified == [
+        Qualified("acme", "customers/acme", ["notes/deal.md"], ["sub/hub.md"])
+    ]
+    assert stats.index_error is not None and "symlink" in stats.index_error
+    assert read_file(root, "notes/deal.md") == "# Deal\n\nclosing [[customers/acme|Acme Corp]] this week\n"
+    db.close()
+
+
 async def test_a_re_entry_failure_after_rewrites_is_reported_not_raised(
     make_vault: MakeVault,
 ) -> None:

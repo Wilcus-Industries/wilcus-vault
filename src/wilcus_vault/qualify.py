@@ -78,8 +78,8 @@ def qualify_collisions(
             if target is None or path in new_paths or len(entry.rewritten) >= cap:
                 entry.skipped.append(path)
                 continue
-            abs_path = confined_path(root, path)
             try:
+                abs_path = confined_path(root, path)
                 done = _rewrite(abs_path, path, linker["hash"], stem, target)
             except Exception as e:
                 done = False
