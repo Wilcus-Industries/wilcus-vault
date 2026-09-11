@@ -133,11 +133,11 @@ repair the vault.
   row alone is not truth — a move the watcher sees in two passes is a rename,
   not a collision), both notes new in the same pass (no incumbent — picking
   one would be the forbidden first-match resolution), a linker edited
-  mid-flight (hash mismatch, never clobbered), and a linker unreadable, and
-  the cap's remainder are all reported and left to `doctor`'s ambiguous
-  report — `rewritten` + `skipped` account for every linker. A linker failing
-  confinement (a stale row whose parent directory became a symlink), a linker
-  unwritable, or a failure in the post-rewrite re-entry all ride on
+  mid-flight (hash mismatch, never clobbered), and the cap's remainder are
+  all reported and left to `doctor`'s ambiguous report — `rewritten` +
+  `skipped` account for every linker. A linker failing confinement (a stale
+  row whose parent directory became a symlink), unreadable, or unwritable,
+  or a failure in the post-rewrite re-entry all ride on
   `IndexStats.index_error` instead of raising (the files have already
   changed; the next pass recovers the rows). This is narrower than
   consolidate's member-path confinement check, which aborts the run (below):
