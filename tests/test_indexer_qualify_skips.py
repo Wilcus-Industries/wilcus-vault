@@ -128,8 +128,17 @@ async def test_an_incumbent_failing_confinement_is_not_a_collision_not_raised(
     # The incumbent's own parent directory is replaced by a symlink after it
     # was indexed (a stale row): confined_path must not throw out of
     # detect_collisions — the identical condition is already a silent
-    # non-collision one line below (an incumbent whose file is gone).
-    root = make_vault({"sub/acme.md": "# Acme the customer\n"})
+    # non-collision one line below (an incumbent whose file is gone). A linker
+    # to the stem makes this discriminating: without the confinement check,
+    # the symlinked incumbent still passes the is_file()-and-not-symlink()
+    # test below it, so it would be treated as a real collision and hub.md
+    # would get rewritten.
+    root = make_vault(
+        {
+            "sub/acme.md": "# Acme the customer\n",
+            "hub.md": "# Hub\n\nsee [[acme]] for the account\n",
+        }
+    )
     db = open_index(root)
     await reindex(db, root, embedder)
     sub, real = root / "sub", root / "sub-real"
@@ -142,6 +151,8 @@ async def test_an_incumbent_failing_confinement_is_not_a_collision_not_raised(
         sub.unlink()
         real.rename(sub)
     assert stats.qualified == []
+    assert stats.index_error is None
+    assert read_file(root, "hub.md") == "# Hub\n\nsee [[acme]] for the account\n"
     db.close()
 
 
