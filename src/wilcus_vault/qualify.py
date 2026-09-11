@@ -40,7 +40,10 @@ def detect_collisions(
         if len(holders) != 1:
             continue
         incumbent = holders[0]["path"]
-        confined_path(root, incumbent)  # the index is derived data, not a trusted path source
+        try:
+            confined_path(root, incumbent)  # the index is derived data, not a trusted path source
+        except Exception:
+            continue  # a stale row escaping the vault is no more a collision than one that's gone
         # The incumbent's file must still exist: a move the watcher sees as
         # create-then-delete would otherwise qualify links to a path about to go.
         if (root / incumbent).is_file() and not (root / incumbent).is_symlink():

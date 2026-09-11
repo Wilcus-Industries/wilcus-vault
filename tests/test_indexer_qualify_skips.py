@@ -122,6 +122,29 @@ async def test_a_confined_path_failure_on_a_linker_is_skipped_not_raised(
     db.close()
 
 
+async def test_an_incumbent_failing_confinement_is_not_a_collision_not_raised(
+    make_vault: MakeVault,
+) -> None:
+    # The incumbent's own parent directory is replaced by a symlink after it
+    # was indexed (a stale row): confined_path must not throw out of
+    # detect_collisions — the identical condition is already a silent
+    # non-collision one line below (an incumbent whose file is gone).
+    root = make_vault({"sub/acme.md": "# Acme the customer\n"})
+    db = open_index(root)
+    await reindex(db, root, embedder)
+    sub, real = root / "sub", root / "sub-real"
+    sub.rename(real)
+    sub.symlink_to(real)
+    write_note(root, "vendors/acme.md", "# Acme the vendor\n")
+    try:
+        stats = await index_paths(db, root, embedder, ["vendors/acme.md"])
+    finally:
+        sub.unlink()
+        real.rename(sub)
+    assert stats.qualified == []
+    db.close()
+
+
 async def test_a_re_entry_failure_after_rewrites_is_reported_not_raised(
     make_vault: MakeVault,
 ) -> None:

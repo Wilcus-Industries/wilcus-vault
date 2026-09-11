@@ -42,7 +42,7 @@ class DoctorReport:
     migrated_discard_log: bool  # a log left in `.vault/` was moved beside the notes
     discards: dict[str, int]  # discard log: total entries, and those from the last 7 days
     unreadable: list[str]  # directories the scan could not read: the vault is only partly seen
-    index_error: str | None = None  # the repair's re-index of rewritten notes failed
+    index_error: str | None = None  # reindex hit an error it could not absorb
 
 
 @dataclass(frozen=True)
