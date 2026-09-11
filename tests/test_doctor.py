@@ -2,6 +2,8 @@
 
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -219,7 +221,8 @@ async def test_doctor_reports_directories_it_could_not_read(make_vault: MakeVaul
         (root / "locked").chmod(0o755)
 
 
-async def _make_symlinked_collision(root: Path) -> tuple[Path, Path]:
+@contextmanager
+def _symlinked_collision(root: Path) -> Iterator[None]:
     """A vault with an indexed linker whose parent directory is about to become
     a symlink, plus a new note that will collide with the existing incumbent.
     The real directory is dot-prefixed so a full scan does not also re-discover
@@ -228,7 +231,11 @@ async def _make_symlinked_collision(root: Path) -> tuple[Path, Path]:
     sub, real = root / "sub", root / ".sub-real"
     sub.rename(real)
     sub.symlink_to(real)
-    return sub, real
+    try:
+        yield
+    finally:
+        sub.unlink()
+        real.rename(sub)
 
 
 async def test_doctor_repair_surfaces_a_reindex_index_error(make_vault: MakeVault) -> None:
@@ -239,12 +246,8 @@ async def test_doctor_repair_surfaces_a_reindex_index_error(make_vault: MakeVaul
         }
     )
     assert (await doctor(root, embedder)).index_error is None
-    sub, real = await _make_symlinked_collision(root)
-    try:
+    with _symlinked_collision(root):
         report = await doctor(root, embedder)
-    finally:
-        sub.unlink()
-        real.rename(sub)
     assert report.index_error is not None and "symlink" in report.index_error
 
 
@@ -256,12 +259,8 @@ async def test_doctor_rebuild_surfaces_a_reindex_index_error(make_vault: MakeVau
         }
     )
     await doctor(root, embedder)
-    sub, real = await _make_symlinked_collision(root)
-    try:
+    with _symlinked_collision(root):
         report = await doctor(root, embedder, DoctorOptions(rebuild=True))
-    finally:
-        sub.unlink()
-        real.rename(sub)
     assert report.index_error is not None and "symlink" in report.index_error
 
 
