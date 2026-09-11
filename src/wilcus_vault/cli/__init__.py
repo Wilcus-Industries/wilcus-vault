@@ -94,8 +94,10 @@ async def run(argv: list[str]) -> int:
         return await cmd_watch(args.root, embedder)
     report = await doctor(args.root, embedder, DoctorOptions(rebuild=args.rebuild))
     print_report(report)
-    # Drift is repaired; links a human has to fix are not, so the exit code says so.
-    return 0 if not report.broken_links and not report.ambiguous_links else 1
+    # Drift is repaired; links a human has to fix, and a reindex that hit an
+    # error it could not absorb, are not — so the exit code says so.
+    failed = report.broken_links or report.ambiguous_links or report.index_error is not None
+    return 1 if failed else 0
 
 
 def entrypoint() -> None:

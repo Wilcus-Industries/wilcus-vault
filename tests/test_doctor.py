@@ -2,6 +2,8 @@
 
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -217,6 +219,49 @@ async def test_doctor_reports_directories_it_could_not_read(make_vault: MakeVaul
         assert report.unreadable == ["locked"]
     finally:
         (root / "locked").chmod(0o755)
+
+
+@contextmanager
+def _symlinked_collision(root: Path) -> Iterator[None]:
+    """A vault with an indexed linker whose parent directory is about to become
+    a symlink, plus a new note that will collide with the existing incumbent.
+    The real directory is dot-prefixed so a full scan does not also re-discover
+    its file as a second, brand-new note under that path."""
+    write_note(root, "vendors/acme.md", "# Acme the vendor\n")
+    sub, real = root / "sub", root / ".sub-real"
+    sub.rename(real)
+    sub.symlink_to(real)
+    try:
+        yield
+    finally:
+        sub.unlink()
+        real.rename(sub)
+
+
+async def test_doctor_repair_surfaces_a_reindex_index_error(make_vault: MakeVault) -> None:
+    root = make_vault(
+        {
+            "customers/acme.md": "# Acme the customer\n",
+            "sub/hub.md": "# Hub\n\nsee [[acme]] for the account\n",
+        }
+    )
+    assert (await doctor(root, embedder)).index_error is None
+    with _symlinked_collision(root):
+        report = await doctor(root, embedder)
+    assert report.index_error is not None and "symlink" in report.index_error
+
+
+async def test_doctor_rebuild_surfaces_a_reindex_index_error(make_vault: MakeVault) -> None:
+    root = make_vault(
+        {
+            "customers/acme.md": "# Acme the customer\n",
+            "sub/hub.md": "# Hub\n\nsee [[acme]] for the account\n",
+        }
+    )
+    await doctor(root, embedder)
+    with _symlinked_collision(root):
+        report = await doctor(root, embedder, DoctorOptions(rebuild=True))
+    assert report.index_error is not None and "symlink" in report.index_error
 
 
 async def test_rebuild_keeps_the_live_index_file_so_open_handles_are_not_stranded(

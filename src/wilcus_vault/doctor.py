@@ -42,6 +42,7 @@ class DoctorReport:
     migrated_discard_log: bool  # a log left in `.vault/` was moved beside the notes
     discards: dict[str, int]  # discard log: total entries, and those from the last 7 days
     unreadable: list[str]  # directories the scan could not read: the vault is only partly seen
+    index_error: str | None = None  # reindex hit an error it could not absorb
 
 
 @dataclass(frozen=True)
@@ -62,12 +63,14 @@ async def doctor(
     # Drift is measured before any repair, so the report says what was wrong.
     stale, missing, unreadable = _with_db(path, lambda db: _disk_drift(db, root))
     reembedded = opts.rebuild
+    index_error = None
     if opts.rebuild:
-        await _rebuild_index(root, embedder)
+        index_error = await _rebuild_index(root, embedder)
     elif opts.repair:
         db = open_db(path)
         try:
-            reembedded = (await reindex(db, root, embedder)).reembedded
+            stats = await reindex(db, root, embedder)
+            reembedded, index_error = stats.reembedded, stats.index_error
         finally:
             db.close()
     broken, ambiguous, orphans, malformed = _with_db(path, _graph_report)
@@ -82,6 +85,7 @@ async def doctor(
         migrated_discard_log=migrated,
         discards=count_discards(root),
         unreadable=unreadable,
+        index_error=index_error,
     )
 
 
@@ -170,7 +174,7 @@ def _graph_report(
     return broken, ambiguous, orphans, malformed
 
 
-async def _rebuild_index(root: Path, embedder: Embedder) -> None:
+async def _rebuild_index(root: Path, embedder: Embedder) -> str | None:
     """Index the files again from scratch, in the live database. Nothing is
     renamed over `index.db`: replacing the inode strands any handle another
     process already has open, which then writes rows into a file nobody will open
@@ -181,6 +185,7 @@ async def _rebuild_index(root: Path, embedder: Embedder) -> None:
     try:
         # Scanned paths plus indexed ones, as `reindex` does: the extras are deletions.
         indexed = [r["path"] for r in db.execute("select path from notes")]
-        await index_paths(db, root, embedder, [*scan_vault(root)[0], *indexed], force=True)
+        stats = await index_paths(db, root, embedder, [*scan_vault(root)[0], *indexed], force=True)
+        return stats.index_error
     finally:
         db.close()

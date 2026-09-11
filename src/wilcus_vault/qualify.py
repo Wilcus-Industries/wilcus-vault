@@ -14,7 +14,7 @@ from pathlib import Path
 from .frontmatter import qualify_links
 from .note import Note, is_writable_target, link_target, parse_note
 from .paths import confined_path, write_atomic
-from .term import printable
+from .term import VaultError, printable
 
 
 @dataclass
@@ -40,7 +40,10 @@ def detect_collisions(
         if len(holders) != 1:
             continue
         incumbent = holders[0]["path"]
-        confined_path(root, incumbent)  # the index is derived data, not a trusted path source
+        try:
+            confined_path(root, incumbent)  # the index is derived data, not a trusted path source
+        except VaultError:
+            continue  # a stale row escaping the vault is no more a collision than one that's gone
         # The incumbent's file must still exist: a move the watcher sees as
         # create-then-delete would otherwise qualify links to a path about to go.
         if (root / incumbent).is_file() and not (root / incumbent).is_symlink():
@@ -78,8 +81,8 @@ def qualify_collisions(
             if target is None or path in new_paths or len(entry.rewritten) >= cap:
                 entry.skipped.append(path)
                 continue
-            abs_path = confined_path(root, path)
             try:
+                abs_path = confined_path(root, path)
                 done = _rewrite(abs_path, path, linker["hash"], stem, target)
             except Exception as e:
                 done = False

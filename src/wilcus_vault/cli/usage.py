@@ -45,8 +45,10 @@ spaces: switching costs a full re-embed, which reindex, doctor and watch do
 on their next pass and search refuses to go without.
 
 Exit code 0 on success, 1 on error — and 1 from doctor when it found links
-only a human can fix: broken (nothing to point at) or ambiguous (a bare
-[[stem]] several notes answer to — qualify it as [[folder/stem]])."""
+only a human can fix (broken: nothing to point at; ambiguous: a bare
+[[stem]] several notes answer to — qualify it as [[folder/stem]]) or when
+doctor's own reindex hit an error it could not absorb (a confinement or
+permission failure, or a failed re-entry)."""
 
 
 def _plural(n: int, word: str) -> str:
@@ -74,7 +76,7 @@ def summary(s: IndexStats) -> str:
         # Their notes are invisible this pass, so the counts above undercount the vault.
         out += safe(f"; could not read: {', '.join(s.unreadable)}")
     if s.index_error is not None:
-        out += safe(f"; re-index of rewritten notes failed: {s.index_error}")
+        out += safe(f"; reindex incomplete: {s.index_error}")
     return out
 
 
@@ -98,4 +100,6 @@ def print_report(r: DoctorReport) -> None:
     lines += [f"malformed frontmatter: {p}" for p in r.malformed]
     lines += [f"orphan: {p}" for p in r.orphans]
     lines += [f"unreadable directory: {p} (its notes are invisible)" for p in r.unreadable]
+    if r.index_error is not None:
+        lines.append(f"reindex incomplete: {r.index_error}")
     print("\n".join(safe(line) for line in lines))

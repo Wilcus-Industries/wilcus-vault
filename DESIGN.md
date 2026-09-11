@@ -131,15 +131,30 @@ repair the vault.
   cannot survive a wikilink round trip (`[`, `]` or `|` in a directory name
   would destroy the links it rewrites), an incumbent whose *file* is gone (the
   row alone is not truth — a move the watcher sees in two passes is a rename,
-  not a collision), both notes new in the same pass (no incumbent — picking
-  one would be the forbidden first-match resolution), a linker edited
-  mid-flight (hash mismatch, never clobbered), a linker unreadable or
-  unwritable, and the cap's remainder are all reported and left to `doctor`'s
-  ambiguous report — `rewritten` + `skipped` account for every linker. A
-  failure in the post-rewrite re-entry rides on `IndexStats.index_error`
-  instead of raising (the files have already changed; the next pass recovers
-  the rows). `doctor --rebuild` and any cold first index see every note as
-  new, so they are structurally no-ops here.
+  not a collision), an incumbent failing confinement (a stale row whose
+  parent directory became a symlink — no more truth than a row whose file is
+  gone), both notes new in the same pass (no incumbent — picking one would be
+  the forbidden first-match resolution), a linker edited mid-flight (hash
+  mismatch, never clobbered), and the cap's remainder are all reported and
+  left to `doctor`'s ambiguous report — `rewritten` + `skipped` account for
+  every linker. A *linker* (not the incumbent) failing confinement, unreadable,
+  or unwritable also lands in `skipped`, but unlike the causes above it rides
+  on `IndexStats.index_error` too: nothing was written for that linker, so
+  there is nothing to recover, but the cause is a filesystem or index fault
+  rather than an ordinary ambiguity, worth a louder signal than a silent
+  skip. A failure in the post-rewrite re-entry rides on the same field for a
+  different reason — the files have already changed, and the next pass
+  recovers the rows. This is narrower than consolidate's member-path
+  confinement check, which aborts the run (below):
+  there a tampered path sits in front of a merge action about to write; here
+  it is one linker among independent per-file rewrites the pass has already
+  committed, so it is skipped and reported like any other post-commit
+  failure instead of discarding the rewrites that already landed. A cold
+  first index sees every note as new, so it is structurally a no-op here —
+  but `doctor --rebuild` marks existing rows dirty, not new (`force` only
+  skips the hash check), so a rebuild run alongside a still-unindexed file
+  can still detect a collision against an existing row and rewrite its
+  linkers, same as an ordinary pass.
 - Frontmatter: `type`, `created`, `updated`, optional `superseded_by`
   (**vault-relative path** of the superseding note), plus free keys. Written by
   us, editable by humans. `parse_note` never raises: a file whose frontmatter is
