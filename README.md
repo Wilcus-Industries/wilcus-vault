@@ -27,7 +27,7 @@ Python 3.12+ and [uv](https://docs.astral.sh/uv/). The system SQLite must be
 not, so use a uv-managed or Homebrew one there. Not published to PyPI yet:
 
 ```
-git clone https://github.com/CrazyWillBear/wilcus-vault && cd wilcus-vault
+git clone https://github.com/Wilcus-Industries/wilcus-vault && cd wilcus-vault
 uv sync
 uv run vault --help
 ```
