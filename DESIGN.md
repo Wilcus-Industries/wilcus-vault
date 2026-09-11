@@ -133,13 +133,20 @@ repair the vault.
   row alone is not truth — a move the watcher sees in two passes is a rename,
   not a collision), both notes new in the same pass (no incumbent — picking
   one would be the forbidden first-match resolution), a linker edited
-  mid-flight (hash mismatch, never clobbered), a linker unreadable or
-  unwritable, and the cap's remainder are all reported and left to `doctor`'s
-  ambiguous report — `rewritten` + `skipped` account for every linker. A
-  failure in the post-rewrite re-entry rides on `IndexStats.index_error`
-  instead of raising (the files have already changed; the next pass recovers
-  the rows). `doctor --rebuild` and any cold first index see every note as
-  new, so they are structurally no-ops here.
+  mid-flight (hash mismatch, never clobbered), and a linker unreadable, and
+  the cap's remainder are all reported and left to `doctor`'s ambiguous
+  report — `rewritten` + `skipped` account for every linker. A linker failing
+  confinement (a stale row whose parent directory became a symlink), a linker
+  unwritable, or a failure in the post-rewrite re-entry all ride on
+  `IndexStats.index_error` instead of raising (the files have already
+  changed; the next pass recovers the rows). This is narrower than
+  consolidate's member-path confinement check, which aborts the run (below):
+  there a tampered path sits in front of a merge action about to write; here
+  it is one linker among independent per-file rewrites the pass has already
+  committed, so it is skipped and reported like any other post-commit
+  failure instead of discarding the rewrites that already landed. `doctor
+  --rebuild` and any cold first index see every note as new, so they are
+  structurally no-ops here.
 - Frontmatter: `type`, `created`, `updated`, optional `superseded_by`
   (**vault-relative path** of the superseding note), plus free keys. Written by
   us, editable by humans. `parse_note` never raises: a file whose frontmatter is
