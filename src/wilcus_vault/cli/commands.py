@@ -23,6 +23,8 @@ class Args:
     ceiling: float | None = None
     agent: str | None = None
     namespace: str | None = None
+    layout: str | None = None
+    roster: str | None = None
     help: bool = False
 
 

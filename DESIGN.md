@@ -59,10 +59,11 @@ src/wilcus_vault/
   watch.py          # watchfiles + per-path debounce + hash dirty-check → index_paths
   cli/
     __init__.py     # vault reindex|doctor|search|watch|propose|get|list|consolidate|
-                    # discards — arg parsing
+                    # discards|init — arg parsing
     commands.py     # consolidate and watch: maintenance that needs more than a line
     scoped.py       # the commands under the policy: propose, get, list, search, discards
     policy.py       # load_policy: <root>/.vault-policy.json, or None for allow-all
+    init.py         # init --layout swarm: a roster's directories and the policy over them
     usage.py        # help text and report formatting
 tests/
   conftest.py       # make_vault / write_note / vec_of, VAULT_* env cleared per test
@@ -604,7 +605,8 @@ is not the one running repairs.
 **On the command line** the policy is `<root>/.vault-policy.json` — the
 `ScopePolicy` above, as JSON — and `--agent` becomes the `VaultContext`.
 `vault propose|get|list|search|discards` follow it (`cli/policy.py`);
-`reindex`, `doctor`, `watch` and `consolidate` never read it. `discards` runs
+`reindex`, `doctor`, `watch` and `consolidate` never read it, and `vault init
+--layout swarm` writes one (§ One shared memory, below). `discards` runs
 only for an agent that may read the whole vault — the log holds refused
 candidates from every namespace — and `restore` writes through the gate as that
 agent, write-checked and stamped like a `propose`. No file is no policy:
@@ -672,6 +674,26 @@ anyway. What it costs is real: the gate decides against the similar notes the
 search returns, so an agent that cannot *see* a fact proposes a second copy of
 it. Narrowing reads to sharpen retrieval is solving a ranking problem with a
 permission, and it belongs in ranking.
+
+**The swarm layout narrows reads anyway, and that is the roster author's call.**
+`vault init --layout swarm --roster <file>` (`cli/init.py`) turns a swarm's
+roster into directories and a `.vault-policy.json` over them: `shared/`, plus
+`roles/<r>/` and `proposals/<r>/` for each manager and doer, which read `shared/`
+and own their two; a worker reads `shared/` and its manager's `roles/` and has no
+write rule, so its writes fail closed; the orchestrator gets the whole vault. The
+library knows nothing about roles. The layout is a CLI generator whose output is a
+plain `ScopePolicy`, run through `compile_scopes` before it is written so init
+never writes one `open()` would refuse, and enforced like any other. It goes
+against the default above, and the cost named there is real: a doer cannot see a
+peer's notes, so two doers can each hold a copy of one fact. That is acceptable
+here because the copies meet the gate on the way into shared memory: promotion
+(`vault promote`, #57) runs a proposal through the gate against `shared/`, and
+that is where a duplicate is caught. A role name is used verbatim, as the
+`--agent`, the policy key and the directory name, so a name that cannot be one
+canonical path segment (empty, a `/` or `\`, a leading `.`, a control character)
+is refused rather than slugified: a rewritten name would scope the agent to a
+directory its own name does not match. Re-running init keeps the directories and
+replaces the policy whole, since the roster is its source.
 
 **The decider is the rail, and that is accepted.** One shared memory means the
 decider chooses among every agent's notes on every propose, and nothing but its

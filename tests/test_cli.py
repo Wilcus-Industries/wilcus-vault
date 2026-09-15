@@ -148,6 +148,7 @@ async def test_help_documents_every_command_and_exits_0(
         "propose",
         "get <path>",
         "list [prefix]",
+        "init --layout swarm --roster <file>",
         ".vault-policy.json",
         "--vault",
         "--lexical",
