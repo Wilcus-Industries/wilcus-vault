@@ -54,8 +54,9 @@ vault discards restore <n> --ceiling <d> # re-propose it through the gate
 vault --help                             # every command and flag
 ```
 
-`--vault` defaults to the current directory; `--` ends flag parsing, so a query
-may start with a dash. Exit code 0 on success, 1 on error — and 1 from `doctor`
+`--vault` defaults to the current directory, and is resolved through symlinks
+before anything reads it, so a command's policy, index and notes all come from
+one directory; `--` ends flag parsing, so a query may start with a dash. Exit code 0 on success, 1 on error — and 1 from `doctor`
 when it found links only a human can fix: broken (nothing to point at) or
 ambiguous (a bare `[[stem]]` several notes answer to — `doctor` prints the
 candidate paths, and qualifying the link with one of them is the fix) — or when

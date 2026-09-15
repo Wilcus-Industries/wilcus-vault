@@ -16,7 +16,7 @@ def load_policy(root: str | Path) -> ScopePolicy | None:
     """The vault's policy, or None when there is no file: allow-all, the library's
     default. A file that is there but unusable raises rather than reading as absent,
     which would grant everything. The rules inside it are checked by `open()`."""
-    here = Path(root).resolve()  # so a symlink into a vault is inside it too
+    here = Path(os.path.abspath(root))  # as Vault does; the CLI has already resolved it
     for above in here.parents:
         # Below a scoped vault's root its policy is out of sight, and every agent
         # would run allow-all over that vault's notes.

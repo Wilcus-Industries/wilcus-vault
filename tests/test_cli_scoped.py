@@ -240,6 +240,15 @@ async def test_a_directory_inside_a_scoped_vault_is_refused_never_allow_all(
     assert (r.code, r.out) == (1, "")
     assert f"use --vault {here}" in r.err
 
+    # `attach/..` spells the vault, but through the link it is the target's parent: the
+    # policy and the notes must both come from one of those directories, never one each
+    outside = root.parent / f"{root.name}-outside" / "target"
+    outside.mkdir(parents=True)
+    (root / "attach").symlink_to(outside)
+    dotdot = ("--agent", "core/notes", "--lexical", "--vault", root / "attach" / "..")
+    r = await cli(capsys, "get", "secret/plans.md", *dotdot)
+    assert (r.code, r.out, r.err) == (1, "", "no note at secret/plans.md")
+
 
 async def test_get_prints_the_file_with_only_line_endings_and_tabs_left_raw(
     make_vault: MakeVault, capsys: pytest.CaptureFixture[str]

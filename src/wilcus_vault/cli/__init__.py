@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 from ..db import db_path, open_db
 from ..doctor import DoctorOptions, doctor
@@ -89,6 +90,9 @@ async def run(argv: list[str]) -> int:
         print(message, file=sys.stderr)
         return 1
     command, rest = args.words[0], args.words[1:]
+    # Resolved once, so the policy lookup and the vault opened are one directory even
+    # through a symlink: `link/..` is the link target's parent, not the lexical one.
+    args.root = str(Path(args.root).resolve())
     # A bad embedder configuration raises here, before a database is opened.
     embedder: Embedder = TokenOverlapEmbedder() if args.lexical else FetchEmbedder()
     if command == "search":
