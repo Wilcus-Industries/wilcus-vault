@@ -45,6 +45,8 @@ vault search <query> [--agent <a>]       # hybrid search, best first
 vault watch [--vault <dir>]              # index changes as they are saved
 vault propose --ceiling <d> [--agent <a>] [--namespace <ns>] < note.md
                                          # write a note through the gate
+vault promote <path> --ceiling <d> [--agent <a>]
+                                         # a proposals/ note, through the gate into shared/
 vault get <path> [--agent <a>]           # print one note's file
 vault list [prefix] [--agent <a>]        # note paths, one per line
 vault consolidate --ceiling <d>          # report near-duplicate clusters
@@ -112,7 +114,7 @@ call — it needs a merger you inject, and the CLI wires none — so this is the
 pass you run to find the ceiling your embedder calls a duplicate. See
 [Consolidation](#consolidation).
 
-`propose`, `get`, `list`, `search` and `discards` act for an agent: `--agent
+`propose`, `promote`, `get`, `list`, `search` and `discards` act for an agent: `--agent
 <name>` is the caller, and a `.vault-policy.json` at the vault's root is what it
 is checked against — the [Scopes](#scopes) policy, as JSON:
 
@@ -156,8 +158,28 @@ decision. `--namespace` is where a created note goes: the vault root without it.
 `get` prints the note's file, control characters scrubbed but for newlines and
 tabs, or exits 1 with `no note at <path>` — one answer for a note that is not
 there and a note the agent may not read. `list` reindexes first too, then prints
-one path per line. It, `propose` and `discards restore` send the reindex summary
-to stderr, so stdout holds only the answer.
+one path per line. It, `propose`, `promote` and `discards restore` send the reindex
+summary to stderr, so stdout holds only the answer.
+
+```
+$ vault promote proposals/clerk/acme-renewal.md --agent orchestrator --ceiling 0.35
+update  shared/acme.md
+proposal removed
+```
+
+`promote` sends a note under `proposals/` through the same gate into `shared/` —
+its title, type and body, as if proposed — then removes it. The decider judges it
+against `shared/` alone, so a copy in `roles/` or another proposal can never
+absorb it, and the note it writes records the proposal's path as `vault_source`.
+The agent must be able to read and write the proposal and write `shared/`, and a
+proposal with malformed frontmatter is refused, all before the chat model runs.
+Just before the proposal is removed, its title, type and body are appended to
+`.discarded.log` with reason `promoted` and the path they landed at, which
+`discards show` prints (after a `discard` the gate's own entry is that record),
+so a decider's merge that drops a fact loses nothing. A proposal edited while the gate ran is kept, and the second
+line says `proposal kept: it changed during promote`. A path outside
+`proposals/` is refused however it is spelled
+(`proposals/../shared/x.md` is `shared/x.md`), and a path with no note exits 1.
 
 `vault init --layout swarm --roster <file>` sets a vault up as a swarm's tiered
 memory. The roster names each role and its kind (other keys are ignored):
@@ -369,6 +391,27 @@ nothing is stamped — on an `update` that also means the previous call's keys a
 *removed*, so `vault_agent` never names an agent that did not write the note it
 sits on. Omitting it stops being an option once the vault has a scope policy,
 which has nothing to check the write against without it.
+
+`promote` puts a note already in the vault through that same gate, then removes
+it: what an orchestrator does with a peer's proposal.
+
+```python
+result = await vault.promote("proposals/clerk/acme.md", "shared", ctx)
+# PromoteResult(action="update", path="shared/acme.md", superseded=None,
+#               unmarked=None, fell_back=False, removed=True)
+```
+
+The candidate is the note's title, type and body, placed in the namespace, and
+the gate runs confined to that namespace: the decider is shown only its notes and
+can target nothing outside it. `ctx.source` defaults to the note's path. The
+agent must be able to read the note and write both it and the namespace, and a
+note with malformed frontmatter is refused, all before the decider runs; a note
+it may not read is `no note at`, like an absent one. Whatever the gate decides,
+the note is then removed only if its hash is unchanged, and just before that the
+candidate is appended to the discard log with reason `promoted` and the landed
+`path` (after a `discard`, the gate's own entry is that record). One a peer
+edited meanwhile is kept, with `removed=False`. The library knows no layout;
+`proposals/` and `shared/` are the CLI's.
 
 ### Consolidation
 

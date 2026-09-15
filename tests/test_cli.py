@@ -146,6 +146,7 @@ async def test_help_documents_every_command_and_exits_0(
         "consolidate",
         "discards",
         "propose",
+        "promote <path>",
         "get <path>",
         "list [prefix]",
         "init --layout swarm --roster <file>",

@@ -35,7 +35,7 @@ src/wilcus_vault/
   db.py             # open DB (WAL, busy_timeout), load sqlite-vec, schema,
                     # vectors_stale (read-only) / reset_vectors (destructive)
   term.py           # scrub control characters out of anything echoed to a terminal
-  paths.py          # confined_path, slugify, write_atomic: every filename rail
+  paths.py          # canonical_path, confined_path, slugify, write_atomic: every filename rail
   embed.py          # Embedder protocol + the deterministic TokenOverlapEmbedder
   fetch_embedder.py # FetchEmbedder over an OpenAI-compatible /v1/embeddings
   http.py           # the endpoint/key rules, redaction and POST shared by both providers
@@ -50,7 +50,9 @@ src/wilcus_vault/
   decision.py       # the decider contract: Candidate, Decision, gate_prompt, parse_decision
   decide.py         # fetch_decider: an OpenAI-compatible chat decider for the CLI
   gate.py           # write gate: top-k similar → decider → update|supersede|create|discard
-  gate_write.py     # the notes the gate authors: create (free path) and mark_superseded
+  gate_write.py     # the notes the gate authors: create (free path), mark_superseded, and
+                    # close_gate, the closing pass that indexes them
+  promote.py        # one note through the gate into a namespace, then removed if unchanged
   discard_log.py    # the discard log's write side: JSONL beside the notes, rotated
   discards.py       # its read side: list / get / restore, and doctor's count
   cluster.py        # complete-linkage clusters under a distance ceiling
@@ -58,10 +60,11 @@ src/wilcus_vault/
   consolidate.py    # the consolidation pass over those clusters, dry-run by default
   watch.py          # watchfiles + per-path debounce + hash dirty-check → index_paths
   cli/
-    __init__.py     # vault reindex|doctor|search|watch|propose|get|list|consolidate|
-                    # discards|init — arg parsing
+    __init__.py     # vault reindex|doctor|search|watch|propose|promote|get|list|
+                    # consolidate|discards|init — arg parsing
     commands.py     # consolidate and watch: maintenance that needs more than a line
-    scoped.py       # the commands under the policy: propose, get, list, search, discards
+    scoped.py       # the commands under the policy: propose, promote, get, list, search,
+                    # discards
     policy.py       # load_policy: <root>/.vault-policy.json, or None for allow-all
     init.py         # init --layout swarm: a roster's directories and the policy over them
     usage.py        # help text and report formatting
@@ -426,9 +429,9 @@ confinement, and one this agent may not write:
      gate stays the only write door. The CLI's `restore` wires `fetch_decider`
      (`decide.py`), FetchEmbedder's chat twin: OpenAI-compatible, configured by
      `VAULT_DECIDE_*`, endpoint defaulting to the local Ollama, model always
-     explicit — and `vault propose` wires the same one. They are the two CLI
-     commands that run a model, because a write that skipped the decider
-     would bypass the gate.
+     explicit — and `vault propose` and `vault promote` wire the same one.
+     They are the CLI commands that run a model, because a write that skipped
+     the decider would bypass the gate.
 
 **The closing pass, and the freshness window.** A `propose` ends by re-indexing,
 so the index never lags a write we made ourselves. That pass is deliberately the
@@ -463,6 +466,57 @@ ambiguous. A title that slugifies to nothing (CJK, Cyrillic, emoji)
 is named `note-<8 hex of the candidate's hash>`; a candidate the gate cannot
 place at all is appended to `<root>/.discarded.log` before it raises. Losing the
 note is never one of the outcomes.
+
+**Promote: a note already in the vault, through the gate.** `vault.promote(path,
+namespace, ctx?)` (`promote.py`) makes one note a candidate — its parsed title,
+type and body, placed in `namespace` — runs it through the gate `propose` runs,
+then removes it. It knows no layout: which notes are proposals, and where they
+go, is the caller's business. Every refusal lands before the decider runs: a note
+the agent may not read is `no note at`, exactly like an absent one (`get` answers
+both); a note it may read but not write is refused, since it could never be
+removed; a note with malformed frontmatter is refused and kept, since its broken
+block would land in the new note's body; and the namespace gets the gate's own
+write check. `ctx.source` defaults to the note's path, so what the gate writes
+records where it came from. Three rails of its own:
+
+- **Only the namespace is judged against.** The gate runs under the caller's
+  scope confined to the canonical namespace: the policy's rules under it, one
+  rule at it carrying the policy's answer there, and the rest of the vault denied
+  (with no policy: read and write at the namespace, nothing elsewhere). Search
+  applies that in SQL, before its cut to n, so the decider still sees up to n of
+  the namespace's notes, and the gate's read re-check and target write check are
+  confined with it. Unconfined, an orchestrator that reads everything has a peer's
+  `roles/` copy or another proposal absorb the promotion, be marked superseded by
+  it, or get it discarded as already written down — and the proposal is deleted
+  while the namespace never gets the fact. § One shared memory rejects pinning a
+  `propose` to a namespace because its target is deliberately the whole memory;
+  for `promote` the namespace is the whole point of the call. The note itself is
+  also kept out of `similar` (for a note already inside the namespace), and its
+  stem does not count against the new note's slug, so a proposal named by its
+  title's slug does not push the promoted note to `-2`.
+- **Check-and-remove.** Whatever the gate decided, the note is re-read and removed
+  only if its hash is still the one `get` read. One a peer edited while the
+  decider ran is kept, and `PromoteResult` (the `GateResult` plus `removed`) says
+  so. An edit landing between that re-read and the unlink is the same window
+  check-and-write has. The gate's closing pass waits for the removal
+  (`propose(..., close=False)`, then `close_gate` in `gate_write.py`) and takes
+  the note's path with it, so the removed note's row is purged by the same pass
+  that indexes the new note. Run first, that pass sees a new `shared/<slug>.md`
+  collide with the note's stem and auto-qualifies every bare `[[slug]]` in the
+  vault to the note's path, which the removal then breaks, orphaning the new
+  note. In one pass it is a rename, and a bare link follows the note to where it
+  landed. A kept note is re-read instead, and links to it are rightly qualified:
+  it is still there.
+- **Logged before it goes.** A decider may answer with a body of its own, and a
+  merge can drop a fact the note held. So just before the unlink the candidate is
+  appended to `.discarded.log` whole, with `reason: promoted` and the `path` it
+  landed at, which `vault discards show` prints — except after a `discard`, which the gate has logged already. A
+  removed note's candidate is always in the log; a kept note is still on disk.
+
+`vault promote <path>` puts one layout on top: the path must be under
+`proposals/`, checked in its canonical form (`proposals/../shared/x.md` is
+`shared/x.md`, and refused), the namespace is `shared/`, and it prints the gate's
+line, then `proposal removed` or `proposal kept: it changed during promote`.
 
 Human edits bypass the gate by definition (files are truth); the watcher +
 `doctor` pick them up.
@@ -597,6 +651,10 @@ Enforcement points, all inside the library so no caller re-implements them:
   the write check on the decision's `target`, and a decision that targets one
   **falls back to `create`**, like a target that failed check-and-write
   twice: the candidate always lands somewhere, losing it is never an outcome.
+- `promote` — the read and write check on the note it takes (read through
+  `get`, so an unreadable note is an absent one), then the gate's write check
+  on the namespace, all before the decider runs; the gate itself runs confined
+  to that namespace (§ Write gate).
 
 Maintenance is unscoped: `doctor`, `reindex`, `watch` and `close` are
 operator operations on the whole vault and take no context — a scoped agent
@@ -604,7 +662,7 @@ is not the one running repairs.
 
 **On the command line** the policy is `<root>/.vault-policy.json` — the
 `ScopePolicy` above, as JSON — and `--agent` becomes the `VaultContext`.
-`vault propose|get|list|search|discards` follow it (`cli/policy.py`);
+`vault propose|promote|get|list|search|discards` follow it (`cli/policy.py`);
 `reindex`, `doctor`, `watch` and `consolidate` never read it, and `vault init
 --layout swarm` writes one (§ One shared memory, below). `discards` runs
 only for an agent that may read the whole vault — the log holds refused

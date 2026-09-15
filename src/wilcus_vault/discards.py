@@ -7,7 +7,7 @@ ponytail: a full parse per call, bounded by the rotation cap per file.
 import errno
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import UnionType
@@ -39,6 +39,7 @@ class DiscardEntry:
     decision: Decision | None  # the decider's verdict; None for a placement failure
     reason: str | None  # why the gate could not place the note
     similar: list[DiscardedSimilar]  # what the decider judged against
+    path: str | None = None  # where a promoted note landed
 
 
 def _log_files(root: Path) -> list[Path]:
@@ -79,6 +80,7 @@ def _parse_line(line: str) -> DiscardEntry | None:
             candidate=_build(Candidate, raw["candidate"]),
             decision=_build(Decision, decision) if isinstance(decision, dict) else None,
             reason=raw.get("reason"),
+            path=raw.get("path"),
             similar=[_build(DiscardedSimilar, s) for s in similar]
             if isinstance(similar, list)
             else [],
@@ -137,11 +139,7 @@ def list_discards(root: str | Path) -> tuple[list[DiscardEntry], int]:
             else:
                 parsed.append(entry)
     parsed.reverse()
-    numbered = [
-        DiscardEntry(i + 1, e.at, e.candidate, e.decision, e.reason, e.similar)
-        for i, e in enumerate(parsed)
-    ]
-    return numbered, malformed
+    return [replace(e, n=i + 1) for i, e in enumerate(parsed)], malformed
 
 
 def get_discard(root: str | Path, n: int) -> DiscardEntry | None:
@@ -191,5 +189,7 @@ def entry_to_json(entry: DiscardEntry) -> dict[str, Any]:
         out["decision"] = {k: v for k, v in vars(entry.decision).items() if v is not None}
     if entry.reason is not None:
         out["reason"] = entry.reason
+    if entry.path is not None:
+        out["path"] = entry.path
     out["similar"] = [vars(s) for s in entry.similar]
     return out

@@ -1,4 +1,4 @@
-"""The commands that follow the vault's policy: propose, get, list, search and discards."""
+"""The commands under the vault's policy: propose, promote, get, list, search, discards."""
 
 import json
 import sys
@@ -13,6 +13,7 @@ from ..gate import GateOptions
 from ..gate_write import GateResult
 from ..indexer import read_raw
 from ..note import parse_note
+from ..paths import canonical_path
 from ..scope import VaultContext, compile_scopes, scope_for
 from ..search import SearchOptions
 from ..search_sql import Cutoffs
@@ -65,6 +66,19 @@ async def cmd_propose(args: Args, embedder: Embedder, rest: list[str]) -> int:
         raise VaultError("propose: the note has no title — give it a # heading or a title: key")
     candidate = Candidate(note.title, note.body, note.type, args.namespace)
     return await _through_gate(args, embedder, "propose", lambda v, ctx: v.propose(candidate, ctx))
+
+
+async def cmd_promote(args: Args, embedder: Embedder, rest: list[str]) -> int:
+    if len(rest) != 1:
+        raise VaultError(f"promote needs one proposal path\n\n{USAGE}")
+    # The layout is the CLI's, not the library's: proposals/ in, shared/ out. Checked
+    # in the canonical form the library reads, or `proposals/../shared/x.md` would pass.
+    path = canonical_path(args.root, rest[0])
+    if not path.startswith("proposals/"):
+        raise VaultError(f"promote: {safe(rest[0])} is not under proposals/")
+    return await _through_gate(
+        args, embedder, "promote", lambda v, ctx: v.promote(path, "shared", ctx)
+    )
 
 
 async def cmd_discards(args: Args, embedder: Embedder, rest: list[str]) -> int:
