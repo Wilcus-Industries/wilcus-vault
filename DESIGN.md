@@ -58,8 +58,11 @@ src/wilcus_vault/
   consolidate.py    # the consolidation pass over those clusters, dry-run by default
   watch.py          # watchfiles + per-path debounce + hash dirty-check → index_paths
   cli/
-    __init__.py     # vault reindex|doctor|search|watch|consolidate|discards — arg parsing
-    commands.py     # the subcommands that need more than a line
+    __init__.py     # vault reindex|doctor|search|watch|propose|get|list|consolidate|
+                    # discards — arg parsing
+    commands.py     # the maintenance subcommands that need more than a line
+    scoped.py       # an agent's commands — propose, get, list, search — under the policy
+    policy.py       # load_policy: <root>/.vault-policy.json, or None for allow-all
     usage.py        # help text and report formatting
 tests/
   conftest.py       # make_vault / write_note / vec_of, VAULT_* env cleared per test
@@ -422,8 +425,9 @@ confinement, and one this agent may not write:
      gate stays the only write door. The CLI's `restore` wires `fetch_decider`
      (`decide.py`), FetchEmbedder's chat twin: OpenAI-compatible, configured by
      `VAULT_DECIDE_*`, endpoint defaulting to the local Ollama, model always
-     explicit — the one CLI command that runs a model, because restoring
-     without re-deciding would bypass the gate.
+     explicit — and `vault propose` wires the same one. They are the two CLI
+     commands that run a model, because a write that skipped the decider
+     would bypass the gate.
 
 **The closing pass, and the freshness window.** A `propose` ends by re-indexing,
 so the index never lags a write we made ourselves. That pass is deliberately the
@@ -595,6 +599,19 @@ Enforcement points, all inside the library so no caller re-implements them:
 Maintenance is unscoped: `doctor`, `reindex`, `watch` and `close` are
 operator operations on the whole vault and take no context — a scoped agent
 is not the one running repairs.
+
+**On the command line** the policy is `<root>/.vault-policy.json` — the
+`ScopePolicy` above, as JSON — and `--agent` becomes the `VaultContext`.
+`vault propose|get|list|search` load it (`cli/policy.py`); the maintenance
+commands never do. No file is no policy: allow-all, the line `None` draws. A
+file that is there but cannot be used — unreadable, not JSON, not an object, a
+dangling symlink — is an error, not a reading of "absent", which would grant
+everything; the rules inside it are `open()`'s to check, like any policy's. It
+sits beside the notes, **not** in `.vault/`: that directory is the disposable
+index, and `rm -rf .vault` is documented as safe. A policy kept there would
+fail *open* the day someone took that advice — every agent silently allowed
+everywhere. Beside the notes it is a dot-file, so the scan never indexes it, and
+it goes wherever the notes it governs go.
 
 Stated plainly: **scopes are advisory containment at the library API, not
 security.** Any process with filesystem access can read or edit the files

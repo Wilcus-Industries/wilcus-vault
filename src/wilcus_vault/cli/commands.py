@@ -1,4 +1,4 @@
-"""The CLI subcommands that need more than a line: search, consolidate, discards, watch."""
+"""The maintenance subcommands that need more than a line: consolidate, discards, watch."""
 
 import asyncio
 import json
@@ -13,12 +13,11 @@ from ..discards import entry_to_json, get_discard, list_discards, restore_discar
 from ..embed import Embedder
 from ..gate import GateOptions
 from ..indexer import IndexStats, reindex
-from ..search import hybrid_search
 from ..search_sql import Cutoffs
 from ..term import VaultError, safe
 from ..vault import open
 from ..watch import WatchOptions, watch
-from .usage import USAGE, summary
+from .usage import USAGE, gate_line, summary
 
 
 @dataclass
@@ -28,25 +27,9 @@ class Args:
     rebuild: bool = False
     lexical: bool = False
     ceiling: float | None = None
+    agent: str | None = None
+    namespace: str | None = None
     help: bool = False
-
-
-async def cmd_search(root: str, embedder: Embedder, query: str) -> int:
-    if query == "":
-        raise VaultError(f"search needs a query\n\n{USAGE}")
-    db = open_db(db_path(root))
-    try:
-        if db.execute("select 1 from notes limit 1").fetchone() is None:
-            print("vault is not indexed (run vault reindex)")
-            return 0
-        # No cutoffs: the ceiling that means "irrelevant" is a property of the
-        # embedder, unknowable here, so the CLI shows the ranking and lets the reader judge.
-        hits = await hybrid_search(db, embedder, query)
-        lines = [safe(f"{h.score:.4f}  {h.path} — {h.title}") for h in hits]
-        print("\n".join(lines) if lines else "no matches")
-    finally:
-        db.close()
-    return 0
 
 
 async def cmd_consolidate(args: Args, embedder: Embedder) -> int:
@@ -104,9 +87,7 @@ async def cmd_discards(args: Args, embedder: Embedder, rest: list[str]) -> int:
     vault = open(args.root, embedder, gate=gate)
     try:
         print(f"indexed {summary(await vault.reindex())}")
-        r = await restore_discard(vault, n)
-        path = f"  {r.path}" if r.path is not None else ""
-        print(safe(f"{r.action}{path}{' (fell back)' if r.fell_back else ''}"))
+        print(gate_line(await restore_discard(vault, n)))
     finally:
         vault.close()
     return 0
