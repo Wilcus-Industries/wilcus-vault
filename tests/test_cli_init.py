@@ -225,7 +225,9 @@ async def test_init_inside_a_scoped_vault_is_refused(
     r = await init(capsys, root / "shared", ROSTER)
     here = root.resolve()
     assert (r.code, r.out) == (1, "")
-    assert f"{here / 'shared'} is inside the scoped vault {here}" in r.err
+    # never "use --vault <root>": re-running init there would replace the swarm's policy
+    inside = f"init: {here / 'shared'} is inside the scoped vault {here}"
+    assert r.err == f"{inside}; init a directory outside it"
     assert list((root / "shared").iterdir()) == []
 
 

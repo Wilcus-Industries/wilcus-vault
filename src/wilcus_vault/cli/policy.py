@@ -12,15 +12,19 @@ from ..term import VaultError, printable
 POLICY_FILE = ".vault-policy.json"
 
 
-def outside_scoped_vaults(root: str | Path) -> Path:
+def outside_scoped_vaults(
+    root: str | Path, command: str = "vault", advice: str | None = None
+) -> Path:
     """`root` as an absolute path, refused when a directory above it holds a policy.
     Below a scoped vault's root that policy is out of sight, so every agent would run
-    allow-all over its notes, and a policy written there would govern none of them."""
+    allow-all over its notes, and a policy written there would govern none of them.
+    `command` and `advice` word the refusal; by default it points at the vault's root."""
     here = Path(os.path.abspath(root))  # as Vault does; the CLI has already resolved it
     for above in here.parents:
         if os.path.lexists(above / POLICY_FILE):
             raise VaultError(
-                f"vault: {here} is inside the scoped vault {above}; use --vault {above}"
+                f"{command}: {here} is inside the scoped vault {above}; "
+                f"{advice or f'use --vault {above}'}"
             )
     return here
 

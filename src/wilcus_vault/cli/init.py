@@ -21,7 +21,8 @@ Roster = dict[str, dict[str, Any]]
 
 
 def cmd_init(args: Args, rest: list[str]) -> int:
-    root = outside_scoped_vaults(args.root)
+    # Not "use --vault <root>": init there would replace that swarm's policy with this roster.
+    root = outside_scoped_vaults(args.root, "init", "init a directory outside it")
     # A policy scopes everything below it, so it goes only where nothing is yet, or where
     # it replaces one: in a project root above a live swarm it would lock that swarm out.
     if root.exists() and not os.path.lexists(root / POLICY_FILE) and any(root.iterdir()):
