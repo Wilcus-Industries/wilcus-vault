@@ -185,11 +185,19 @@ The policy it writes gives the orchestrator the whole vault. A manager or doer
 reads `shared/` and writes its own `roles/<role>/` and `proposals/<role>/`. A
 worker reads `shared/` and its manager's `roles/`, and writes nothing. A role
 name is the `--agent` that role passes and its directory name, verbatim, so a
-name that is not one path segment (empty, a `/` or `\`, a leading `.`, a control
-character) is refused rather than rewritten. So is an unknown `kind`, or a worker
-whose `manager` is not a manager row. Each error names its row, and nothing is
-written until the whole roster checks out. Re-running init keeps existing
-directories and replaces the policy, since the roster is its source. This layout
+name that is not one path segment (blank, a `/` or `\`, a leading `.`, a control
+character, or not valid UTF-8) is refused rather than rewritten. So is an unknown
+`kind`, or a worker whose `manager` is not a manager row. Each error names its
+row, and nothing is written until the whole roster checks out. Re-running init
+keeps existing directories and replaces the policy, since the roster is its
+source.
+
+init runs only on a directory that is not there yet, is empty, or already holds
+its own `.vault-policy.json`, and never inside a scoped vault. A policy scopes
+everything below it, and `--vault` defaults to the current directory, so init
+from a project root above a live swarm would otherwise lock that swarm's memory
+out. As a result an existing unscoped vault is not converted in place: set the
+swarm up in a fresh directory. This layout
 narrows reads, which [Scopes](#scopes) otherwise advises against; DESIGN.md § One
 shared memory says why it is acceptable here.
 

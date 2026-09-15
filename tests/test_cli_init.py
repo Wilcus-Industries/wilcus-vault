@@ -92,6 +92,10 @@ INVALID: dict[str, tuple[object, str]] = {
     "a hidden name": ({".git": {"kind": "doer"}}, 'row ".git": a role name must be one path'),
     "a control character": ({"a\x1bb": {"kind": "doer"}}, 'row "a?b": a role name must be'),
     "a NUL": ({"a\x00b": {"kind": "doer"}}, 'row "a?b": a role name must be one path'),
+    # the gate refuses every propose from a blank agent, so its scope would be dead weight
+    "a blank name": ({"   ": {"kind": "doer"}}, 'row "   ": a role name must be one path'),
+    # a JSON escape can spell half a surrogate pair, which no filename can hold
+    "a lone surrogate": ({"bad\ud800": {"kind": "doer"}}, "a role name must be one path segment"),
     # refused even where no directory is made: the name is still what --agent passes
     "an orchestrator with a slash": ({"a/b": {"kind": "orchestrator"}}, "must be one path segment"),
     "a row that is not an object": ({"a": "doer"}, 'row "a": kind must be orchestrator, manager'),
@@ -175,7 +179,7 @@ async def test_reinit_keeps_what_is_there_and_replaces_the_policy(
 async def test_init_refuses_a_symlinked_namespace_before_writing_anything(
     make_vault: MakeVault, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    root = make_vault({})
+    root = make_vault({".vault-policy.json": "{}"})  # a re-init, so the directory may hold things
     outside = root.parent / f"{root.name}-elsewhere"
     outside.mkdir()
     (root / "roles").symlink_to(outside)
@@ -183,7 +187,46 @@ async def test_init_refuses_a_symlinked_namespace_before_writing_anything(
     assert (r.code, r.out) == (1, "")
     assert "roles/Planner Two passes through a symlink" in r.err
     assert list(outside.iterdir()) == []
-    assert [p.name for p in root.iterdir()] == ["roles"]  # no shared/, no policy
+    assert sorted(p.name for p in root.iterdir()) == [".vault-policy.json", "roles"]  # no shared/
+    assert (root / ".vault-policy.json").read_text() == "{}"  # and no new policy
+
+
+async def test_init_refuses_a_directory_holding_anything_but_its_own_policy(
+    make_vault: MakeVault, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parent = make_vault({})
+    swarm = parent / "swarm"
+    roster = roster_file(parent, ROSTER)  # beside parent, so parent holds only the swarm
+    lay_out = ("init", "--layout", "swarm", "--roster", roster, "--vault")
+    assert (await cli(capsys, *lay_out, swarm)).code == 0  # a directory not there yet is made
+
+    # --vault defaults to the working directory: a policy in a project root above a live
+    # swarm would put the swarm inside another scoped vault, and lock every command out
+    r = await cli(capsys, *lay_out, parent)
+    assert (r.code, r.out) == (1, "")
+    assert f"init: {parent.resolve()} is not empty and has no .vault-policy.json" in r.err
+    assert [p.name for p in parent.iterdir()] == ["swarm"]
+    assert (await cli(capsys, "list", "--agent", "lead", "--lexical", "--vault", swarm)).code == 0
+
+    # nor is an unscoped vault converted: every agent the roster leaves out would lose it
+    plain = make_vault({"notes/a.md": "# A\n"})
+    r = await init(capsys, plain, ROSTER)
+    assert (r.code, r.out) == (1, "")
+    assert "is not empty and has no .vault-policy.json" in r.err
+    assert [p.name for p in plain.iterdir()] == ["notes"]
+
+
+async def test_init_inside_a_scoped_vault_is_refused(
+    make_vault: MakeVault, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = make_vault({})
+    assert (await init(capsys, root, ROSTER)).code == 0
+    # empty, but a policy there would sit inside the swarm's, out of sight of its commands
+    r = await init(capsys, root / "shared", ROSTER)
+    here = root.resolve()
+    assert (r.code, r.out) == (1, "")
+    assert f"{here / 'shared'} is inside the scoped vault {here}" in r.err
+    assert list((root / "shared").iterdir()) == []
 
 
 async def test_a_vault_opened_with_the_written_policy_enforces_it(

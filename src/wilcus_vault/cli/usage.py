@@ -47,9 +47,14 @@ tiered memory. The roster is JSON: role -> {"kind": "orchestrator",
 needs a manager, it must be a manager row, and other keys are ignored. A
 role name is used verbatim as its --agent and its directory, so a name that
 is not one path segment is refused; any invalid row is refused before
-anything is written. init creates shared/, plus roles/<role>/ and
-proposals/<role>/ for each manager and doer, keeping what already exists,
-and writes .vault-policy.json from the roster, replacing any before it. The
+anything is written. init runs only on a directory that is not there yet,
+is empty, or holds a .vault-policy.json of its own (a re-init), and never
+inside a scoped vault. A policy scopes everything below it, so init will
+not turn a project root above a swarm into a vault that locks the swarm
+out, and for the same reason it will not convert an existing unscoped
+vault. init creates shared/, plus roles/<role>/ and proposals/<role>/ for
+each manager and doer, keeping what already exists, and writes
+.vault-policy.json from the roster, replacing any before it. The
 orchestrator reads and writes everything; a manager or doer reads shared/
 and writes its own two directories; a worker reads shared/ and its
 manager's roles/, and writes nothing.

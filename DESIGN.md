@@ -690,10 +690,21 @@ here because the copies meet the gate on the way into shared memory: promotion
 (`vault promote`, #57) runs a proposal through the gate against `shared/`, and
 that is where a duplicate is caught. A role name is used verbatim, as the
 `--agent`, the policy key and the directory name, so a name that cannot be one
-canonical path segment (empty, a `/` or `\`, a leading `.`, a control character)
-is refused rather than slugified: a rewritten name would scope the agent to a
-directory its own name does not match. Re-running init keeps the directories and
-replaces the policy whole, since the roster is its source.
+canonical path segment (blank, a `/` or `\`, a leading `.`, a control character,
+or not valid UTF-8) is refused rather than slugified: a rewritten name would scope
+the agent to a directory its own name does not match. Re-running init keeps the
+directories and replaces the policy whole, since the roster is its source.
+
+Where init may write is narrower than where a policy may sit. It runs only on a
+directory that is not there yet, is empty, or already holds its own
+`.vault-policy.json`, and never below a scoped vault's root (the same ancestor
+check `load_policy` makes, shared as `outside_scoped_vaults`). A policy scopes
+everything under it, and every command below a scoped root is refused, so a
+policy written to a project root above a live swarm (`--vault` defaults to the
+working directory) would take that swarm's memory offline. Init does not walk
+down looking for one instead: a swarm's memory can live under a dot-directory the
+scan skips. The price is that an existing unscoped vault cannot be converted in
+place, because a directory of notes cannot be told apart from that project root.
 
 **The decider is the rail, and that is accepted.** One shared memory means the
 decider chooses among every agent's notes on every propose, and nothing but its
