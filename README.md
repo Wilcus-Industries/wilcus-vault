@@ -172,7 +172,7 @@ memory. The roster names each role and its kind (other keys are ignored):
 ```
 
 ```
-$ vault init --layout swarm --roster roster.json
+$ vault init --layout swarm --roster roster.json --vault memory
 created shared/
 created roles/planner/
 created proposals/planner/

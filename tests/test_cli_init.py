@@ -195,7 +195,7 @@ async def test_init_refuses_a_directory_holding_anything_but_its_own_policy(
     make_vault: MakeVault, capsys: pytest.CaptureFixture[str]
 ) -> None:
     parent = make_vault({})
-    swarm = parent / "swarm"
+    swarm = parent / ".swarm"  # hidden, as a swarm's memory may be: dot-entries count too
     roster = roster_file(parent, ROSTER)  # beside parent, so parent holds only the swarm
     lay_out = ("init", "--layout", "swarm", "--roster", roster, "--vault")
     assert (await cli(capsys, *lay_out, swarm)).code == 0  # a directory not there yet is made
@@ -205,7 +205,7 @@ async def test_init_refuses_a_directory_holding_anything_but_its_own_policy(
     r = await cli(capsys, *lay_out, parent)
     assert (r.code, r.out) == (1, "")
     assert f"init: {parent.resolve()} is not empty and has no .vault-policy.json" in r.err
-    assert [p.name for p in parent.iterdir()] == ["swarm"]
+    assert [p.name for p in parent.iterdir()] == [".swarm"]
     assert (await cli(capsys, "list", "--agent", "lead", "--lexical", "--vault", swarm)).code == 0
 
     # nor is an unscoped vault converted: every agent the roster leaves out would lose it
