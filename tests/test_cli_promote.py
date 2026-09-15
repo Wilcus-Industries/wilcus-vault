@@ -34,6 +34,8 @@ async def test_promote_moves_a_proposal_into_shared_and_says_what_became_of_it(
     assert r.err.startswith("indexed ")  # the summary stays off stdout
     assert not (root / PROPOSAL).exists()
     assert f"vault_source: {PROPOSAL}" in (root / "shared/acme-renewal-2026.md").read_text()
+    shown = await cli(capsys, "discards", "show", "1", *orchestrator)
+    assert json.loads(shown.out)["path"] == "shared/acme-renewal-2026.md"  # where it landed
 
     missing = await cli(capsys, "promote", PROPOSAL, *orchestrator)
     assert (missing.code, missing.out) == (1, "")

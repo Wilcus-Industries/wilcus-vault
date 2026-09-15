@@ -3,6 +3,7 @@ Deterministic embedder, fake deciders, no network."""
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
+from typing import Any
 
 import pytest
 from conftest import MakeVault
@@ -56,9 +57,13 @@ async def open_vault(
     opened: list[Vault] = []
 
     async def make(
-        scopes: ScopePolicy | None, decider: Decider = _create, files: dict[str, str] = VAULT
+        scopes: ScopePolicy | None,
+        decider: Decider = _create,
+        files: dict[str, str] = VAULT,
+        **options: Any,  # the rest of GateOptions: n, freshness
     ) -> Vault:
-        v = open(make_vault(files), embedder, gate=GateOptions(decider, CUTOFFS), scopes=scopes)
+        gate = GateOptions(decider, CUTOFFS, **options)
+        v = open(make_vault(files), embedder, gate=gate, scopes=scopes)
         opened.append(v)
         await v.reindex()
         return v

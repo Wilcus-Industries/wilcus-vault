@@ -5,22 +5,19 @@ go to, is the caller's business.
 """
 
 import sqlite3
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .decision import Candidate
 from .discard_log import log_candidate
 from .embed import Embedder
-from .gate_write import GateResult
-from .indexer import index_paths, read_note
+from .gate import GateOptions, propose
+from .gate_write import GateResult, close_gate
+from .indexer import read_note
 from .note import Note
 from .paths import canonical_namespace, confined_path
 from .scope import Rule, Scope
 from .term import VaultError, safe
-
-# The gate as the vault runs it: the candidate, its scope, and a note never shown as similar.
-Gate = Callable[[Candidate, Scope, str], Awaitable[GateResult]]
 
 
 @dataclass(frozen=True)
@@ -33,10 +30,11 @@ async def promote(
     db: sqlite3.Connection,
     root: Path,
     embedder: Embedder,
+    options: GateOptions,
     note: Note,  # read through `get`: read-checked, at its canonical path
     namespace: str,
     scope: Scope,
-    gate: Gate,
+    walk: bool,  # the closing pass re-reads the whole vault; the caller owns the clock
 ) -> PromoteResult:
     """The note through the gate into `namespace`; removed if it is still what was read."""
     ctx = scope.ctx
@@ -55,8 +53,11 @@ async def promote(
         ctx = replace(ctx, source=note.path)  # the note the gate writes records its origin
     candidate = Candidate(note.title, note.body, note.type, namespace)
     within = _within(Scope(ctx, scope.rules), canonical_namespace(root, namespace))
-    # Excluded as well, for a note that already sits inside the namespace.
-    result = await gate(candidate, within, note.path)
+    # Excluded as well, for a note that already sits inside the namespace. The
+    # closing pass waits until the note is dealt with, below.
+    result = await propose(
+        db, root, embedder, candidate, options, within, exclude=note.path, close=False
+    )
 
     # Check-and-remove, like the gate's check-and-write: a note edited meanwhile is kept.
     # ponytail: an edit landing between this re-read and the unlink is lost, the
@@ -72,8 +73,12 @@ async def promote(
                 root, candidate, {"reason": "promoted", "path": result.path, "similar": []}
             )
         abs_path.unlink(missing_ok=True)
-    # Purges a removed note's row, and re-reads a kept one.
-    await index_paths(db, root, embedder, [note.path])
+    # After the removal, with the note's path in it: the row goes in the pass that
+    # indexes the new note, so a new note taking the stem is a rename. Run before, the
+    # pass sees a stem collision and qualifies every bare link to this note's path,
+    # which the removal then breaks. A kept note is re-read, and links to it rightly
+    # qualified: it is still there.
+    await close_gate(db, root, embedder, result, walk, [note.path])
     return PromoteResult(**vars(result), removed=removed)
 
 

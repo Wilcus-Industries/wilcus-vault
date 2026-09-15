@@ -50,7 +50,8 @@ src/wilcus_vault/
   decision.py       # the decider contract: Candidate, Decision, gate_prompt, parse_decision
   decide.py         # fetch_decider: an OpenAI-compatible chat decider for the CLI
   gate.py           # write gate: top-k similar → decider → update|supersede|create|discard
-  gate_write.py     # the notes the gate authors: create (free path) and mark_superseded
+  gate_write.py     # the notes the gate authors: create (free path), mark_superseded, and
+                    # close_gate, the closing pass that indexes them
   promote.py        # one note through the gate into a namespace, then removed if unchanged
   discard_log.py    # the discard log's write side: JSONL beside the notes, rotated
   discards.py       # its read side: list / get / restore, and doctor's count
@@ -497,12 +498,19 @@ records where it came from. Three rails of its own:
   only if its hash is still the one `get` read. One a peer edited while the
   decider ran is kept, and `PromoteResult` (the `GateResult` plus `removed`) says
   so. An edit landing between that re-read and the unlink is the same window
-  check-and-write has. Then the path goes through `index_paths`, which purges a
-  removed note's row and re-reads a kept one.
+  check-and-write has. The gate's closing pass waits for the removal
+  (`propose(..., close=False)`, then `close_gate` in `gate_write.py`) and takes
+  the note's path with it, so the removed note's row is purged by the same pass
+  that indexes the new note. Run first, that pass sees a new `shared/<slug>.md`
+  collide with the note's stem and auto-qualifies every bare `[[slug]]` in the
+  vault to the note's path, which the removal then breaks, orphaning the new
+  note. In one pass it is a rename, and a bare link follows the note to where it
+  landed. A kept note is re-read instead, and links to it are rightly qualified:
+  it is still there.
 - **Logged before it goes.** A decider may answer with a body of its own, and a
   merge can drop a fact the note held. So just before the unlink the candidate is
   appended to `.discarded.log` whole, with `reason: promoted` and the `path` it
-  landed at — except after a `discard`, which the gate has logged already. A
+  landed at, which `vault discards show` prints — except after a `discard`, which the gate has logged already. A
   removed note's candidate is always in the log; a kept note is still on disk.
 
 `vault promote <path>` puts one layout on top: the path must be under

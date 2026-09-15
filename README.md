@@ -174,9 +174,9 @@ absorb it, and the note it writes records the proposal's path as `vault_source`.
 The agent must be able to read and write the proposal and write `shared/`, and a
 proposal with malformed frontmatter is refused, all before the chat model runs.
 Just before the proposal is removed, its title, type and body are appended to
-`.discarded.log` with reason `promoted` and the path they landed at (after a
-`discard` the gate's own entry is that record), so a decider's merge that drops a
-fact loses nothing. A proposal edited while the gate ran is kept, and the second
+`.discarded.log` with reason `promoted` and the path they landed at, which
+`discards show` prints (after a `discard` the gate's own entry is that record),
+so a decider's merge that drops a fact loses nothing. A proposal edited while the gate ran is kept, and the second
 line says `proposal kept: it changed during promote`. A path outside
 `proposals/` is refused however it is spelled
 (`proposals/../shared/x.md` is `shared/x.md`), and a path with no note exits 1.

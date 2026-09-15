@@ -25,7 +25,6 @@ from .promote import PromoteResult
 from .promote import promote as run_promote
 from .scope import (
     CompiledPolicy,
-    Scope,
     ScopePolicy,
     VaultContext,
     compile_scopes,
@@ -106,7 +105,14 @@ class Vault:
     async def propose(self, candidate: Candidate, ctx: VaultContext | None = None) -> GateResult:
         """The write gate: search, decide, apply. `ctx` names the calling agent and
         is stamped as provenance on every note the gate authors."""
-        return await self._gate_write(candidate, scope_for(self._policy, ctx))
+        options, walk, now = self._gate_clock()
+        scope = scope_for(self._policy, ctx)
+        result = await run_gate(
+            self._db, self.root, self._embedder, candidate, options, scope, walk
+        )
+        if walk:
+            self._walked = now
+        return result
 
     async def promote(
         self, path: str, namespace: str, ctx: VaultContext | None = None
@@ -117,29 +123,26 @@ class Vault:
         note = await self.get(path, ctx)
         if note is None:  # absent, or not this agent's to read: one answer, as with get
             raise VaultError(f"promote: no note at {safe(path)}")
+        options, walk, now = self._gate_clock()
         scope = scope_for(self._policy, ctx)
-        return await run_promote(
-            self._db, self.root, self._embedder, note, namespace, scope, self._gate_write
-        )
-
-    async def _gate_write(
-        self, candidate: Candidate, scope: Scope, exclude: str | None = None
-    ) -> GateResult:
-        """The gate as propose and promote run it; `exclude` is never shown as similar."""
-        if self._gate is None:
-            raise VaultError(
-                "vault: propose and promote need a gate — Vault(..., gate=GateOptions(...))"
-            )
-        # The clock lives here, not in the gate: freshness is a property of this
-        # handle's view of the files, and a burst of writes shares one walk.
-        now = time.monotonic()
-        walk = now - self._walked >= self._gate.freshness
-        result = await run_gate(
-            self._db, self.root, self._embedder, candidate, self._gate, scope, walk, exclude
+        result = await run_promote(
+            self._db, self.root, self._embedder, options, note, namespace, scope, walk
         )
         if walk:
             self._walked = now
         return result
+
+    def _gate_clock(self) -> tuple[GateOptions, bool, float]:
+        """The gate's options, whether a write starting now walks the vault, and now.
+        The clock lives here, not in the gate: freshness is a property of this handle's
+        view of the files, and a burst of writes shares one walk. The caller marks the
+        walk once the write that ran it returns."""
+        if self._gate is None:
+            raise VaultError(
+                "vault: propose and promote need a gate — Vault(..., gate=GateOptions(...))"
+            )
+        now = time.monotonic()
+        return self._gate, now - self._walked >= self._gate.freshness, now
 
     async def consolidate(self, run: ConsolidateRun) -> ConsolidateReport:
         """The consolidation pass. An operator operation like doctor, unscoped:

@@ -3,13 +3,15 @@ unless it changed while the gate ran. Deterministic embedder, fake deciders."""
 
 import json
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 from gate_common import fm
 from test_scope_vault import OpenVault
 from test_scope_vault import open_vault as _open_vault
 
-from wilcus_vault.decision import Decider, DeciderInput, Decision
+from wilcus_vault.db import db_path, open_db
+from wilcus_vault.decision import Candidate, Decider, DeciderInput, Decision
 from wilcus_vault.note import parse_note
 from wilcus_vault.scope import ScopePolicy, VaultContext
 from wilcus_vault.term import VaultError
@@ -181,3 +183,58 @@ async def test_a_source_the_caller_gives_is_kept(open_vault: OpenVault) -> None:
     v = await open_vault(POLICY, deciding(Decision("create"), []), FILES)
     await v.promote(PROPOSAL, "shared", VaultContext("orchestrator", "task-9"))
     assert fm(v.root, "shared/acme-renewal-2026.md")["vault_source"] == "task-9"
+
+
+def linked_from(root: Path, rel: str) -> list[str]:
+    """The notes `rel`'s links resolve to, as the index holds them."""
+    db = open_db(db_path(root))
+    try:
+        rows = db.execute(
+            """select t.path from edges e join notes f on f.id = e.from_id
+               join notes t on t.id = e.to_id where f.path = ?""",
+            (rel,),
+        ).fetchall()
+        return [r["path"] for r in rows]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("decision", "freshness"),
+    [
+        (Decision("create"), 0.0),
+        (Decision("supersede", target="shared/acme-renewal.md"), 0.0),
+        (Decision("create"), 3600.0),  # inside the window: only the paths written are indexed
+    ],
+    ids=["create", "supersede", "create-in-window"],
+)
+async def test_a_bare_link_to_the_proposal_follows_it_into_the_namespace(
+    open_vault: OpenVault, decision: Decision, freshness: float
+) -> None:
+    linker, links = (
+        "roles/peer/renewals.md",
+        "# Renewals\n\nThe date is in [[acme-renewal-2026]].\n",
+    )
+    files = {**FILES, linker: links}
+    v = await open_vault(POLICY, deciding(decision, []), files, freshness=freshness)
+    if freshness:
+        rota = Candidate(title="Support rota", body="Who carries the pager.\n", namespace="shared")
+        await v.propose(rota, ORCHESTRATOR)  # walks, and opens the window
+    r = await v.promote(PROPOSAL, "shared", ORCHESTRATOR)
+    # Never qualified to the proposal's path, which the promotion removes: the new
+    # note takes the stem over, as a rename would.
+    assert (v.root / linker).read_text() == links
+    assert linked_from(v.root, linker) == [r.path]
+
+
+@pytest.mark.parametrize("path", [PROPOSAL, "shared/acme-draft.md"], ids=["outside", "inside"])
+async def test_the_decider_sees_at_most_n_notes_and_never_the_one_promoted(
+    open_vault: OpenVault, path: str
+) -> None:
+    seen: list[DeciderInput] = []
+    files = {**FILES, "shared/acme-draft.md": TEXT}
+    v = await open_vault(POLICY, deciding(Decision("discard"), seen), files, n=1)
+    await v.promote(path, "shared", ORCHESTRATOR)
+    shown = [s.note.path for s in seen[0].similar]
+    assert len(shown) == 1
+    assert path not in shown

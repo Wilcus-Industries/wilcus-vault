@@ -1,15 +1,17 @@
-"""The notes the gate authors itself: a fresh file, or a supersede mark on an old one."""
+"""The notes the gate authors itself — a fresh file, or a supersede mark on an old
+one — and the closing pass that indexes them."""
 
 import hashlib
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 from .decision import Action, Candidate
 from .discard_log import log_candidate
+from .embed import Embedder
 from .frontmatter import patch_frontmatter
-from .indexer import read_raw
+from .indexer import index_paths, read_raw, reindex
 from .note import link_target, parse_note, serialize_note
 from .paths import confined_path, now, slugify, write_atomic, write_new
 from .scope import VaultContext
@@ -111,3 +113,28 @@ def provenance(ctx: VaultContext | None) -> dict[str, str]:
     if ctx.source is not None:
         stamp["vault_source"] = ctx.source
     return stamp
+
+
+async def close_gate(
+    db: sqlite3.Connection,
+    root: Path,
+    embedder: Embedder,
+    result: GateResult,
+    walk: bool,
+    also: Iterable[str] = (),  # paths the caller changed after the gate: re-read, or purged
+) -> None:
+    """The gate's closing pass: the whole vault re-read when `walk`, else just what the
+    gate wrote and `also`. Either way one pass, so a note the caller removed has its row
+    purged by the pass that indexes the new note, and a new note taking its stem is a
+    rename rather than a collision."""
+    # The whole walk is the expensive part of a write: dirtiness is decided by
+    # content hash, so it re-reads every note in the vault. What it buys is the
+    # next call's search seeing a note a human edited behind our back — without
+    # which the gate re-creates notes that already exist. Skipping it is the
+    # caller's call; indexing what we just wrote is not optional either way.
+    if walk:
+        await reindex(db, root, embedder)  # every indexed path as well, so `also` too
+        return
+    written = [p for p in (result.path, result.superseded, result.unmarked, *also) if p]
+    if written:
+        await index_paths(db, root, embedder, written)
