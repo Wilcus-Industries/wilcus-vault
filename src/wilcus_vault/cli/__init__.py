@@ -1,5 +1,5 @@
-"""`vault <command>`: reindex, doctor, search, watch, propose, get, list, consolidate, discards,
-init."""
+"""`vault <command>`: reindex, doctor, search, watch, propose, promote, get, list,
+consolidate, discards, init."""
 
 import asyncio
 import os
@@ -14,7 +14,7 @@ from ..indexer import reindex
 from ..term import VaultError, printable
 from .commands import Args, cmd_consolidate, cmd_watch
 from .init import cmd_init
-from .scoped import cmd_discards, cmd_get, cmd_list, cmd_propose, cmd_search
+from .scoped import cmd_discards, cmd_get, cmd_list, cmd_promote, cmd_propose, cmd_search
 from .usage import USAGE, print_report, summary
 
 COMMANDS = (
@@ -23,6 +23,7 @@ COMMANDS = (
     "search",
     "watch",
     "propose",
+    "promote",
     "get",
     "list",
     "consolidate",
@@ -110,6 +111,8 @@ async def run(argv: list[str]) -> int:
         return await cmd_search(args, embedder, " ".join(rest))
     if command == "propose":
         return await cmd_propose(args, embedder, rest)
+    if command == "promote":
+        return await cmd_promote(args, embedder, rest)
     if command == "get":
         return await cmd_get(args, embedder, rest)
     if command == "list":

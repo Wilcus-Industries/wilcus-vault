@@ -36,6 +36,7 @@ from .indexer import IndexStats
 from .merge import MergedNote, MergeInput, Merger, merge_prompt, parse_merged
 from .note import Note
 from .paths import slugify
+from .promote import PromoteResult
 from .qualify import Qualified
 from .scope import Permission, ScopePolicy, ScopeRule, VaultContext
 from .search import SearchOptions
@@ -73,6 +74,7 @@ __all__ = [
     "Merger",
     "Note",
     "Permission",
+    "PromoteResult",
     "Qualified",
     "ScopePolicy",
     "ScopeRule",

@@ -19,6 +19,12 @@ def slugify(title: str) -> str | None:
     return slug or None
 
 
+def canonical_path(root: str | Path, path: str) -> str:
+    """`path` in the form the scan stores: relative to the root, forward slashes. So
+    `./x.md`, `a//x.md` and an absolute path inside the vault all name one note."""
+    return os.path.relpath(os.path.join(root, path), root).replace("\\", "/")
+
+
 def confined_path(root: str | Path, rel: str) -> Path:
     """Resolve `rel` under `root` and prove it stays inside: no `..` escape, no
     absolute path, and no hidden or symlinked directory on the way down.

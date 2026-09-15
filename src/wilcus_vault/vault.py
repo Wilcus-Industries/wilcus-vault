@@ -20,7 +20,9 @@ from .gate_write import GateResult
 from .indexer import IndexStats, is_note_path, note_entry, read_note
 from .indexer import reindex as reindex_vault
 from .note import Note
-from .paths import confined_path
+from .paths import canonical_path, confined_path
+from .promote import PromoteResult
+from .promote import promote as run_promote
 from .scope import (
     CompiledPolicy,
     ScopePolicy,
@@ -43,7 +45,7 @@ class Vault:
         self,
         root: str | Path,
         embedder: Embedder,
-        gate: GateOptions | None = None,  # required by propose
+        gate: GateOptions | None = None,  # required by propose and promote
         consolidate: ConsolidateOptions | None = None,  # required by consolidate
         # Per-agent namespace rules. Absent means allow-all; present, it is an
         # allowlist that fails closed and every call then needs a VaultContext.
@@ -75,9 +77,7 @@ class Vault:
         is not "there is nothing there", and it must not answer None.
         """
         scope = scope_for(self._policy, ctx)
-        # Canonicalized into the form the scan stores, so `./x.md`, `a//x.md`
-        # and an absolute path inside the vault all name one note.
-        norm = os.path.relpath(os.path.join(self.root, path), self.root).replace("\\", "/")
+        norm = canonical_path(self.root, path)
         if "\0" in norm:
             return None
         # The parent is confined, not the leaf: a symlink where the note should
@@ -105,15 +105,37 @@ class Vault:
     async def propose(self, candidate: Candidate, ctx: VaultContext | None = None) -> GateResult:
         """The write gate: search, decide, apply. `ctx` names the calling agent and
         is stamped as provenance on every note the gate authors."""
+        return await self._gate_write(candidate, ctx)
+
+    async def promote(
+        self, path: str, namespace: str, ctx: VaultContext | None = None
+    ) -> PromoteResult:
+        """One note through the write gate into `namespace`, then removed — or kept,
+        if it changed while the gate ran. The agent must be able to read and write the
+        note; `ctx.source` defaults to its path, so a note the gate writes records it."""
+        note = await self.get(path, ctx)
+        if note is None:  # absent, or not this agent's to read: one answer, as with get
+            raise VaultError(f"promote: no note at {safe(path)}")
+        scope = scope_for(self._policy, ctx)
+        return await run_promote(
+            self._db, self.root, self._embedder, note, namespace, scope, self._gate_write
+        )
+
+    async def _gate_write(
+        self, candidate: Candidate, ctx: VaultContext | None, exclude: str | None = None
+    ) -> GateResult:
+        """The gate as propose and promote run it; `exclude` is never shown as similar."""
         if self._gate is None:
-            raise VaultError("vault: propose needs a gate — Vault(..., gate=GateOptions(...))")
+            raise VaultError(
+                "vault: propose and promote need a gate — Vault(..., gate=GateOptions(...))"
+            )
         scope = scope_for(self._policy, ctx)
         # The clock lives here, not in the gate: freshness is a property of this
         # handle's view of the files, and a burst of writes shares one walk.
         now = time.monotonic()
         walk = now - self._walked >= self._gate.freshness
         result = await run_gate(
-            self._db, self.root, self._embedder, candidate, self._gate, scope, walk
+            self._db, self.root, self._embedder, candidate, self._gate, scope, walk, exclude
         )
         if walk:
             self._walked = now

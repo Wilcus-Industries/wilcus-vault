@@ -3,6 +3,7 @@
 from ..doctor import DoctorReport
 from ..gate_write import GateResult
 from ..indexer import IndexStats
+from ..promote import PromoteResult
 from ..term import safe
 
 USAGE = """vault <command> [options]
@@ -12,6 +13,7 @@ USAGE = """vault <command> [options]
   search <query>      hybrid search: one line per hit — score, path, title
   watch               index every change as it is saved, until interrupted
   propose             write the note on stdin through the write gate
+  promote <path>      a proposals/ note through the write gate into shared/
   get <path>          print one note's file
   list [prefix]       note paths, one per line, optionally under a namespace
   consolidate         report near-duplicate clusters (needs --ceiling)
@@ -22,7 +24,7 @@ USAGE = """vault <command> [options]
                       set the vault up as a swarm's tiered memory
 
   --vault <dir>       vault root (default: the current directory)
-  --agent <name>      who propose, get, list, search and discards act for
+  --agent <name>      who propose, promote, get, list, search and discards act for
   --namespace <ns>    where propose may create the note (default: the root)
   --lexical           embed offline, without a provider (see below)
   --ceiling <d>       cosine distance two notes must be within to cluster,
@@ -32,7 +34,7 @@ USAGE = """vault <command> [options]
   --help, -h          this text
   --                  end of flags, so a search query may start with a dash
 
-propose, get, list, search and discards act for an agent. A
+propose, promote, get, list, search and discards act for an agent. A
 .vault-policy.json at the vault's root scopes them: agent name ->
 [{prefix, read?, write?}] rules, as JSON. With one, every call needs
 --agent and answers only what that agent may touch, discards runs only for
@@ -65,8 +67,14 @@ kept), reindexes, and puts it through the write gate, which needs --ceiling
 and a chat model (see discards restore below). It prints the action and
 path, then (fell back) if the gate had to create the note instead. vault
 get prints a note's file, or exits 1 with "no note at <path>" when there is
-none the agent may read. list, propose and discards restore report their
-reindex on stderr, so stdout holds only the answer.
+none the agent may read. list, propose, promote and discards restore report
+their reindex on stderr, so stdout holds only the answer.
+
+vault promote <path> sends a note under proposals/ through the same gate
+into shared/, then removes it. It prints the gate's line, then "proposal
+removed", or "proposal kept: it changed during promote" when the note was
+edited while the gate ran. A path outside proposals/ is refused however it
+is spelled, and one with no note the agent may read exits 1.
 
 vault consolidate is report-only: one line per cluster — widest internal
 distance, then the member paths, with the ones that span namespaces flagged
@@ -99,9 +107,13 @@ permission failure, or a failed re-entry)."""
 
 
 def gate_line(r: GateResult) -> str:
-    """What the write gate did, as propose and discards restore print it."""
+    """What the write gate did, as propose, promote and discards restore print it —
+    and for promote, a second line saying what became of the proposal."""
     path = f"  {r.path}" if r.path is not None else ""
-    return safe(f"{r.action}{path}{' (fell back)' if r.fell_back else ''}")
+    line = safe(f"{r.action}{path}{' (fell back)' if r.fell_back else ''}")
+    if isinstance(r, PromoteResult):
+        line += "\nproposal removed" if r.removed else "\nproposal kept: it changed during promote"
+    return line
 
 
 def _plural(n: int, word: str) -> str:
