@@ -13,6 +13,7 @@ from test_scope_policy import POLICY
 from test_scope_vault import VAULT
 
 from wilcus_vault.decide import fetch_decider
+from wilcus_vault.scope import ScopePolicy
 
 NOTE = (
     "---\ntype: customer\n---\n# Acme renewal 2026\n\n"
@@ -21,9 +22,9 @@ NOTE = (
 SECRET = VAULT["secret/plans.md"].rstrip("\n")  # as `cli` captures it, trailing newline dropped
 
 
-def with_policy(make_vault: MakeVault) -> Path:
+def with_policy(make_vault: MakeVault, policy: ScopePolicy = POLICY) -> Path:
     root = make_vault(VAULT)
-    (root / ".vault-policy.json").write_text(json.dumps(POLICY))
+    (root / ".vault-policy.json").write_text(json.dumps(policy))
     return root
 
 
@@ -179,6 +180,15 @@ MALFORMED: dict[str, Callable[[Path], object]] = {
     "not json": lambda p: p.write_text("{"),
     "null, not an object": lambda p: p.write_text("null"),
     "a rule open refuses": lambda p: p.write_text('{"core/notes": [{"prefix": "", "read": "no"}]}'),
+    # a typo that would otherwise grant: `wirte` is ignored, so ledger/ stays writable
+    "a misspelt permission": lambda p: p.write_text(
+        '{"core/notes": [{"prefix": "", "read": true, "write": true},'
+        ' {"prefix": "ledger", "wirte": false}]}'
+    ),
+    # JSON keeps a repeated key's last value, so this rule would read as a grant
+    "a key given twice": lambda p: p.write_text(
+        '{"core/notes": [{"prefix": "", "read": false, "read": true}]}'
+    ),
     "a dangling symlink": lambda p: p.symlink_to(p.parent / "moved-away.json"),
     "a directory": lambda p: p.mkdir(),
 }
@@ -199,6 +209,36 @@ async def test_a_policy_file_that_cannot_be_used_exits_1_never_allow_all(
         assert r.err.startswith(("vault: cannot load .vault-policy.json", "vault: scope policy"))
     # maintenance is unscoped, so it never reads the policy
     assert (await cli(capsys, "reindex", *lex)).code == 0
+
+
+async def test_a_directory_inside_a_scoped_vault_is_refused_never_allow_all(
+    make_vault: MakeVault, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = with_policy(make_vault)
+    here = root.resolve()
+    # Below the root the policy file is out of sight, and every agent would be allow-all.
+    below = ("--agent", "core/notes", "--lexical", "--vault", root / "secret")
+    commands = [["get", "plans.md"], ["list"], ["search", "secret", "plans"], ["discards", "list"]]
+    for command in commands:
+        r = await cli(capsys, *command, *below)
+        assert (r.code, r.out) == (1, "")
+        assert f"{here / 'secret'} is inside the scoped vault {here}; use --vault {here}" in r.err
+
+    # a read-only peer would otherwise write into a namespace the policy keeps from it
+    transport = decide(monkeypatch, {"action": "create"})
+    ledger = root / "ledger"
+    r = await propose(capsys, monkeypatch, NOTE, ledger, "--agent", "core/notes", "--ceiling", "1")
+    assert r.code == 1
+    assert f"use --vault {here}" in r.err
+    assert transport.calls == []
+    assert sorted(p.name for p in (root / "ledger").iterdir()) == ["q3.md"]
+
+    # and a symlink into the vault is the same directory by another name
+    link = root.parent / f"{root.name}-secret"
+    link.symlink_to(root / "secret")
+    r = await cli(capsys, "get", "plans.md", "--agent", "core/notes", "--lexical", "--vault", link)
+    assert (r.code, r.out) == (1, "")
+    assert f"use --vault {here}" in r.err
 
 
 async def test_get_prints_the_file_with_only_line_endings_and_tabs_left_raw(

@@ -10,8 +10,8 @@ from ..embed import Embedder, TokenOverlapEmbedder
 from ..fetch_embedder import FetchEmbedder
 from ..indexer import reindex
 from ..term import VaultError, printable
-from .commands import Args, cmd_consolidate, cmd_discards, cmd_watch
-from .scoped import cmd_get, cmd_list, cmd_propose, cmd_search
+from .commands import Args, cmd_consolidate, cmd_watch
+from .scoped import cmd_discards, cmd_get, cmd_list, cmd_propose, cmd_search
 from .usage import USAGE, print_report, summary
 
 COMMANDS = (

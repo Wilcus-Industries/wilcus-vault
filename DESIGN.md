@@ -60,8 +60,8 @@ src/wilcus_vault/
   cli/
     __init__.py     # vault reindex|doctor|search|watch|propose|get|list|consolidate|
                     # discards — arg parsing
-    commands.py     # the maintenance subcommands that need more than a line
-    scoped.py       # an agent's commands — propose, get, list, search — under the policy
+    commands.py     # consolidate and watch: maintenance that needs more than a line
+    scoped.py       # the commands under the policy: propose, get, list, search, discards
     policy.py       # load_policy: <root>/.vault-policy.json, or None for allow-all
     usage.py        # help text and report formatting
 tests/
@@ -548,7 +548,8 @@ lands as `create`: a duplicate factory, not a scope.
 configuration, so it arrives from a file, an orchestrator, another process's
 JSON, and a `read: "false"` there is **truthy** — a rule meant as a denial
 would grant. Every rule is checked to be `{prefix: str, read?: bool,
-write?: bool}`, and a prefix that is not the canonical form of a path
+write?: bool}` with no other key — a misspelt `wirte: false` is otherwise a
+deny nothing reads — and a prefix that is not the canonical form of a path
 (`./ledger`, `ledger//sub`, `ledger/../x`) is refused rather than normalized:
 stored paths are canonical, so such a prefix matches nothing, and a deny rule
 that matches nothing is a deny that never fires.
@@ -602,12 +603,18 @@ is not the one running repairs.
 
 **On the command line** the policy is `<root>/.vault-policy.json` — the
 `ScopePolicy` above, as JSON — and `--agent` becomes the `VaultContext`.
-`vault propose|get|list|search` load it (`cli/policy.py`); the maintenance
-commands never do. No file is no policy: allow-all, the line `None` draws. A
-file that is there but cannot be used — unreadable, not JSON, not an object, a
-dangling symlink — is an error, not a reading of "absent", which would grant
-everything; the rules inside it are `open()`'s to check, like any policy's. It
-sits beside the notes, **not** in `.vault/`: that directory is the disposable
+`vault propose|get|list|search|discards` follow it (`cli/policy.py`);
+`reindex`, `doctor`, `watch` and `consolidate` never read it. `discards` runs
+only for an agent that may read the whole vault — the log holds refused
+candidates from every namespace — and `restore` writes through the gate as that
+agent, write-checked and stamped like a `propose`. No file is no policy:
+allow-all, the line `None` draws. A file that is there but cannot be used —
+unreadable, not JSON, a key given twice, not an object, a dangling symlink — is
+an error, not a reading of "absent", which would grant everything; the rules
+inside it are `open()`'s to check, like any policy's. So is a `--vault` *inside*
+a scoped vault: below the root the file is out of sight and every agent would
+run allow-all, so an ancestor directory holding one refuses the command and
+names the root to use instead. It sits beside the notes, **not** in `.vault/`: that directory is the disposable
 index, and `rm -rf .vault` is documented as safe. A policy kept there would
 fail *open* the day someone took that advice — every agent silently allowed
 everywhere. Beside the notes it is a dot-file, so the scan never indexes it, and
@@ -616,7 +623,9 @@ it goes wherever the notes it governs go.
 Stated plainly: **scopes are advisory containment at the library API, not
 security.** Any process with filesystem access can read or edit the files
 directly; that is the files-are-truth contract, not a hole in it. The boundary
-that matters for hostile code is the OS, not this policy object.
+that matters for hostile code is the OS, not this policy object. The same goes
+for a CLI `--vault` pointed at a *parent* of a scoped vault: the parent has no
+policy of its own, so its commands run allow-all over the scoped vault's notes.
 
 Prefix matching is **byte-exact**, and deliberately: on Linux `Secret/` and
 `secret/` are two different namespaces holding two different notes, and

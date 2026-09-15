@@ -109,9 +109,9 @@ call — it needs a merger you inject, and the CLI wires none — so this is the
 pass you run to find the ceiling your embedder calls a duplicate. See
 [Consolidation](#consolidation).
 
-`propose`, `get`, `list` and `search` are the commands an agent runs, and they
-act for one: `--agent <name>` is the caller, and a `.vault-policy.json` beside
-the notes is what it is checked against — the [Scopes](#scopes) policy, as JSON:
+`propose`, `get`, `list`, `search` and `discards` act for an agent: `--agent
+<name>` is the caller, and a `.vault-policy.json` at the vault's root is what it
+is checked against — the [Scopes](#scopes) policy, as JSON:
 
 ```json
 {
@@ -124,11 +124,15 @@ the notes is what it is checked against — the [Scopes](#scopes) policy, as JSO
 
 With no file, any agent may do anything and `--agent` is optional. With one,
 every call needs an `--agent` the policy names, and answers only what that agent
-may touch. A file that is there but cannot be used — not JSON, not an object, a
-rule `open()` refuses, a dangling symlink — is an error, never allow-all. It sits
-beside the notes rather than in `.vault/` because `.vault/` is disposable, and a
-policy deleted along with the index would fail open. The maintenance commands
-(`reindex`, `doctor`, `watch`, `consolidate`, `discards`) never read it.
+may touch. `discards` runs only for an agent that may read the whole vault,
+because the log holds refused candidates from every namespace, and `restore`
+writes through the gate as that agent. A file that is there but cannot be used —
+not JSON, a key given twice, not an object, a rule `open()` refuses, a dangling
+symlink — is an error, never allow-all. So is a `--vault` inside a scoped vault,
+where the file is out of sight: the error names the root to use. The file sits at
+the root rather than in `.vault/` because `.vault/` is disposable, and a policy
+deleted along with the index would fail open. `reindex`, `doctor`, `watch` and
+`consolidate` never read it.
 
 ```
 $ vault propose --agent clerk --namespace customers --ceiling 0.35 < renewal.md
@@ -139,8 +143,9 @@ customers/acme.md
 ```
 
 `propose` reads a note's markdown on stdin and takes its title and type from the
-frontmatter or the first `# heading`. A note with no title, or with malformed
-frontmatter, is refused. It reindexes, so the gate sees notes written by hand,
+frontmatter or the first `# heading`; no other frontmatter key is kept, since the
+gate writes the frontmatter of the notes it authors. A note with no title, or
+with malformed frontmatter, is refused. It reindexes, so the gate sees notes written by hand,
 then puts the note through the write gate — which needs `--ceiling` and the same
 chat model `discards restore` does — and prints the action and the path, plus
 `(fell back)` when the gate had to create the note instead of applying its
@@ -148,8 +153,8 @@ decision. `--namespace` is where a created note goes: the vault root without it.
 `get` prints the note's file, control characters scrubbed but for newlines and
 tabs, or exits 1 with `no note at <path>` — one answer for a note that is not
 there and a note the agent may not read. `list` reindexes first too, then prints
-one path per line. Both send the reindex summary to stderr, so stdout holds only
-the answer.
+one path per line. It, `propose` and `discards restore` send the reindex summary
+to stderr, so stdout holds only the answer.
 
 ## Obsidian
 
@@ -427,8 +432,9 @@ await vault.propose(candidate, support)
   means denied. `open()` refuses a policy that answers one question twice, one
   with a subtree writable but not readable (an agent that cannot see its own
   notes re-creates them on every propose), a rule that is not
-  `{prefix, read?, write?}` with booleans — a JSON `"read": "false"` is truthy,
-  and would grant where it meant to deny — and a prefix that is not a canonical
+  `{prefix, read?, write?}` with booleans and no other key — a misspelt `wirte`
+  would be ignored, and a JSON `"read": "false"` is truthy, so either would grant
+  where it meant to deny — and a prefix that is not a canonical
   path (`./ledger`, `ledger//sub`), which would match nothing and deny nothing.
 - `search` filters unreadable notes out of the over-fetched set before capping,
   so you get *up to* N readable hits (and `expand_links` neighbours are filtered

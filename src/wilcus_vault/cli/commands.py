@@ -1,23 +1,17 @@
-"""The maintenance subcommands that need more than a line: consolidate, discards, watch."""
+"""The maintenance subcommands that need more than a line: consolidate and watch."""
 
 import asyncio
-import json
 import os
 import signal
 from dataclasses import dataclass
 
 from ..cluster import clusters
 from ..db import db_path, open_db
-from ..decide import fetch_decider
-from ..discards import entry_to_json, get_discard, list_discards, restore_discard
 from ..embed import Embedder
-from ..gate import GateOptions
 from ..indexer import IndexStats, reindex
-from ..search_sql import Cutoffs
 from ..term import VaultError, safe
-from ..vault import open
 from ..watch import WatchOptions, watch
-from .usage import USAGE, gate_line, summary
+from .usage import USAGE, summary
 
 
 @dataclass
@@ -50,46 +44,6 @@ async def cmd_consolidate(args: Args, embedder: Embedder) -> int:
         print("\n".join(lines) if lines else "no clusters under that ceiling")
     finally:
         db.close()
-    return 0
-
-
-async def cmd_discards(args: Args, embedder: Embedder, rest: list[str]) -> int:
-    sub = rest[0] if rest else None
-    if sub == "list":
-        entries, malformed = list_discards(args.root)
-        lines = [
-            safe(
-                f"[{e.n}] {e.at}  {e.candidate.title} — "
-                f"{e.decision.action if e.decision else e.reason or '?'}"
-            )
-            for e in entries
-        ]
-        if malformed:
-            lines.append(f"({malformed} unreadable line{'' if malformed == 1 else 's'} skipped)")
-        print("\n".join(lines) if lines else "no discards")
-        return 0
-    n = int(rest[1]) if len(rest) > 1 and rest[1].isascii() and rest[1].isdigit() else 0
-    if sub not in ("show", "restore") or n < 1:
-        raise VaultError(f"discards needs list, show <n> or restore <n>\n\n{USAGE}")
-    if sub == "show":
-        entry = get_discard(args.root, n)
-        if entry is None:
-            raise VaultError(f"discards: no entry {n} — run vault discards list")
-        print(
-            json.dumps(entry_to_json(entry), indent=2)
-        )  # JSON escaping keeps control chars off the terminal
-        return 0
-    # restore: back through the gate against current vault state, so it needs a
-    # ceiling (like propose's cutoffs) and a chat model.
-    if args.ceiling is None:
-        raise VaultError(f"discards restore needs --ceiling\n\n{USAGE}")
-    gate = GateOptions(fetch_decider(), Cutoffs(distance_ceiling=args.ceiling))
-    vault = open(args.root, embedder, gate=gate)
-    try:
-        print(f"indexed {summary(await vault.reindex())}")
-        print(gate_line(await restore_discard(vault, n)))
-    finally:
-        vault.close()
     return 0
 
 

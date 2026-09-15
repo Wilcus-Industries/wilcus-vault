@@ -100,6 +100,9 @@ def test_open_refuses_a_rule_that_is_not_a_rule(
         refuse(root, {"a": [None]}, embedder)
     with pytest.raises(VaultError, match="must be a list of rules"):
         refuse(root, {"a": {"prefix": "notes/", "read": True}}, embedder)
+    # A misspelt permission is no permission: `wirte: false` would be a deny that never fires.
+    with pytest.raises(VaultError, match="unknown key"):
+        refuse(root, {"a": [{"prefix": "", "read": True, "wirte": False}]}, embedder)
 
     # A prefix that is not the canonical form of a path matches nothing, so a
     # deny spelled that way is a deny that never fires. Refused, not normalized.

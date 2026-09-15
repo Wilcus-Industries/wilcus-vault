@@ -76,6 +76,12 @@ class Scope:
     def may(self, permission: Permission, path: str) -> bool:
         return True if self.rules is None else _resolve(self.rules, permission, path)
 
+    def reads_all(self) -> bool:
+        """May this scope read every note? Resolution only changes at a rule's own
+        prefix, so the root and each prefix cover every path."""
+        prefixes = ["", *(rule.prefix for rule in self.rules or [])]
+        return all(self.may("read", p) for p in prefixes)
+
     @property
     def read_sql(self) -> tuple[str, list[str]]:
         """The read check as a SQL boolean over `n.path`, for filters inside a query.
@@ -124,6 +130,9 @@ def _compile_rules(agent: str, given: Any) -> list[Rule]:
     for raw in given:
         if not isinstance(raw, dict):
             raise bad(f"a rule must be {{prefix, read?, write?}}, got {json.dumps(raw)[:60]}")
+        # A misspelt `wirte: false` would otherwise be a deny nothing reads.
+        if unknown := [k for k in raw if k not in ("prefix", *PERMISSIONS)]:
+            raise bad(f"unknown key {json.dumps(unknown, default=str)[:60]} in a rule")
         prefix = raw.get("prefix")
         if not isinstance(prefix, str):
             raise bad("a rule's prefix must be a string")
