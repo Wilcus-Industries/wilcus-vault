@@ -168,13 +168,17 @@ proposal removed
 ```
 
 `promote` sends a note under `proposals/` through the same gate into `shared/` —
-its title, type and body, as if proposed — then removes it. The gate never shows
-the decider the proposal itself as a similar note, and the note it writes records
-the proposal's path as `vault_source`. The agent must be able to read and write
-the proposal and write `shared/`, all checked before the chat model runs. A
-proposal edited while the gate ran is kept, and the second line says `proposal
-kept: it changed during promote`; what was read has already landed, so nothing is
-lost. A path outside `proposals/` is refused however it is spelled
+its title, type and body, as if proposed — then removes it. The decider judges it
+against `shared/` alone, so a copy in `roles/` or another proposal can never
+absorb it, and the note it writes records the proposal's path as `vault_source`.
+The agent must be able to read and write the proposal and write `shared/`, and a
+proposal with malformed frontmatter is refused, all before the chat model runs.
+Just before the proposal is removed, its title, type and body are appended to
+`.discarded.log` with reason `promoted` and the path they landed at (after a
+`discard` the gate's own entry is that record), so a decider's merge that drops a
+fact loses nothing. A proposal edited while the gate ran is kept, and the second
+line says `proposal kept: it changed during promote`. A path outside
+`proposals/` is refused however it is spelled
 (`proposals/../shared/x.md` is `shared/x.md`), and a path with no note exits 1.
 
 `vault init --layout swarm --roster <file>` sets a vault up as a swarm's tiered
@@ -397,14 +401,17 @@ result = await vault.promote("proposals/clerk/acme.md", "shared", ctx)
 #               unmarked=None, fell_back=False, removed=True)
 ```
 
-The candidate is the note's title, type and body, placed in the namespace. The
-decider is never shown the note itself as a similar note, and `ctx.source`
-defaults to its path. The agent must be able to read the note and write both it
-and the namespace, all checked before the decider runs; a note it may not read
-is `no note at`, like an absent one. Whatever the gate decides, the note is then
-removed only if its hash is unchanged. One a peer edited meanwhile is kept, with
-`removed=False`, and nothing is lost: what was read is in the gate's note or the
-discard log. The library knows no layout; `proposals/` and `shared/` are the CLI's.
+The candidate is the note's title, type and body, placed in the namespace, and
+the gate runs confined to that namespace: the decider is shown only its notes and
+can target nothing outside it. `ctx.source` defaults to the note's path. The
+agent must be able to read the note and write both it and the namespace, and a
+note with malformed frontmatter is refused, all before the decider runs; a note
+it may not read is `no note at`, like an absent one. Whatever the gate decides,
+the note is then removed only if its hash is unchanged, and just before that the
+candidate is appended to the discard log with reason `promoted` and the landed
+`path` (after a `discard`, the gate's own entry is that record). One a peer
+edited meanwhile is kept, with `removed=False`. The library knows no layout;
+`proposals/` and `shared/` are the CLI's.
 
 ### Consolidation
 

@@ -467,28 +467,43 @@ place at all is appended to `<root>/.discarded.log` before it raises. Losing the
 note is never one of the outcomes.
 
 **Promote: a note already in the vault, through the gate.** `vault.promote(path,
-namespace, ctx?)` (`promote.py`) makes one note a candidate — its title, type and
-body, placed in `namespace` — runs it through the gate `propose` runs, then
-removes it. It knows no layout: which notes are proposals, and where they go, is
-the caller's business. Every refusal lands before the decider runs: a note the
-agent may not read is `no note at`, exactly like an absent one (`get` answers
+namespace, ctx?)` (`promote.py`) makes one note a candidate — its parsed title,
+type and body, placed in `namespace` — runs it through the gate `propose` runs,
+then removes it. It knows no layout: which notes are proposals, and where they
+go, is the caller's business. Every refusal lands before the decider runs: a note
+the agent may not read is `no note at`, exactly like an absent one (`get` answers
 both); a note it may read but not write is refused, since it could never be
-removed; and the namespace gets the gate's own write check. `ctx.source` defaults
-to the note's path, so what the gate writes records where it came from. Two
-rails of its own:
+removed; a note with malformed frontmatter is refused and kept, since its broken
+block would land in the new note's body; and the namespace gets the gate's own
+write check. `ctx.source` defaults to the note's path, so what the gate writes
+records where it came from. Three rails of its own:
 
-- **The note is never its own similar note.** The gate's search leaves that path
-  out, and asks for one more hit to make up for it. The proposal is indexed, so
-  it is the closest match there is to its own text, and a decider shown the
-  candidate already written down discards it: the proposal would be removed with
-  its content only in the discard log.
+- **Only the namespace is judged against.** The gate runs under the caller's
+  scope confined to the canonical namespace: the policy's rules under it, one
+  rule at it carrying the policy's answer there, and the rest of the vault denied
+  (with no policy: read and write at the namespace, nothing elsewhere). Search
+  applies that in SQL, before its cut to n, so the decider still sees up to n of
+  the namespace's notes, and the gate's read re-check and target write check are
+  confined with it. Unconfined, an orchestrator that reads everything has a peer's
+  `roles/` copy or another proposal absorb the promotion, be marked superseded by
+  it, or get it discarded as already written down — and the proposal is deleted
+  while the namespace never gets the fact. § One shared memory rejects pinning a
+  `propose` to a namespace because its target is deliberately the whole memory;
+  for `promote` the namespace is the whole point of the call. The note itself is
+  also kept out of `similar` (for a note already inside the namespace), and its
+  stem does not count against the new note's slug, so a proposal named by its
+  title's slug does not push the promoted note to `-2`.
 - **Check-and-remove.** Whatever the gate decided, the note is re-read and removed
   only if its hash is still the one `get` read. One a peer edited while the
   decider ran is kept, and `PromoteResult` (the `GateResult` plus `removed`) says
-  so. Nothing is lost either way: what was read is in the gate's note or
-  `.discarded.log`. An edit landing between that re-read and the unlink is the
-  same window check-and-write has. Then the path goes through `index_paths`,
-  which purges a removed note's row and re-reads a kept one.
+  so. An edit landing between that re-read and the unlink is the same window
+  check-and-write has. Then the path goes through `index_paths`, which purges a
+  removed note's row and re-reads a kept one.
+- **Logged before it goes.** A decider may answer with a body of its own, and a
+  merge can drop a fact the note held. So just before the unlink the candidate is
+  appended to `.discarded.log` whole, with `reason: promoted` and the `path` it
+  landed at — except after a `discard`, which the gate has logged already. A
+  removed note's candidate is always in the log; a kept note is still on disk.
 
 `vault promote <path>` puts one layout on top: the path must be under
 `proposals/`, checked in its canonical form (`proposals/../shared/x.md` is
@@ -630,7 +645,8 @@ Enforcement points, all inside the library so no caller re-implements them:
   twice: the candidate always lands somewhere, losing it is never an outcome.
 - `promote` — the read and write check on the note it takes (read through
   `get`, so an unreadable note is an absent one), then the gate's write check
-  on the namespace, all before the decider runs.
+  on the namespace, all before the decider runs; the gate itself runs confined
+  to that namespace (§ Write gate).
 
 Maintenance is unscoped: `doctor`, `reindex`, `watch` and `close` are
 operator operations on the whole vault and take no context — a scoped agent

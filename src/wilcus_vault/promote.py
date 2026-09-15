@@ -10,22 +10,22 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .decision import Candidate
+from .discard_log import log_candidate
 from .embed import Embedder
 from .gate_write import GateResult
 from .indexer import index_paths, read_note
 from .note import Note
-from .paths import confined_path
-from .scope import Scope, VaultContext
+from .paths import canonical_namespace, confined_path
+from .scope import Rule, Scope
 from .term import VaultError, safe
 
-# The gate as the vault runs it: the candidate, who asks, and a note never shown as similar.
-Gate = Callable[[Candidate, VaultContext | None, str], Awaitable[GateResult]]
+# The gate as the vault runs it: the candidate, its scope, and a note never shown as similar.
+Gate = Callable[[Candidate, Scope, str], Awaitable[GateResult]]
 
 
 @dataclass(frozen=True)
 class PromoteResult(GateResult):
-    # False when the note changed while the gate ran: that edit is kept, and what
-    # was promoted already landed in the gate's note or the discard log.
+    # False when the note changed while the gate ran: that edit is kept, not removed.
     removed: bool = field(kw_only=True)
 
 
@@ -40,18 +40,23 @@ async def promote(
 ) -> PromoteResult:
     """The note through the gate into `namespace`; removed if it is still what was read."""
     ctx = scope.ctx
-    # Before the gate, so a note this agent could never remove costs no model call.
+    # Refused before the gate, so a note that cannot be promoted costs no model call.
     if not scope.may("write", note.path):
         agent = ctx.agent if ctx else ""
         raise VaultError(
             f'promote: "{safe(agent)}" may not write {safe(note.path)}, so it cannot remove it'
         )
+    if note.malformed_frontmatter:
+        raise VaultError(
+            f"promote: {safe(note.path)} has malformed frontmatter (unterminated, not YAML, "
+            "or a title or type that is not a string), and its block would land in the body"
+        )
     if ctx is not None and ctx.source is None:
         ctx = replace(ctx, source=note.path)  # the note the gate writes records its origin
     candidate = Candidate(note.title, note.body, note.type, namespace)
-    # Kept out of `similar`: shown its own text, a decider finds the candidate
-    # already written down and discards it.
-    result = await gate(candidate, ctx, note.path)
+    within = _within(Scope(ctx, scope.rules), canonical_namespace(root, namespace))
+    # Excluded as well, for a note that already sits inside the namespace.
+    result = await gate(candidate, within, note.path)
 
     # Check-and-remove, like the gate's check-and-write: a note edited meanwhile is kept.
     # ponytail: an edit landing between this re-read and the unlink is lost, the
@@ -60,7 +65,25 @@ async def promote(
     current = read_note(root, note.path)
     removed = current is not None and current.hash == note.hash
     if removed:
+        # A decider's own body can drop what the note said, so it is logged whole
+        # before the file goes. A discard is in the log already, from the gate.
+        if result.action != "discard":
+            log_candidate(
+                root, candidate, {"reason": "promoted", "path": result.path, "similar": []}
+            )
         abs_path.unlink(missing_ok=True)
     # Purges a removed note's row, and re-reads a kept one.
     await index_paths(db, root, embedder, [note.path])
     return PromoteResult(**vars(result), removed=removed)
+
+
+def _within(scope: Scope, namespace: str) -> Scope:
+    """`scope` confined to one namespace: the policy's rules under it, one rule at it
+    carrying the policy's answer there, and the rest of the vault denied. The gate's
+    search (in SQL, before its cut to n), read re-check and target write check then
+    see only the namespace; anywhere else a note could absorb the promotion."""
+    rules = scope.rules or []
+    under = [r for r in rules if r.prefix.startswith(namespace) and r.prefix != namespace]
+    at = Rule(namespace, scope.may("read", namespace), scope.may("write", namespace))
+    elsewhere = [Rule("", False, False)] if namespace else []
+    return Scope(scope.ctx, [*under, at, *elsewhere])  # still longest prefix first

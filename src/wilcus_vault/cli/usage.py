@@ -71,10 +71,11 @@ none the agent may read. list, propose, promote and discards restore report
 their reindex on stderr, so stdout holds only the answer.
 
 vault promote <path> sends a note under proposals/ through the same gate
-into shared/, then removes it. It prints the gate's line, then "proposal
+into shared/, judged against shared/ alone, then logs it to .discarded.log
+as promoted and removes it. It prints the gate's line, then "proposal
 removed", or "proposal kept: it changed during promote" when the note was
-edited while the gate ran. A path outside proposals/ is refused however it
-is spelled, and one with no note the agent may read exits 1.
+edited while the gate ran. A path outside proposals/ (however it is
+spelled), malformed frontmatter, or no note the agent may read exits 1.
 
 vault consolidate is report-only: one line per cluster — widest internal
 distance, then the member paths, with the ones that span namespaces flagged

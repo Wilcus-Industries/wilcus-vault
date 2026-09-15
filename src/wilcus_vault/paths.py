@@ -6,6 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .scope import normalize_prefix
 from .term import VaultError, safe
 
 MAX_SLUG = 80  # readable as a filename, short enough for every filesystem
@@ -47,6 +48,13 @@ def confined_path(root: str | Path, rel: str) -> Path:
         if walk.is_symlink():
             raise VaultError(f"vault: {rel} passes through a symlink")
     return abs_path
+
+
+def canonical_namespace(root: str | Path, namespace: str | None) -> str:
+    """A namespace in the one form it is checked and written in: through the
+    confinement rail, as a prefix. `notes/../ledger` is `ledger/`; the root is `""`."""
+    base = Path(os.path.abspath(root))
+    return normalize_prefix(confined_path(base, namespace or "").relative_to(base).as_posix())
 
 
 def _staged(abs_path: Path, text: str) -> Path:

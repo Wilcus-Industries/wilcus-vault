@@ -25,6 +25,7 @@ from .promote import PromoteResult
 from .promote import promote as run_promote
 from .scope import (
     CompiledPolicy,
+    Scope,
     ScopePolicy,
     VaultContext,
     compile_scopes,
@@ -105,14 +106,14 @@ class Vault:
     async def propose(self, candidate: Candidate, ctx: VaultContext | None = None) -> GateResult:
         """The write gate: search, decide, apply. `ctx` names the calling agent and
         is stamped as provenance on every note the gate authors."""
-        return await self._gate_write(candidate, ctx)
+        return await self._gate_write(candidate, scope_for(self._policy, ctx))
 
     async def promote(
         self, path: str, namespace: str, ctx: VaultContext | None = None
     ) -> PromoteResult:
-        """One note through the write gate into `namespace`, then removed — or kept,
-        if it changed while the gate ran. The agent must be able to read and write the
-        note; `ctx.source` defaults to its path, so a note the gate writes records it."""
+        """One note through the write gate into `namespace`, judged against that
+        namespace alone, then removed — or kept, if it changed while the gate ran. The
+        agent must be able to read and write the note; `ctx.source` defaults to its path."""
         note = await self.get(path, ctx)
         if note is None:  # absent, or not this agent's to read: one answer, as with get
             raise VaultError(f"promote: no note at {safe(path)}")
@@ -122,14 +123,13 @@ class Vault:
         )
 
     async def _gate_write(
-        self, candidate: Candidate, ctx: VaultContext | None, exclude: str | None = None
+        self, candidate: Candidate, scope: Scope, exclude: str | None = None
     ) -> GateResult:
         """The gate as propose and promote run it; `exclude` is never shown as similar."""
         if self._gate is None:
             raise VaultError(
                 "vault: propose and promote need a gate — Vault(..., gate=GateOptions(...))"
             )
-        scope = scope_for(self._policy, ctx)
         # The clock lives here, not in the gate: freshness is a property of this
         # handle's view of the files, and a burst of writes shares one walk.
         now = time.monotonic()

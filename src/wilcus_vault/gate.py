@@ -23,8 +23,8 @@ from .frontmatter import patch_frontmatter, replace_body
 from .gate_write import PROVENANCE_KEYS, GateResult, create, mark_superseded, provenance
 from .indexer import index_paths, read_raw, reindex
 from .note import parse_note
-from .paths import confined_path, now, write_atomic
-from .scope import ALLOW_ALL, Scope, VaultContext, normalize_prefix
+from .paths import canonical_namespace, confined_path, now, write_atomic
+from .scope import ALLOW_ALL, Scope, VaultContext
 from .search import SearchOptions, hybrid_search
 from .search_sql import Cutoffs
 from .term import VaultError, safe
@@ -69,8 +69,7 @@ async def propose(
     base = Path(root).absolute()
     # Canonicalized through the confinement rail and used from here on: checking
     # one spelling and writing another (`notes/../ledger`) would be a scope bypass.
-    namespace_abs = confined_path(base, candidate.namespace or "")
-    namespace = normalize_prefix(namespace_abs.relative_to(base).as_posix())
+    namespace = canonical_namespace(base, candidate.namespace)
     if not scope.may("write", namespace):
         agent = ctx.agent if ctx else ""
         where = "the vault root" if namespace == "" else safe(namespace)
@@ -91,13 +90,13 @@ async def propose(
         # A target the agent may read but not write falls back to create below.
         if decision.target is not None and not scope.may("write", decision.target):
             break
-        applied = await _apply(db, base, candidate, namespace, decision, similar, ctx)
+        applied = await _apply(db, base, candidate, namespace, decision, similar, ctx, exclude)
         if applied is not None:
             break
         stale = decision.target
     fell_back = applied is None
     if applied is None:
-        applied = await create(db, base, candidate, namespace, None, ctx)
+        applied = await create(db, base, candidate, namespace, None, ctx, exclude)
     # The whole walk is the expensive part of a propose: dirtiness is decided by
     # content hash, so it re-reads every note in the vault. What it buys is the
     # next call's search seeing a note a human edited behind our back — without
@@ -152,6 +151,7 @@ async def _apply(
     decision: Decision,
     similar: list[SimilarNote],
     ctx: VaultContext | None,
+    exclude: str | None,
 ) -> GateResult | None:
     """Apply one decision, or None if the target changed under us."""
     if decision.action == "discard":
@@ -159,7 +159,7 @@ async def _apply(
         log_candidate(root, candidate, {"decision": _decision_json(decision), "similar": judged})
         return GateResult("discard")
     if decision.action == "create":
-        return await create(db, root, candidate, namespace, decision.body, ctx)
+        return await create(db, root, candidate, namespace, decision.body, ctx, exclude)
 
     hit = next(s for s in similar if s.note.path == decision.target)
     rel = hit.note.path
@@ -180,7 +180,7 @@ async def _apply(
         return GateResult("update", rel)
 
     # supersede: the successor is written first, then the old note is marked.
-    created = await create(db, root, candidate, namespace, decision.body, ctx)
+    created = await create(db, root, candidate, namespace, decision.body, ctx, exclude)
     assert created.path is not None
     marked, unmarked = await mark_superseded(root, rel, hit.hash, created.path)
     return GateResult("supersede", created.path, marked, unmarked)

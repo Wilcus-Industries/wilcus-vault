@@ -61,6 +61,7 @@ async def create(
     namespace: str,
     body: str | None,
     ctx: VaultContext | None,
+    exclude: str | None = None,  # a note whose stem is not taken: the one being promoted
 ) -> GateResult:
     """Write a note we authored ourselves at `<namespace><slug>.md`. `namespace`
     is canonical and already write-checked by the caller.
@@ -75,7 +76,7 @@ async def create(
         frontmatter["type"] = candidate.type
     frontmatter.update(created=at, updated=at, **provenance(ctx))
     text = serialize_note(frontmatter, body if body is not None else candidate.body)
-    for slug in _free_slugs(db, candidate):
+    for slug in _free_slugs(db, candidate, exclude):
         rel = f"{namespace}{slug}.md"
         abs_path = confined_path(root, rel)
         abs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,16 +88,19 @@ async def create(
     raise VaultError(reason)
 
 
-def _free_slugs(db: sqlite3.Connection, candidate: Candidate) -> Iterator[str]:
-    """Filename stems to try, in order, skipping those another note's stem holds.
-    The index is a hint that saves a syscall; the write is what decides."""
+def _free_slugs(db: sqlite3.Connection, candidate: Candidate, exclude: str | None) -> Iterator[str]:
+    """Filename stems to try, in order, skipping those another note's stem holds —
+    bar `exclude`'s, which is on its way out. The index is a hint that saves a
+    syscall; the write is what decides."""
     base = slugify(candidate.title)
     if base is None:
         digest = hashlib.sha256(f"{candidate.title}\n\n{candidate.body}".encode()).hexdigest()
         base = f"note-{digest[:8]}"
+    # `is not` rather than `!=`: with no note excluded, NULL must match every path.
+    taken = "select 1 from notes where slug = ? and path is not ?"
     for i in range(1, MAX_SLUG_TRIES + 1):
         slug = base if i == 1 else f"{base}-{i}"
-        if db.execute("select 1 from notes where slug = ?", (slug,)).fetchone() is None:
+        if db.execute(taken, (slug, exclude)).fetchone() is None:
             yield slug
 
 
