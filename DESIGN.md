@@ -58,8 +58,11 @@ src/wilcus_vault/
   consolidate.py    # the consolidation pass over those clusters, dry-run by default
   watch.py          # watchfiles + per-path debounce + hash dirty-check → index_paths
   cli/
-    __init__.py     # vault reindex|doctor|search|watch|consolidate|discards — arg parsing
-    commands.py     # the subcommands that need more than a line
+    __init__.py     # vault reindex|doctor|search|watch|propose|get|list|consolidate|
+                    # discards — arg parsing
+    commands.py     # consolidate and watch: maintenance that needs more than a line
+    scoped.py       # the commands under the policy: propose, get, list, search, discards
+    policy.py       # load_policy: <root>/.vault-policy.json, or None for allow-all
     usage.py        # help text and report formatting
 tests/
   conftest.py       # make_vault / write_note / vec_of, VAULT_* env cleared per test
@@ -422,8 +425,9 @@ confinement, and one this agent may not write:
      gate stays the only write door. The CLI's `restore` wires `fetch_decider`
      (`decide.py`), FetchEmbedder's chat twin: OpenAI-compatible, configured by
      `VAULT_DECIDE_*`, endpoint defaulting to the local Ollama, model always
-     explicit — the one CLI command that runs a model, because restoring
-     without re-deciding would bypass the gate.
+     explicit — and `vault propose` wires the same one. They are the two CLI
+     commands that run a model, because a write that skipped the decider
+     would bypass the gate.
 
 **The closing pass, and the freshness window.** A `propose` ends by re-indexing,
 so the index never lags a write we made ourselves. That pass is deliberately the
@@ -544,7 +548,8 @@ lands as `create`: a duplicate factory, not a scope.
 configuration, so it arrives from a file, an orchestrator, another process's
 JSON, and a `read: "false"` there is **truthy** — a rule meant as a denial
 would grant. Every rule is checked to be `{prefix: str, read?: bool,
-write?: bool}`, and a prefix that is not the canonical form of a path
+write?: bool}` with no other key — a misspelt `wirte: false` is otherwise a
+deny nothing reads — and a prefix that is not the canonical form of a path
 (`./ledger`, `ledger//sub`, `ledger/../x`) is refused rather than normalized:
 stored paths are canonical, so such a prefix matches nothing, and a deny rule
 that matches nothing is a deny that never fires.
@@ -596,10 +601,31 @@ Maintenance is unscoped: `doctor`, `reindex`, `watch` and `close` are
 operator operations on the whole vault and take no context — a scoped agent
 is not the one running repairs.
 
+**On the command line** the policy is `<root>/.vault-policy.json` — the
+`ScopePolicy` above, as JSON — and `--agent` becomes the `VaultContext`.
+`vault propose|get|list|search|discards` follow it (`cli/policy.py`);
+`reindex`, `doctor`, `watch` and `consolidate` never read it. `discards` runs
+only for an agent that may read the whole vault — the log holds refused
+candidates from every namespace — and `restore` writes through the gate as that
+agent, write-checked and stamped like a `propose`. No file is no policy:
+allow-all, the line `None` draws. A file that is there but cannot be used —
+unreadable, not JSON, a key given twice, not an object, a dangling symlink — is
+an error, not a reading of "absent", which would grant everything; the rules
+inside it are `open()`'s to check, like any policy's. So is a `--vault` *inside*
+a scoped vault: below the root the file is out of sight and every agent would
+run allow-all, so an ancestor directory holding one refuses the command and
+names the root to use instead. It sits beside the notes, **not** in `.vault/`: that directory is the disposable
+index, and `rm -rf .vault` is documented as safe. A policy kept there would
+fail *open* the day someone took that advice — every agent silently allowed
+everywhere. Beside the notes it is a dot-file, so the scan never indexes it, and
+it goes wherever the notes it governs go.
+
 Stated plainly: **scopes are advisory containment at the library API, not
 security.** Any process with filesystem access can read or edit the files
 directly; that is the files-are-truth contract, not a hole in it. The boundary
-that matters for hostile code is the OS, not this policy object.
+that matters for hostile code is the OS, not this policy object. The same goes
+for a CLI `--vault` pointed at a *parent* of a scoped vault: the parent has no
+policy of its own, so its commands run allow-all over the scoped vault's notes.
 
 Prefix matching is **byte-exact**, and deliberately: on Linux `Secret/` and
 `secret/` are two different namespaces holding two different notes, and

@@ -11,9 +11,9 @@ class VaultError(Exception):
     """An error the vault raised on purpose, with a message meant for a human."""
 
 
-def safe(text: str) -> str:
-    """Untrusted text, safe to echo: control characters print as `?`."""
-    return _CONTROL.sub("?", text)
+def safe(text: str, keep: str = "") -> str:
+    """Untrusted text, safe to echo: control characters print as `?`, except any in `keep`."""
+    return _CONTROL.sub(lambda m: m[0] if m[0] in keep else "?", text)
 
 
 def printable(error: object) -> str:

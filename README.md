@@ -41,8 +41,12 @@ FetchEmbedder`.
 ```
 vault reindex [--vault <dir>]            # index new and changed notes
 vault doctor [--rebuild] [--vault <dir>] # check and repair the index
-vault search <query> [--vault <dir>]     # hybrid search, best first
+vault search <query> [--agent <a>]       # hybrid search, best first
 vault watch [--vault <dir>]              # index changes as they are saved
+vault propose --ceiling <d> [--agent <a>] [--namespace <ns>] < note.md
+                                         # write a note through the gate
+vault get <path> [--agent <a>]           # print one note's file
+vault list [prefix] [--agent <a>]        # note paths, one per line
 vault consolidate --ceiling <d>          # report near-duplicate clusters
 vault discards list                      # the discard log, newest first
 vault discards show <n>                  # one refused candidate, in full
@@ -50,8 +54,9 @@ vault discards restore <n> --ceiling <d> # re-propose it through the gate
 vault --help                             # every command and flag
 ```
 
-`--vault` defaults to the current directory; `--` ends flag parsing, so a query
-may start with a dash. Exit code 0 on success, 1 on error — and 1 from `doctor`
+`--vault` defaults to the current directory, and is resolved through symlinks
+before anything reads it, so a command's policy, index and notes all come from
+one directory; `--` ends flag parsing, so a query may start with a dash. Exit code 0 on success, 1 on error — and 1 from `doctor`
 when it found links only a human can fix: broken (nothing to point at) or
 ambiguous (a bare `[[stem]]` several notes answer to — `doctor` prints the
 candidate paths, and qualifying the link with one of them is the fix) — or when
@@ -101,9 +106,56 @@ indexed 0 new, 0 changed, 0 removed, 214 unchanged
 widest distance inside it, then the note paths, with the clusters that span
 namespaces flagged, because those are never merged. It reindexes first, so the
 report describes the files rather than a stale index. Merging is a library
-call — it needs a merger you inject, the same reason there is no
-`vault propose` — so this is the pass you run to find the ceiling your embedder
-calls a duplicate. See [Consolidation](#consolidation).
+call — it needs a merger you inject, and the CLI wires none — so this is the
+pass you run to find the ceiling your embedder calls a duplicate. See
+[Consolidation](#consolidation).
+
+`propose`, `get`, `list`, `search` and `discards` act for an agent: `--agent
+<name>` is the caller, and a `.vault-policy.json` at the vault's root is what it
+is checked against — the [Scopes](#scopes) policy, as JSON:
+
+```json
+{
+  "clerk": [
+    {"prefix": "", "read": true, "write": true},
+    {"prefix": "ledger", "write": false}
+  ]
+}
+```
+
+With no file, any agent may do anything and `--agent` is optional. With one,
+every call needs an `--agent` the policy names, and answers only what that agent
+may touch. `discards` runs only for an agent that may read the whole vault,
+because the log holds refused candidates from every namespace, and `restore`
+writes through the gate as that agent. A file that is there but cannot be used —
+not JSON, a key given twice, not an object, a rule `open()` refuses, a dangling
+symlink — is an error, never allow-all. So is a `--vault` inside a scoped vault,
+where the file is out of sight: the error names the root to use. The file sits at
+the root rather than in `.vault/` because `.vault/` is disposable, and a policy
+deleted along with the index would fail open. `reindex`, `doctor`, `watch` and
+`consolidate` never read it.
+
+```
+$ vault propose --agent clerk --namespace customers --ceiling 0.35 < renewal.md
+create  customers/acme-renewal-2026.md
+$ vault list customers --agent clerk
+customers/acme-renewal-2026.md
+customers/acme.md
+```
+
+`propose` reads a note's markdown on stdin and takes its title and type from the
+frontmatter or the first `# heading`; no other frontmatter key is kept, since the
+gate writes the frontmatter of the notes it authors. A note with no title, or
+with malformed frontmatter, is refused. It reindexes, so the gate sees notes written by hand,
+then puts the note through the write gate — which needs `--ceiling` and the same
+chat model `discards restore` does — and prints the action and the path, plus
+`(fell back)` when the gate had to create the note instead of applying its
+decision. `--namespace` is where a created note goes: the vault root without it.
+`get` prints the note's file, control characters scrubbed but for newlines and
+tabs, or exits 1 with `no note at <path>` — one answer for a note that is not
+there and a note the agent may not read. `list` reindexes first too, then prints
+one path per line. It, `propose` and `discards restore` send the reindex summary
+to stderr, so stdout holds only the answer.
 
 ## Obsidian
 
@@ -381,8 +433,9 @@ await vault.propose(candidate, support)
   means denied. `open()` refuses a policy that answers one question twice, one
   with a subtree writable but not readable (an agent that cannot see its own
   notes re-creates them on every propose), a rule that is not
-  `{prefix, read?, write?}` with booleans — a JSON `"read": "false"` is truthy,
-  and would grant where it meant to deny — and a prefix that is not a canonical
+  `{prefix, read?, write?}` with booleans and no other key — a misspelt `wirte`
+  would be ignored, and a JSON `"read": "false"` is truthy, so either would grant
+  where it meant to deny — and a prefix that is not a canonical
   path (`./ledger`, `ledger//sub`), which would match nothing and deny nothing.
 - `search` filters unreadable notes out of the over-fetched set before capping,
   so you get *up to* N readable hits (and `expand_links` neighbours are filtered

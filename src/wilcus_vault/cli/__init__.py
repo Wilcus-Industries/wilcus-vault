@@ -1,8 +1,9 @@
-"""`vault <command>`: reindex, doctor, search, watch, consolidate, discards."""
+"""`vault <command>`: reindex, doctor, search, watch, propose, get, list, consolidate, discards."""
 
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 from ..db import db_path, open_db
 from ..doctor import DoctorOptions, doctor
@@ -10,10 +11,22 @@ from ..embed import Embedder, TokenOverlapEmbedder
 from ..fetch_embedder import FetchEmbedder
 from ..indexer import reindex
 from ..term import VaultError, printable
-from .commands import Args, cmd_consolidate, cmd_discards, cmd_search, cmd_watch
+from .commands import Args, cmd_consolidate, cmd_watch
+from .scoped import cmd_discards, cmd_get, cmd_list, cmd_propose, cmd_search
 from .usage import USAGE, print_report, summary
 
-COMMANDS = ("reindex", "doctor", "search", "watch", "consolidate", "discards")
+COMMANDS = (
+    "reindex",
+    "doctor",
+    "search",
+    "watch",
+    "propose",
+    "get",
+    "list",
+    "consolidate",
+    "discards",
+)
+VALUED = {"--vault": "root", "--agent": "agent", "--namespace": "namespace"}  # flag -> Args field
 
 
 def parse_args(argv: list[str]) -> Args:
@@ -43,11 +56,13 @@ def parse_args(argv: list[str]) -> Args:
             if ceiling is None or not 0 <= ceiling <= 2:
                 raise VaultError(f"--ceiling needs a cosine distance in 0..2\n\n{USAGE}")
             args.ceiling = ceiling
-        elif arg == "--vault":
-            root = next(it, None)
-            if root is None or root.startswith("--"):
-                raise VaultError(f"--vault needs a directory\n\n{USAGE}")
-            args.root = root
+        elif arg in VALUED:
+            value = next(it, None)
+            # A flag swallowed as the value would index the wrong directory, or
+            # act as an agent named `--lexical`.
+            if value is None or value.startswith("--"):
+                raise VaultError(f"{arg} needs a value\n\n{USAGE}")
+            setattr(args, VALUED[arg], value)
         else:
             raise VaultError(f"unknown flag {arg}\n\n{USAGE}")
     return args
@@ -75,10 +90,19 @@ async def run(argv: list[str]) -> int:
         print(message, file=sys.stderr)
         return 1
     command, rest = args.words[0], args.words[1:]
+    # Resolved once, so the policy lookup and the vault opened are one directory even
+    # through a symlink: `link/..` is the link target's parent, not the lexical one.
+    args.root = str(Path(args.root).resolve())
     # A bad embedder configuration raises here, before a database is opened.
     embedder: Embedder = TokenOverlapEmbedder() if args.lexical else FetchEmbedder()
     if command == "search":
-        return await cmd_search(args.root, embedder, " ".join(rest))
+        return await cmd_search(args, embedder, " ".join(rest))
+    if command == "propose":
+        return await cmd_propose(args, embedder, rest)
+    if command == "get":
+        return await cmd_get(args, embedder, rest)
+    if command == "list":
+        return await cmd_list(args, embedder, rest)
     if command == "reindex":
         db = open_db(db_path(args.root))
         try:

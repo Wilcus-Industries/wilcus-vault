@@ -145,9 +145,15 @@ async def test_help_documents_every_command_and_exits_0(
         "watch",
         "consolidate",
         "discards",
+        "propose",
+        "get <path>",
+        "list [prefix]",
+        ".vault-policy.json",
         "--vault",
         "--lexical",
         "--ceiling",
+        "--agent",
+        "--namespace",
     ):
         assert word in r.out
 

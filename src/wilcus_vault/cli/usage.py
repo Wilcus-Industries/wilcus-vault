@@ -1,6 +1,7 @@
 """The CLI's help text and report formatting."""
 
 from ..doctor import DoctorReport
+from ..gate_write import GateResult
 from ..indexer import IndexStats
 from ..term import safe
 
@@ -10,16 +11,40 @@ USAGE = """vault <command> [options]
   doctor [--rebuild]  check and repair the index (--rebuild: from scratch)
   search <query>      hybrid search: one line per hit — score, path, title
   watch               index every change as it is saved, until interrupted
+  propose             write the note on stdin through the write gate
+  get <path>          print one note's file
+  list [prefix]       note paths, one per line, optionally under a namespace
   consolidate         report near-duplicate clusters (needs --ceiling)
   discards list       the discard log, newest first — one line per entry
   discards show <n>   one entry in full, as JSON
   discards restore <n>  re-propose entry n through the write gate
 
   --vault <dir>       vault root (default: the current directory)
+  --agent <name>      who propose, get, list, search and discards act for
+  --namespace <ns>    where propose may create the note (default: the root)
   --lexical           embed offline, without a provider (see below)
-  --ceiling <d>       cosine distance two notes must be within to cluster
+  --ceiling <d>       cosine distance two notes must be within to cluster,
+                      or to count as similar in the write gate
   --help, -h          this text
   --                  end of flags, so a search query may start with a dash
+
+propose, get, list, search and discards act for an agent. A
+.vault-policy.json at the vault's root scopes them: agent name ->
+[{prefix, read?, write?}] rules, as JSON. With one, every call needs
+--agent and answers only what that agent may touch, discards runs only for
+an agent that may read the whole vault (the log spans all of it), and a
+--vault inside that vault is refused. With none, any agent may do anything.
+A policy file that cannot be read or is not a valid policy is an error,
+never allow-all. reindex, doctor, watch and consolidate never read it.
+
+vault propose reads a note's markdown on stdin, takes its title and type
+from its frontmatter or first # heading (no other frontmatter key is
+kept), reindexes, and puts it through the write gate, which needs --ceiling
+and a chat model (see discards restore below). It prints the action and
+path, then (fell back) if the gate had to create the note instead. vault
+get prints a note's file, or exits 1 with "no note at <path>" when there is
+none the agent may read. list, propose and discards restore report their
+reindex on stderr, so stdout holds only the answer.
 
 vault consolidate is report-only: one line per cluster — widest internal
 distance, then the member paths, with the ones that span namespaces flagged
@@ -49,6 +74,12 @@ only a human can fix (broken: nothing to point at; ambiguous: a bare
 [[stem]] several notes answer to — qualify it as [[folder/stem]]) or when
 doctor's own reindex hit an error it could not absorb (a confinement or
 permission failure, or a failed re-entry)."""
+
+
+def gate_line(r: GateResult) -> str:
+    """What the write gate did, as propose and discards restore print it."""
+    path = f"  {r.path}" if r.path is not None else ""
+    return safe(f"{r.action}{path}{' (fell back)' if r.fell_back else ''}")
 
 
 def _plural(n: int, word: str) -> str:
