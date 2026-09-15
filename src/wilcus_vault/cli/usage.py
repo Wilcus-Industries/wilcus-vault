@@ -18,6 +18,8 @@ USAGE = """vault <command> [options]
   discards list       the discard log, newest first — one line per entry
   discards show <n>   one entry in full, as JSON
   discards restore <n>  re-propose entry n through the write gate
+  init --layout swarm --roster <file>
+                      set the vault up as a swarm's tiered memory
 
   --vault <dir>       vault root (default: the current directory)
   --agent <name>      who propose, get, list, search and discards act for
@@ -25,6 +27,8 @@ USAGE = """vault <command> [options]
   --lexical           embed offline, without a provider (see below)
   --ceiling <d>       cosine distance two notes must be within to cluster,
                       or to count as similar in the write gate
+  --layout swarm      the layout init sets up; swarm is the only one
+  --roster <file>     the roster init reads (see below)
   --help, -h          this text
   --                  end of flags, so a search query may start with a dash
 
@@ -36,6 +40,24 @@ an agent that may read the whole vault (the log spans all of it), and a
 --vault inside that vault is refused. With none, any agent may do anything.
 A policy file that cannot be read or is not a valid policy is an error,
 never allow-all. reindex, doctor, watch and consolidate never read it.
+
+vault init --layout swarm --roster <file> sets the vault up as a swarm's
+tiered memory. The roster is JSON: role -> {"kind": "orchestrator",
+"manager", "doer" or "worker", "manager": "<role>"}, where only a worker
+needs a manager, it must be a manager row, and other keys are ignored. A
+role name is used verbatim as its --agent and its directory, so a name that
+is not one path segment is refused; any invalid row is refused before
+anything is written. init runs only on a directory that is not there yet,
+is empty, or holds a .vault-policy.json of its own (a re-init), and never
+inside a scoped vault. A policy scopes everything below it, so init will
+not turn a project root above a swarm into a vault that locks the swarm
+out, and for the same reason it will not convert an existing unscoped
+vault. init creates shared/, plus roles/<role>/ and proposals/<role>/ for
+each manager and doer, keeping what already exists, and writes
+.vault-policy.json from the roster, replacing any before it. The
+orchestrator reads and writes everything; a manager or doer reads shared/
+and writes its own two directories; a worker reads shared/ and its
+manager's roles/, and writes nothing.
 
 vault propose reads a note's markdown on stdin, takes its title and type
 from its frontmatter or first # heading (no other frontmatter key is

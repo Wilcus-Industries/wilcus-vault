@@ -1,4 +1,5 @@
-"""`vault <command>`: reindex, doctor, search, watch, propose, get, list, consolidate, discards."""
+"""`vault <command>`: reindex, doctor, search, watch, propose, get, list, consolidate, discards,
+init."""
 
 import asyncio
 import os
@@ -12,6 +13,7 @@ from ..fetch_embedder import FetchEmbedder
 from ..indexer import reindex
 from ..term import VaultError, printable
 from .commands import Args, cmd_consolidate, cmd_watch
+from .init import cmd_init
 from .scoped import cmd_discards, cmd_get, cmd_list, cmd_propose, cmd_search
 from .usage import USAGE, print_report, summary
 
@@ -25,8 +27,15 @@ COMMANDS = (
     "list",
     "consolidate",
     "discards",
+    "init",
 )
-VALUED = {"--vault": "root", "--agent": "agent", "--namespace": "namespace"}  # flag -> Args field
+VALUED = {  # flag -> Args field
+    "--vault": "root",
+    "--agent": "agent",
+    "--namespace": "namespace",
+    "--layout": "layout",
+    "--roster": "roster",
+}
 
 
 def parse_args(argv: list[str]) -> Args:
@@ -93,6 +102,8 @@ async def run(argv: list[str]) -> int:
     # Resolved once, so the policy lookup and the vault opened are one directory even
     # through a symlink: `link/..` is the link target's parent, not the lexical one.
     args.root = str(Path(args.root).resolve())
+    if command == "init":
+        return cmd_init(args, rest)  # embeds nothing, so no embedder configuration can fail it
     # A bad embedder configuration raises here, before a database is opened.
     embedder: Embedder = TokenOverlapEmbedder() if args.lexical else FetchEmbedder()
     if command == "search":
